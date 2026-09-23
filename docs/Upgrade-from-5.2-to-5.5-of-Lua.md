@@ -1,11 +1,37 @@
 # Upgrading from Lua 5.2 to Lua 5.5
 
-> **Status (2026-09-19): DRAFT PLAN — research complete, no implementation started.**
+> **Status (2026-09-23): U0 COMPLETE — oracle groundwork landed; U1 next.**
 > Companion research artifacts are saved under `note/conv-from-5.2-to-5.5/` (source tarballs,
 > extracted manual sections, official 5.5 test suite). This document follows the conventions of
 > `Lua-Wasm-Design-and-Test-Plan.md`: design decisions are numbered **D1–D12**, milestones are
 > numbered **U0–U8** with hard test gates, and the divergence-ledger discipline applies throughout.
 > It supersedes `docs/Lua-5.2-to-5.5.md` (background research note) as the plan of record.
+>
+> **U0 record (2026-09-23).** `runtime/lua55/` vendors stock 5.5.1 with a one-entry patch
+> list (`runtime/lua55/VENDORED.md`: `readable()` rejects the empty filename — POSIX
+> `fopen("")` fails with ENOENT everywhere, wasi-libc resolves it to the preopen root and
+> succeeds, wrongly "finding" `package.searchpath`'s trailing empty template); everything
+> else is build flags. `runtime/luawasm55.c` ports the oracle driver onto the 5.5 public C
+> API. Determinism is pinned by flags, not patches: `-D'luai_makeseed()=0u'` for the
+> xoshiro/sort-pivot seeds (math.random itself runs stock — math.lua asserts exact xoshiro
+> output of seed 1007), `time()`/`clock()` symbol preemption so stock os.time/os.date keep
+> their 5.5 validation texts over the pinned 2000-01-01 instant, and
+> `lua_newstate(...,42)` — the state seed MUST be non-zero: seed 0 makes `#`'s
+> hash_search probe ladder hit pure powers of two, exactly nextvar.lua's "attack on table
+> length" key set, so `#t` answers 2^61 and the suite never terminates (seed 0 also
+> degraded hashing-heavy files globally — the gate ran 45+ minutes under seed 0 and runs in
+> ~4 s under 42). `runtime/build55.sh` builds `lua55_sjlj.wasm` (byte-deterministic; same
+> SJLJ/new-EH dialect as the 5.1 blob).
+> `testdiff/clua55.go` adds the `clua55` (wasmtime) and `clua55-wazero` (wazero) engines —
+> the U0 gate `TestCLua55Conformance` runs `_lua5.5-tests` (official suite) on both hosts in
+> the suite's own "user tests" posture (`_port`/`_soft`/`_nomsg` prelude, engine-side, no
+> corpus edits) and asserts host equivalence (same blob → byte-identical logs).
+> `cmd/clua55-run` is the CLI leg (`GLUA55_ENGINE=wazero` selects the pure-Go host).
+> Skips (reasons in the gate): `main.lua`, `all.lua` (subprocess drivers, as in 5.1),
+> `heavy.lua` (not in the official all.lua run; exceeds the 256 MiB wasm backstop),
+> `files.lua` (the `/dev/full` block asserts io.flush fails with ENOSPC — no WASI host here
+> can express a write-failing device; `/dev/null` is served by an engine-provisioned empty
+> stand-in file, gitignored under the corpus). All 5.1 gates unchanged and green.
 
 ---
 
@@ -48,7 +74,7 @@ still 16 bytes on wasm32 — re-assert in `build.sh`), the testdiff event model
 
 The fork exists to run untrusted client scripts in a pure-Go Redis clone. Real Redis embeds
 Lua 5.1 (LuaJIT dialect), so 5.1 was never a *compatibility* requirement — it is inherited
-from upstream gopher-lua. Reasons to move to 5.5:
+from upstream golua55. Reasons to move to 5.5:
 
 - modern semantics for script authors: 64-bit integers, bitwise operators, `//`,
   `<const>`/`<close>`, `goto`-based control flow, string packing, utf-8 support;
@@ -100,18 +126,18 @@ The honest counterweights, recorded here so they are decisions rather than surpr
 
 ### 3.3 Standard libraries (Go)
 
-| File | LOC | Registers | Notable 5.1-isms / 5.5 gaps |
-|---|---|---|---|
-| `baselib.go` | 597 | `_G` | `setfenv`/`getfenv`/`module`/`loadstring`/`unpack` present; `load` is the 5.1 reader-fn form (no `mode`/`env` args); `_VERSION="Lua 5.1"` |
-| `stringlib.go` | 448 | `string` | no `pack`/`unpack`; `gfind` alias; patterns (pm/, 645 LOC) lack `\0`-in-pattern and the `%f` frontier; `dump` always errors |
-| `mathlib.go` | 231 | `math` | 5.1 set incl. `pow log10 mod atan2 frexp ldexp cosh sinh tanh`; no `type/tointeger/maxinteger/mininteger/ult` |
-| `tablelib.go` | 100 | `table` | `getn`/`maxn`; no `move`/`unpack`/`pack`/`create`; ignores metamethods (5.3+ honors `__index`/`__newindex`) |
-| `oslib.go` | 235 | `os` | `execute` returns 0/1 (5.2+ returns bool+info); `setlocale` stub; `setenv` extension |
-| `iolib.go` | 748 | `io` | `*n/*a/*l` only (no `l`/`L`/`a` unstarred forms); `io.lines` single return |
-| `debuglib.go` | 173 | `debug` | `getfenv`/`setfenv`; no nparams/isvararg info |
-| `loadlib.go` | 128 | `package` | `loaders` (5.2+: `searchers`); `loadlib` always errors |
-| `coroutinelib.go` | 112 | `coroutine` | no `close`, no `isyieldable` |
-| `channellib.go` | 184 | `channel` | gopher-lua extension — keep (D12) |
+| File              | LOC | Registers   | Notable 5.1-isms / 5.5 gaps                                                                                                               |
+|-------------------|-----|-------------|-------------------------------------------------------------------------------------------------------------------------------------------|
+| `baselib.go`      | 597 | `_G`        | `setfenv`/`getfenv`/`module`/`loadstring`/`unpack` present; `load` is the 5.1 reader-fn form (no `mode`/`env` args); `_VERSION="Lua 5.1"` |
+| `stringlib.go`    | 448 | `string`    | no `pack`/`unpack`; `gfind` alias; patterns (pm/, 645 LOC) lack `\0`-in-pattern and the `%f` frontier; `dump` always errors               |
+| `mathlib.go`      | 231 | `math`      | 5.1 set incl. `pow log10 mod atan2 frexp ldexp cosh sinh tanh`; no `type/tointeger/maxinteger/mininteger/ult`                             |
+| `tablelib.go`     | 100 | `table`     | `getn`/`maxn`; no `move`/`unpack`/`pack`/`create`; ignores metamethods (5.3+ honors `__index`/`__newindex`)                               |
+| `oslib.go`        | 235 | `os`        | `execute` returns 0/1 (5.2+ returns bool+info); `setlocale` stub; `setenv` extension                                                      |
+| `iolib.go`        | 748 | `io`        | `*n/*a/*l` only (no `l`/`L`/`a` unstarred forms); `io.lines` single return                                                                |
+| `debuglib.go`     | 173 | `debug`     | `getfenv`/`setfenv`; no nparams/isvararg info                                                                                             |
+| `loadlib.go`      | 128 | `package`   | `loaders` (5.2+: `searchers`); `loadlib` always errors                                                                                    |
+| `coroutinelib.go` | 112 | `coroutine` | no `close`, no `isyieldable`                                                                                                              |
+| `channellib.go`   | 184 | `channel`   | golua55 extension — keep (D12)                                                                                                            |
 
 ### 3.4 C runtime and wasm backend
 
@@ -419,7 +445,7 @@ Family mapping (what the compiler must learn):
 | package | `loaders` | `searchers`; `searchpath` | — |
 | utf8 (new) | — | full library (5.3) + 5.5 `offset` extra return; 5.4 surrogate policy | — |
 | bit32 | never had | **not adding** (deprecated in 5.3, dead after) | — |
-| channel | — | — | keep as gopher-lua extension (D12) |
+| channel | — | — | keep as golua55 extension (D12) |
 
 ## Appendix C — Source material
 
@@ -438,5 +464,5 @@ Everything below is saved under `note/conv-from-5.2-to-5.5/` (see its `README.md
 
 Web sources: lua.org/versions.html (version chronology), lua.org/manual/5.5/ (readme +
 manual §8), lua.org/tests/ (official suites). Prior art surveyed: no maintained
-gopher-lua-family implementation of 5.4/5.5 exists in Go today (closest: Lua 5.4 VM
+golua55-family implementation of 5.4/5.5 exists in Go today (closest: Lua 5.4 VM
 experiments); this fork would be the migration path.
