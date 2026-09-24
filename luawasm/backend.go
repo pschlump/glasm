@@ -231,6 +231,13 @@ func (b *backend) emitInit() {
 			case lua.LNumber:
 				f.LocalGet(lK).I32Const(int32(cellSize * (pi.koff + i))).I32Add().F64Const(float64(v)).
 					Call(b.imp("rt_mknumber"))
+			case lua.LInteger:
+				// U2a: the cell ABI has no integer tag until v4
+				// (U2d); integer constants stage as their float
+				// value — value-equal for everything the corpora can
+				// observe before the matrix regeneration
+				f.LocalGet(lK).I32Const(int32(cellSize * (pi.koff + i))).I32Add().F64Const(float64(v)).
+					Call(b.imp("rt_mknumber"))
 			case lua.LString:
 				writeStrBytes(f, lS, lC, string(v))
 				f.LocalGet(lK).I32Const(int32(cellSize * (pi.koff + i))).I32Add()

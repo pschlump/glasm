@@ -130,15 +130,23 @@ func isVarArgReturnExpr(expr ast.Expr) bool {
 	return false
 }
 
+// lnumberValue returns the float view of a constant expression. U2a keeps
+// const-folding float-only (subtype-exact folding arrives with the integer
+// arithmetic paths in U2b), so both number subtypes flatten to LNumber here.
 func lnumberValue(expr ast.Expr) (LNumber, bool) {
 	if ex, ok := expr.(*ast.NumberExpr); ok {
 		lv, err := parseNumber(ex.Value)
 		if err != nil {
-			lv = LNumber(math.NaN())
+			return LNumber(math.NaN()), true
 		}
-		return lv, true
+		return LVAsNumber(lv), true
 	} else if ex, ok := expr.(*constLValueExpr); ok {
-		return ex.Value.(LNumber), true
+		if n, ok := ex.Value.(LNumber); ok {
+			return n, true
+		}
+		if n, ok := ex.Value.(LInteger); ok {
+			return LNumber(float64(n)), true
+		}
 	}
 	return 0, false
 }
@@ -1291,6 +1299,8 @@ func compileExpr(context *funcContext, reg int, expr ast.Expr, ec *expcontext) i
 		code.AddABx(OP_LOADK, sreg, context.ConstIndex(LString(ex.Value)), sline(ex))
 		return sused
 	case *ast.NumberExpr:
+		// integer literals keep their syntactic subtype in the constant
+		// pool (U2/D1): parseNumber yields LInteger or LNumber
 		num, err := parseNumber(ex.Value)
 		if err != nil {
 			num = LNumber(math.NaN())

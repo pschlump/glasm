@@ -18,10 +18,12 @@ var _fv float64
 var _uv uintptr
 
 var preloads [int(preloadLimit)]LValue
+var intPreloads [int(preloadLimit)]LValue
 
 func init() {
 	for i := 0; i < int(preloadLimit); i++ {
 		preloads[i] = LNumber(i)
+		intPreloads[i] = LInteger(i)
 	}
 }
 
@@ -30,9 +32,13 @@ type allocator struct {
 	size    int
 	fptrs   []float64
 	fheader *reflect.SliceHeader
+	iptrs   []int64
+	iheader *reflect.SliceHeader
 
 	scratchValue  LValue
 	scratchValueP *iface
+	iscratchValue LValue
+	iscratchP     *iface
 }
 
 func newAllocator(size int) *allocator {
@@ -40,10 +46,15 @@ func newAllocator(size int) *allocator {
 		size:    size,
 		fptrs:   make([]float64, 0, size),
 		fheader: nil,
+		iptrs:   make([]int64, 0, size),
+		iheader: nil,
 	}
 	al.fheader = (*reflect.SliceHeader)(unsafe.Pointer(&al.fptrs))
+	al.iheader = (*reflect.SliceHeader)(unsafe.Pointer(&al.iptrs))
 	al.scratchValue = LNumber(0)
 	al.scratchValueP = (*iface)(unsafe.Pointer(&al.scratchValue))
+	al.iscratchValue = LInteger(0)
+	al.iscratchP = (*iface)(unsafe.Pointer(&al.iscratchValue))
 
 	return al
 }
@@ -80,4 +91,30 @@ func (al *allocator) LNumber2I(v LNumber) LValue {
 	al.scratchValueP.word = unsafe.Pointer(fptr)
 
 	return al.scratchValue
+}
+
+// LInteger2I is the integer twin of LNumber2I (U2/D1): small non-negative
+// integers come from the shared preload table, everything else from a
+// bulk-allocated int64 block. Go's runtime already caches boxed values
+// below 256, but LInteger needs no sign exclusion — every value in
+// [0,preloadLimit) is a distinct cache entry.
+func (al *allocator) LInteger2I(v LInteger) LValue {
+	if v >= 0 && v < LInteger(preloadLimit) {
+		return intPreloads[int(v)]
+	}
+
+	// check if we need a new alloc page
+	if cap(al.iptrs) == len(al.iptrs) {
+		al.iptrs = make([]int64, 0, al.size)
+		al.iheader = (*reflect.SliceHeader)(unsafe.Pointer(&al.iptrs))
+	}
+
+	// alloc a new int, and store our value into it
+	al.iptrs = append(al.iptrs, int64(v))
+	iptr := &al.iptrs[len(al.iptrs)-1]
+
+	// hack our scratch LValue to point to our allocated value
+	al.iscratchP.word = unsafe.Pointer(iptr)
+
+	return al.iscratchValue
 }

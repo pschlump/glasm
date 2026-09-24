@@ -105,7 +105,10 @@ Available options are:
 				fmt.Println(err.Error())
 				return 1
 			}
-			name = flag.Arg(0)
+			// a file chunk names itself "@path" (auxlib's LoadFile
+			// convention) so compile errors print "./x.lua:9:" like
+			// every other engine leg, not "[string ...]:9:"
+			name = "@" + flag.Arg(0)
 		}
 		bin, err := testdiff.CompileSource(src, name)
 		if err != nil {

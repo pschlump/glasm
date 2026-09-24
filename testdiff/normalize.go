@@ -42,6 +42,8 @@ func PrintArg(v lua.LValue) string {
 		return string(x)
 	case lua.LNumber:
 		return NumRepr(float64(x))
+	case lua.LInteger:
+		return NumRepr(float64(x))
 	case *lua.LNilType:
 		return "nil"
 	case lua.LBool:
@@ -70,6 +72,8 @@ func ValueRepr(v lua.LValue, depth int, seen map[*lua.LTable]bool) string {
 	case lua.LString:
 		return strconv.Quote(string(x))
 	case lua.LNumber:
+		return NumRepr(float64(x))
+	case lua.LInteger:
 		return NumRepr(float64(x))
 	case *lua.LNilType:
 		return "nil"

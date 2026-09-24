@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"strconv"
 )
 
 type LValueType int
@@ -18,9 +19,13 @@ const (
 	LTThread
 	LTTable
 	LTChannel
+	// LTInteger is the 5.3+ integer subtype (U2/D1). It is a distinct
+	// LValueType so type switches can tell int from float, but it names
+	// "number": Lua's type() must keep reporting the basic type.
+	LTInteger
 )
 
-var lValueNames = [9]string{"nil", "boolean", "number", "string", "function", "userdata", "thread", "table", "channel"}
+var lValueNames = [10]string{"nil", "boolean", "number", "string", "function", "userdata", "thread", "table", "channel", "number"}
 
 func (vt LValueType) String() string {
 	return lValueNames[int(vt)]
@@ -41,7 +46,7 @@ func LVAsBool(v LValue) bool { return v != LNil && v != LFalse }
 // if the LValue is a string or number, otherwise an empty string.
 func LVAsString(v LValue) string {
 	switch sn := v.(type) {
-	case LString, LNumber:
+	case LString, LNumber, LInteger:
 		return sn.String()
 	default:
 		return ""
@@ -52,21 +57,25 @@ func LVAsString(v LValue) string {
 // otherwise false.
 func LVCanConvToString(v LValue) bool {
 	switch v.(type) {
-	case LString, LNumber:
+	case LString, LNumber, LInteger:
 		return true
 	default:
 		return false
 	}
 }
 
-// LVAsNumber tries to convert a given LValue to a number.
+// LVAsNumber tries to convert a given LValue to a number (float view).
+// The integer subtype converts to its float value; use parseNumber when
+// the syntactic subtype of a string must be preserved.
 func LVAsNumber(v LValue) LNumber {
 	switch lv := v.(type) {
 	case LNumber:
 		return lv
+	case LInteger:
+		return LNumber(float64(lv))
 	case LString:
 		if num, err := parseNumber(string(lv)); err == nil {
-			return num
+			return LVAsNumber(num)
 		}
 	}
 	return LNumber(0)
@@ -92,6 +101,33 @@ func (bl LBool) Type() LValueType { return LTBool }
 var LTrue = LBool(true)
 var LFalse = LBool(false)
 
+// LInteger is the 64-bit integer subtype of "number" (5.3+, U2/D1).
+// Integer-ness is observable: tostring(2) == "2" while tostring(2.0) ==
+// "2.0" (once float printing re-pins at U5), table keys normalize
+// t[2.0] to the integer 2, and //, shifts and integer for-loops require
+// it. Arithmetic on mixed subtypes promotes to float.
+type LInteger int64
+
+func (nm LInteger) String() string {
+	return strconv.FormatInt(int64(nm), 10)
+}
+
+func (nm LInteger) Type() LValueType { return LTInteger }
+
+// fmt.Formatter interface
+func (nm LInteger) Format(f fmt.State, c rune) {
+	switch c {
+	case 'q', 's':
+		defaultFormat(nm.String(), f, c)
+	case 'b', 'c', 'd', 'o', 'x', 'X', 'U', 'i':
+		defaultFormat(int64(nm), f, c)
+	case 'e', 'E', 'f', 'F', 'g', 'G':
+		defaultFormat(float64(nm), f, c)
+	default:
+		defaultFormat(int64(nm), f, c)
+	}
+}
+
 type LString string
 
 func (st LString) String() string   { return string(st) }
@@ -102,7 +138,7 @@ func (st LString) Format(f fmt.State, c rune) {
 	switch c {
 	case 'd', 'i':
 		if nm, err := parseNumber(string(st)); err != nil {
-			defaultFormat(nm, f, 'd')
+			defaultFormat(LVAsNumber(nm), f, 'd')
 		} else {
 			defaultFormat(string(st), f, 's')
 		}

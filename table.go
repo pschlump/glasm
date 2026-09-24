@@ -46,6 +46,12 @@ func newLTable(acap int, hcap int) *LTable {
 	return tb
 }
 
+// arrayLen reports the size of the array part (0 when absent) — the
+// analogue of stock's t->asize for next()'s keyinarray range test.
+func (tb *LTable) arrayLen() int {
+	return len(tb.array)
+}
+
 // Len returns length of this LTable without using __len.
 func (tb *LTable) Len() int {
 	if tb.array == nil {
@@ -141,13 +147,32 @@ func (tb *LTable) Remove(pos int) LValue {
 	return oldval
 }
 
+// normalizeNumberKey maps a numeric key to its canonical table-key form
+// (5.3+ rule): a float with an exact integer value becomes that integer —
+// t[2.0] and t[2] name the same slot — while integers and non-integral
+// floats are unchanged. Non-number keys pass through untouched. Every
+// table boundary (RawSet/RawGet/RawSetH/RawGetH/Next) normalizes so the
+// dict, k2i and keys never hold two spellings of one number.
+func normalizeNumberKey(key LValue) LValue {
+	switch v := key.(type) {
+	case LInteger:
+		return v
+	case LNumber:
+		if i, ok := floatToIntExact(float64(v)); ok {
+			return LInteger(i)
+		}
+	}
+	return key
+}
+
 // RawSet sets a given LValue to a given index without the __newindex metamethod.
 // It is recommended to use `RawSetString` or `RawSetInt` for performance
 // if you already know the given LValue is a string or number.
 func (tb *LTable) RawSet(key LValue, value LValue) {
+	key = normalizeNumberKey(key)
 	switch v := key.(type) {
-	case LNumber:
-		if isArrayKey(v) {
+	case LInteger:
+		if v > 0 && v < LInteger(MaxArrayIndex) {
 			if tb.array == nil {
 				tb.array = make([]LValue, 0, defaultArrayCap)
 			}
@@ -177,7 +202,7 @@ func (tb *LTable) RawSet(key LValue, value LValue) {
 // RawSetInt sets a given LValue at a position `key` without the __newindex metamethod.
 func (tb *LTable) RawSetInt(key int, value LValue) {
 	if key < 1 || key >= MaxArrayIndex {
-		tb.RawSetH(LNumber(key), value)
+		tb.RawSetH(LInteger(key), value)
 		return
 	}
 	if tb.array == nil {
@@ -227,6 +252,7 @@ func (tb *LTable) RawSetH(key LValue, value LValue) {
 		tb.RawSetString(string(s), value)
 		return
 	}
+	key = normalizeNumberKey(key)
 	if tb.dict == nil {
 		tb.dict = make(map[LValue]LValue, len(tb.strdict))
 	}
@@ -249,9 +275,10 @@ func (tb *LTable) RawSetH(key LValue, value LValue) {
 
 // RawGet returns an LValue associated with a given key without __index metamethod.
 func (tb *LTable) RawGet(key LValue) LValue {
+	key = normalizeNumberKey(key)
 	switch v := key.(type) {
-	case LNumber:
-		if isArrayKey(v) {
+	case LInteger:
+		if v > 0 && v < LInteger(MaxArrayIndex) {
 			if tb.array == nil {
 				return LNil
 			}
@@ -302,6 +329,7 @@ func (tb *LTable) RawGetH(key LValue) LValue {
 		}
 		return LNil
 	}
+	key = normalizeNumberKey(key)
 	if tb.dict == nil {
 		return LNil
 	}
@@ -348,20 +376,24 @@ func (tb *LTable) ForEach(cb func(LValue, LValue)) {
 }
 
 // This function is equivalent to lua_next ( http://www.lua.org/manual/5.1/manual.html#lua_next ).
+// Unlike RawGet/RawSet, the incoming key is NOT normalized: stock 5.5's
+// findindex accepts array entries only for integer keys (keyinarray is
+// ttisinteger-only) and hashes the raw key for the hash part, so the float
+// spelling of an integer slot is an invalid key (baseNext screens it).
 func (tb *LTable) Next(key LValue) (LValue, LValue) {
 	init := false
 	if key == LNil {
-		key = LNumber(0)
+		key = LInteger(0)
 		init = true
 	}
 
-	if init || key != LNumber(0) {
-		if kv, ok := key.(LNumber); ok && isInteger(kv) && int(kv) >= 0 && kv < LNumber(MaxArrayIndex) {
+	if init || key != LInteger(0) {
+		if kv, ok := key.(LInteger); ok && int64(kv) >= 0 && kv < LInteger(MaxArrayIndex) {
 			index := int(kv)
 			if tb.array != nil {
 				for ; index < len(tb.array); index++ {
 					if v := tb.array[index]; v != LNil {
-						return LNumber(index + 1), v
+						return LInteger(index + 1), v
 					}
 				}
 			}

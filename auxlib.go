@@ -19,6 +19,9 @@ func (ls *LState) CheckAny(n int) LValue {
 
 func (ls *LState) CheckInt(n int) int {
 	v := ls.Get(n)
+	if intv, ok := v.(LInteger); ok {
+		return int(intv)
+	}
 	if intv, ok := v.(LNumber); ok {
 		return int(intv)
 	}
@@ -28,6 +31,9 @@ func (ls *LState) CheckInt(n int) int {
 
 func (ls *LState) CheckInt64(n int) int64 {
 	v := ls.Get(n)
+	if intv, ok := v.(LInteger); ok {
+		return int64(intv)
+	}
 	if intv, ok := v.(LNumber); ok {
 		return int64(intv)
 	}
@@ -40,9 +46,12 @@ func (ls *LState) CheckNumber(n int) LNumber {
 	if lv, ok := v.(LNumber); ok {
 		return lv
 	}
+	if lv, ok := v.(LInteger); ok {
+		return LNumber(float64(lv))
+	}
 	if lv, ok := v.(LString); ok {
 		if num, err := parseNumber(string(lv)); err == nil {
-			return num
+			return LVAsNumber(num)
 		}
 	}
 	ls.TypeError(n, LTNumber)
@@ -115,7 +124,8 @@ func (ls *LState) CheckType(n int, typ LValueType) {
 func (ls *LState) CheckTypes(n int, typs ...LValueType) {
 	vt := ls.Get(n).Type()
 	for _, typ := range typs {
-		if vt == typ {
+		// the integer subtype satisfies a "number" expectation
+		if vt == typ || (typ == LTNumber && vt == LTInteger) {
 			return
 		}
 	}
@@ -146,6 +156,9 @@ func (ls *LState) OptInt(n int, d int) int {
 	if v == LNil {
 		return d
 	}
+	if intv, ok := v.(LInteger); ok {
+		return int(intv)
+	}
 	if intv, ok := v.(LNumber); ok {
 		return int(intv)
 	}
@@ -158,6 +171,9 @@ func (ls *LState) OptInt64(n int, d int64) int64 {
 	if v == LNil {
 		return d
 	}
+	if intv, ok := v.(LInteger); ok {
+		return int64(intv)
+	}
 	if intv, ok := v.(LNumber); ok {
 		return int64(intv)
 	}
@@ -169,6 +185,9 @@ func (ls *LState) OptNumber(n int, d LNumber) LNumber {
 	v := ls.Get(n)
 	if v == LNil {
 		return d
+	}
+	if lv, ok := v.(LInteger); ok {
+		return LNumber(float64(lv))
 	}
 	if lv, ok := v.(LNumber); ok {
 		return lv

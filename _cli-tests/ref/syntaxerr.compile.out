@@ -1,2 +1,1 @@
-./syntaxerr.lua at EOF:   syntax error
-
+./syntaxerr.lua:9: unexpected symbol near <eof>

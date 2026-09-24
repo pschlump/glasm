@@ -255,10 +255,12 @@ func (sc *Scanner) scanNumber(ch int, buf *bytes.Buffer) error {
 // acceptance of C's strtod/luaO_str2num: "3." and "3.e5" are valid, hex
 // floats may omit the p-exponent, and underscores are not. Note Go's
 // base-0 ParseInt is NOT usable here: it would read "0777" as octal (Lua
-// says 777) and accept "0b101"/"0o17" (unknown to Lua). The value parsing
-// itself lives in lua.parseNumber (utils.go), which applies the same
-// rules; this copy exists because the parse package cannot import the lua
-// package.
+// says 777) and accept "0b101"/"0o17" (unknown to Lua). 5.3+ acceptance
+// (U2): a decimal integer that overflows int64 is a valid numeral reading
+// as a float, and plain hex integers of ANY length are valid (they wrap
+// as unsigned: 0xFFFFFFFFFFFFFFFF == -1). The value parsing itself lives
+// in lua.parseNumber (utils.go), which applies the same rules; this copy
+// exists because the parse package cannot import the lua package.
 func numeralOK(s string) bool {
 	isHex := len(s) > 2 && s[0] == '0' && (s[1] == 'x' || s[1] == 'X')
 	if isHex {
@@ -267,8 +269,16 @@ func numeralOK(s string) bool {
 			_, err := strconv.ParseFloat(normalizeNumeral(s), 64)
 			return err == nil || errors.Is(err, strconv.ErrRange)
 		}
-		_, err := strconv.ParseInt(body, 16, 64)
-		return err == nil
+		// plain hex integer: always valid, wrapping in lua.parseNumber
+		if len(body) == 0 {
+			return false
+		}
+		for i := 0; i < len(body); i++ {
+			if !isHexDigit(body[i]) {
+				return false
+			}
+		}
+		return true
 	}
 	if strings.IndexAny(s, ".eE") >= 0 {
 		_, err := strconv.ParseFloat(normalizeNumeral(s), 64)
@@ -276,8 +286,12 @@ func numeralOK(s string) bool {
 		// (math.lua: 10e500 == math.huge)
 		return err == nil || errors.Is(err, strconv.ErrRange)
 	}
-	_, err := strconv.ParseInt(s, 10, 64)
-	return err == nil
+	if _, err := strconv.ParseInt(s, 10, 64); err == nil {
+		return true
+	}
+	// decimal integer overflow: valid numeral, value read as a float
+	_, err := strconv.ParseFloat(normalizeNumeral(s), 64)
+	return err == nil || errors.Is(err, strconv.ErrRange)
 }
 
 // normalizeNumeral adapts Lua numeral syntax to Go's ParseFloat: digits

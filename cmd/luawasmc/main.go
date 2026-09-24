@@ -34,7 +34,9 @@ func main() {
 	}
 	chunk := *name
 	if chunk == "" {
-		chunk = in
+		// default chunk name follows the loadfile convention ("@path")
+		// so compile errors print "in.lua:9:", not "[string ...]:9:"
+		chunk = "@" + in
 	}
 
 	src, err := os.ReadFile(in)

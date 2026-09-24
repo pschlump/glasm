@@ -332,6 +332,27 @@ func fileReadAux(L *LState, file *lFile, idx int) int {
 	top := L.GetTop()
 	for i := idx; i <= top; i++ {
 		switch lv := L.Get(i).(type) {
+		case LInteger:
+			size := int64(lv)
+			if size == 0 {
+				_, err = file.reader.ReadByte()
+				if err == io.EOF {
+					L.Push(LNil)
+					goto normalreturn
+				}
+				file.reader.UnreadByte()
+			}
+			var buf []byte
+			var iseof bool
+			buf, err, iseof = readBufioSize(file.reader, size)
+			if iseof {
+				L.Push(LNil)
+				goto normalreturn
+			}
+			if err != nil {
+				goto errreturn
+			}
+			L.Push(LString(string(buf)))
 		case LNumber:
 			size := int64(lv)
 			if size == 0 {

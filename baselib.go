@@ -5,7 +5,6 @@ import (
 	"io"
 	"os"
 	"runtime"
-	"strconv"
 	"strings"
 )
 
@@ -234,6 +233,11 @@ func baseNext(L *LState) int {
 	if L.GetTop() >= 2 {
 		index = L.Get(2)
 	}
+	if index != LNil && !nextKeyPresent(tb, index) {
+		// stock raises from the C function's frame (luaG_runerror), so
+		// the message carries no position prefix
+		L.raiseError(0, "invalid key to 'next'")
+	}
 	key, value := tb.Next(index)
 	if key == LNil {
 		L.Push(LNil)
@@ -242,6 +246,27 @@ func baseNext(L *LState) int {
 	L.Push(key)
 	L.Push(value)
 	return 2
+}
+
+// nextKeyPresent mirrors stock 5.5 ltable.c findindex's acceptance test
+// for lua_next's key: an integer key within the array part is accepted by
+// range alone (even a nil slot — the scan just continues from there);
+// anything else must be an existing hash-part key in its stored spelling.
+// Integral floats never match (they are never a stored spelling), which
+// is why next(t, 2.0) is an error even though t[2.0] reads fine.
+func nextKeyPresent(tb *LTable, key LValue) bool {
+	if iv, ok := key.(LInteger); ok {
+		if iv >= 1 && int(iv) <= tb.arrayLen() {
+			return true
+		}
+		return tb.RawGetH(iv) != LNil
+	}
+	if fv, ok := key.(LNumber); ok {
+		if _, exact := floatToIntExact(float64(fv)); exact {
+			return false
+		}
+	}
+	return tb.RawGetH(key) != LNil
 }
 
 func pairsaux(L *LState) int {
@@ -340,6 +365,18 @@ func baseSelect(L *LState) int {
 			L.ArgError(1, "index out of range")
 		}
 		return num - idx
+	case LInteger:
+		idx := int(lv)
+		num := L.GetTop()
+		if idx < 0 {
+			idx = num + idx
+		} else if idx > num {
+			idx = num
+		}
+		if 1 > idx {
+			L.ArgError(1, "index out of range")
+		}
+		return num - idx
 	case LString:
 		if string(lv) != "#" {
 			L.ArgError(1, "invalid string '"+string(lv)+"'")
@@ -367,38 +404,86 @@ func baseSetMetatable(L *LState) int {
 	return 1
 }
 
+// str2intBase ports stock lbaselib.c b_str2int (tonumber with an explicit
+// base): skip spaces, optional sign, one or more alphanumerics interpreted
+// in the base, unsigned accumulate with wraparound, trailing spaces; the
+// caller must pass the whole string and requires at least one valid digit.
+func str2intBase(s string, base int) (int64, bool) {
+	neg := false
+	i := 0
+	for ; i < len(s) && strings.IndexByte(" \t\n\v\f\r", s[i]) >= 0; i++ {
+	}
+	if i < len(s) && s[i] == '-' {
+		neg = true
+		i++
+	} else if i < len(s) && s[i] == '+' {
+		i++
+	}
+	start := i
+	var n uint64
+	for ; i < len(s); i++ {
+		c := s[i]
+		var d int
+		switch {
+		case '0' <= c && c <= '9':
+			d = int(c - '0')
+		case 'a' <= c && c <= 'z':
+			d = int(c-'a') + 10
+		case 'A' <= c && c <= 'Z':
+			d = int(c-'A') + 10
+		default:
+			return 0, false // isalnum only, per stock
+		}
+		if d >= base {
+			return 0, false
+		}
+		n = n*uint64(base) + uint64(d)
+	}
+	if i == start {
+		return 0, false // no digit at all
+	}
+	for ; i < len(s) && strings.IndexByte(" \t\n\v\f\r", s[i]) >= 0; i++ {
+	}
+	if i != len(s) {
+		return 0, false // trailing garbage
+	}
+	v := int64(n)
+	if neg {
+		v = -v
+	}
+	return v, true
+}
+
 func baseToNumber(L *LState) int {
-	base := L.OptInt(2, 10)
-	noBase := L.Get(2) == LNil
+	if L.Get(2) != LNil {
+		// explicit base: strict integer conversion (stock luaB_tonumber's
+		// b_str2int path — the result is always an integer)
+		base := L.CheckInt(2)
+		str := string(L.CheckString(1))
+		if base < 2 || base > 36 {
+			L.ArgError(2, "base out of range")
+		}
+		if v, ok := str2intBase(str, base); ok {
+			L.Push(LInteger(v))
+		} else {
+			L.Push(LNil)
+		}
+		return 1
+	}
 
 	switch lv := L.CheckAny(1).(type) {
-	case LNumber:
+	case LNumber, LInteger:
 		L.Push(lv)
 	case LString:
 		str := strings.Trim(string(lv), " \n\t")
-		if noBase {
-			// no base: full numeral grammar via parseNumber (hex floats
-			// like "0x1p-2" and trailing-dot forms like "3." are valid —
-			// the old integer-only paths returned nil for them)
-			if v, err := parseNumber(str); err == nil {
-				L.Push(v)
-			} else {
-				L.Push(LNil)
-			}
-			return 1
-		}
-		if strings.Index(str, ".") > -1 {
-			if v, err := strconv.ParseFloat(str, LNumberBit); err != nil {
-				L.Push(LNil)
-			} else {
-				L.Push(LNumber(v))
-			}
+		// no base: full numeral grammar via parseNumber (hex floats
+		// like "0x1p-2" and trailing-dot forms like "3." are valid —
+		// the old integer-only paths returned nil for them); the
+		// syntactic subtype is preserved ("10" → integer, "10.0" → float)
+		if v, err := parseNumber(str); err == nil {
+			L.Push(v)
 		} else {
-			if v, err := strconv.ParseInt(str, base, LNumberBit); err != nil {
-				L.Push(LNil)
-			} else {
-				L.Push(LNumber(v))
-			}
+			L.Push(LNil)
 		}
 	default:
 		L.Push(LNil)

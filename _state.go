@@ -528,6 +528,15 @@ func (rg *registry) SetNumber(regi int, vali LNumber) { // +inline-start
 	}
 } // +inline-end
 
+func (rg *registry) SetInteger(regi int, vali LInteger) { // +inline-start
+	newSize := regi + 1
+	// +inline-call rg.checkSize newSize
+	rg.array[regi] = rg.alloc.LInteger2I(vali)
+	if regi >= rg.top {
+		rg.top = regi + 1
+	}
+} // +inline-end
+
 func (rg *registry) IsFull() bool {
 	return rg.top >= cap(rg.array)
 }
@@ -1461,24 +1470,30 @@ func (ls *LState) ToBool(n int) bool {
 }
 
 func (ls *LState) ToInt(n int) int {
+	if lv, ok := ls.Get(n).(LInteger); ok {
+		return int(lv)
+	}
 	if lv, ok := ls.Get(n).(LNumber); ok {
 		return int(lv)
 	}
 	if lv, ok := ls.Get(n).(LString); ok {
 		if num, err := parseNumber(string(lv)); err == nil {
-			return int(num)
+			return int(LVAsNumber(num))
 		}
 	}
 	return 0
 }
 
 func (ls *LState) ToInt64(n int) int64 {
+	if lv, ok := ls.Get(n).(LInteger); ok {
+		return int64(lv)
+	}
 	if lv, ok := ls.Get(n).(LNumber); ok {
 		return int64(lv)
 	}
 	if lv, ok := ls.Get(n).(LString); ok {
 		if num, err := parseNumber(string(lv)); err == nil {
-			return int64(num)
+			return int64(LVAsNumber(num))
 		}
 	}
 	return 0
@@ -1765,6 +1780,9 @@ func (ls *LState) ObjLen(v1 LValue) int {
 		ls.Push(v1)
 		ls.Call(1, 1)
 		ret := ls.reg.Pop()
+		if iv, ok := ret.(LInteger); ok {
+			return int(iv)
+		}
 		if ret.Type() == LTNumber {
 			return int(ret.(LNumber))
 		}

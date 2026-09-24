@@ -381,7 +381,9 @@ func init() {
 			RA := lbase + A
 			B := int(inst & 0x1ff) //GETB
 			unaryv := L.rkValue(B)
-			if nm, ok := unaryv.(LNumber); ok {
+			if nm, ok := unaryv.(LInteger); ok {
+				// +inline-call reg.SetInteger RA -nm
+			} else if nm, ok := unaryv.(LNumber); ok {
 				// +inline-call reg.Set RA -nm
 			} else {
 				op := L.metaOp1(unaryv, "__unm")
@@ -392,7 +394,12 @@ func init() {
 					// +inline-call reg.Set RA reg.Pop()
 				} else if str, ok1 := unaryv.(LString); ok1 {
 					if num, err := parseNumber(string(str)); err == nil {
-						// +inline-call reg.Set RA -num
+						if iv, ok2 := num.(LInteger); ok2 {
+							// +inline-call reg.SetInteger RA -iv
+						} else {
+							fv := num.(LNumber)
+							// +inline-call reg.Set RA -fv
+						}
 					} else {
 						L.RaiseError("__unm undefined")
 					}
@@ -506,12 +513,10 @@ func init() {
 			rhs := L.rkValue(C)
 			ret := false
 
-			if v1, ok1 := lhs.(LNumber); ok1 {
-				if v2, ok2 := rhs.(LNumber); ok2 {
-					ret = v1 <= v2
-				} else {
-					L.RaiseError("attempt to compare %v with %v", lhs.Type().String(), rhs.Type().String())
-				}
+			if res, ok := numLE(lhs, rhs); ok {
+				ret = res
+			} else if isNumberValue(lhs) || isNumberValue(rhs) {
+				L.RaiseError("attempt to compare %v with %v", lhs.Type().String(), rhs.Type().String())
 			} else {
 				if lhs.Type() != rhs.Type() {
 					L.RaiseError("attempt to compare %v with %v", lhs.Type().String(), rhs.Type().String())
@@ -696,9 +701,9 @@ func init() {
 			lbase := cf.LocalBase
 			A := int(inst>>18) & 0xff //GETA
 			RA := lbase + A
-			if init, ok1 := reg.Get(RA).(LNumber); ok1 {
-				if limit, ok2 := reg.Get(RA + 1).(LNumber); ok2 {
-					if step, ok3 := reg.Get(RA + 2).(LNumber); ok3 {
+			if init, ok1 := arithNumber(reg.Get(RA)); ok1 {
+				if limit, ok2 := arithNumber(reg.Get(RA + 1)); ok2 {
+					if step, ok3 := arithNumber(reg.Get(RA + 2)); ok3 {
 						init += step
 						v := LNumber(init)
 						// +inline-call reg.SetNumber RA v
@@ -727,8 +732,8 @@ func init() {
 			A := int(inst>>18) & 0xff //GETA
 			RA := lbase + A
 			Sbx := int(inst&0x3ffff) - opMaxArgSbx //GETSBX
-			if init, ok1 := reg.Get(RA).(LNumber); ok1 {
-				if step, ok2 := reg.Get(RA + 2).(LNumber); ok2 {
+			if init, ok1 := arithNumber(reg.Get(RA)); ok1 {
+				if step, ok2 := arithNumber(reg.Get(RA + 2)); ok2 {
 					// +inline-call reg.SetNumber RA LNumber(init-step)
 				} else {
 					L.RaiseError("for statement step must be a number")
@@ -839,6 +844,20 @@ func init() {
 	}
 }
 
+// arithNumber returns the float view of either number subtype. Temporary
+// U2a shape: the integer-integer arithmetic paths land in U2b; until then
+// integer operands compute as floats (value-equal for every result the
+// corpora can print, since integral floats still print as integers).
+func arithNumber(v LValue) (LNumber, bool) {
+	switch n := v.(type) {
+	case LNumber:
+		return n, true
+	case LInteger:
+		return LNumber(float64(n)), true
+	}
+	return 0, false
+}
+
 func opArith(L *LState, inst uint32, baseframe *callFrame) int { //OP_ADD, OP_SUB, OP_MUL, OP_DIV, OP_MOD, OP_POW
 	reg := L.reg
 	cf := L.currentFrame
@@ -850,8 +869,8 @@ func opArith(L *LState, inst uint32, baseframe *callFrame) int { //OP_ADD, OP_SU
 	C := int(inst>>9) & 0x1ff //GETC
 	lhs := L.rkValue(B)
 	rhs := L.rkValue(C)
-	v1, ok1 := lhs.(LNumber)
-	v2, ok2 := rhs.(LNumber)
+	v1, ok1 := arithNumber(lhs)
+	v2, ok2 := arithNumber(rhs)
 	if ok1 && ok2 {
 		v := numberArith(L, opcode, LNumber(v1), LNumber(v2))
 		// +inline-call reg.SetNumber RA v
@@ -927,8 +946,8 @@ func objectArith(L *LState, opcode int, lhs, rhs LValue) LValue {
 			rhs = rnum
 		}
 	}
-	if v1, ok1 := lhs.(LNumber); ok1 {
-		if v2, ok2 := rhs.(LNumber); ok2 {
+	if v1, ok1 := arithNumber(lhs); ok1 {
+		if v2, ok2 := arithNumber(rhs); ok2 {
 			return numberArith(L, opcode, LNumber(v1), LNumber(v2))
 		}
 	}
@@ -975,12 +994,137 @@ func stringConcat(L *LState, total, last int) LValue {
 	return rhs
 }
 
+// The four mixed int/float order comparisons below are ports of stock
+// 5.5 lvm.c LTintfloat/LEintfloat/LTfloatint/LEfloatint: compare as floats
+// when the integer survives the round trip (|i| <= 2^53, l_intfitsf),
+// otherwise through the exact floor/ceil of the float operand.
+
+func ltIntFloat(i int64, f float64) bool {
+	if intFitsFloat(i) {
+		return float64(i) < f
+	}
+	if fi, ok := floatToCeilInt(f); ok { // i < f <=> i < ceil(f)
+		return i < fi
+	}
+	return f > 0 // 'f' is greater than all integers, or NaN
+}
+
+func leIntFloat(i int64, f float64) bool {
+	if intFitsFloat(i) {
+		return float64(i) <= f
+	}
+	if fi, ok := floatToFloorInt(f); ok { // i <= f <=> i <= floor(f)
+		return i <= fi
+	}
+	return f > 0
+}
+
+func ltFloatInt(f float64, i int64) bool {
+	if intFitsFloat(i) {
+		return f < float64(i)
+	}
+	if fi, ok := floatToFloorInt(f); ok { // f < i <=> floor(f) < i
+		return fi < i
+	}
+	return f < 0 // 'f' is less than all integers, or NaN
+}
+
+func leFloatInt(f float64, i int64) bool {
+	if intFitsFloat(i) {
+		return f <= float64(i)
+	}
+	if fi, ok := floatToCeilInt(f); ok { // f <= i <=> ceil(f) <= i
+		return fi <= i
+	}
+	return f < 0
+}
+
+// floatToFloorInt / floatToCeilInt are luaV_flttointeger with F2Ifloor /
+// F2Iceil: they fail on NaN/±Inf and on values whose floored/ceiled value
+// falls outside int64; anything else converts.
+func floatToFloorInt(f float64) (int64, bool) {
+	if f != f || f >= 9223372036854775808.0 || f < -9223372036854775808.0 {
+		return 0, false
+	}
+	return int64(math.Floor(f)), true
+}
+
+func floatToCeilInt(f float64) (int64, bool) {
+	if f != f || f >= 9223372036854775808.0 || f < -9223372036854775808.0 {
+		return 0, false
+	}
+	return int64(math.Ceil(f)), true
+}
+
+// numLT/numLE return (result, true) when both operands are numbers —
+// either subtype — and (false, false) for any other pair.
+func numLT(lhs, rhs LValue) (bool, bool) {
+	li, lok := lhs.(LInteger)
+	ri, rok := rhs.(LInteger)
+	lf, lokf := lhs.(LNumber)
+	rf, rokf := rhs.(LNumber)
+	switch {
+	case lok && rok:
+		return li < ri, true
+	case lok && rokf:
+		return ltIntFloat(int64(li), float64(rf)), true
+	case lokf && rok:
+		return ltFloatInt(float64(lf), int64(ri)), true
+	case lokf && rokf:
+		return lf < rf, true
+	}
+	return false, false
+}
+
+func numLE(lhs, rhs LValue) (bool, bool) {
+	li, lok := lhs.(LInteger)
+	ri, rok := rhs.(LInteger)
+	lf, lokf := lhs.(LNumber)
+	rf, rokf := rhs.(LNumber)
+	switch {
+	case lok && rok:
+		return li <= ri, true
+	case lok && rokf:
+		return leIntFloat(int64(li), float64(rf)), true
+	case lokf && rok:
+		return leFloatInt(float64(lf), int64(ri)), true
+	case lokf && rokf:
+		return lf <= rf, true
+	}
+	return false, false
+}
+
+// equalsNumber compares two numbers — either subtype — for exact equality
+// (stock luaV_rawequalobj's int/float case: 2 == 2.0).
+func equalsNumber(lhs, rhs LValue) bool {
+	li, lok := lhs.(LInteger)
+	ri, rok := rhs.(LInteger)
+	if lok && rok {
+		return li == ri
+	}
+	if lok {
+		return eqIntFloat(int64(li), float64(rhs.(LNumber)))
+	}
+	if rok {
+		return eqIntFloat(int64(ri), float64(lhs.(LNumber)))
+	}
+	return lhs.(LNumber) == rhs.(LNumber)
+}
+
+func eqIntFloat(i int64, f float64) bool {
+	if intFitsFloat(i) {
+		return f == float64(i)
+	}
+	fi, ok := floatToIntExact(f)
+	return ok && fi == i
+}
+
 func lessThan(L *LState, lhs, rhs LValue) bool {
 	// optimization for numbers
-	if v1, ok1 := lhs.(LNumber); ok1 {
-		if v2, ok2 := rhs.(LNumber); ok2 {
-			return v1 < v2
-		}
+	if ret, ok := numLT(lhs, rhs); ok {
+		return ret
+	}
+	if isNumberValue(lhs) || isNumberValue(rhs) {
 		L.RaiseError("attempt to compare %v with %v", lhs.Type().String(), rhs.Type().String())
 	}
 	if lhs.Type() != rhs.Type() {
@@ -1000,6 +1144,10 @@ func lessThan(L *LState, lhs, rhs LValue) bool {
 func equals(L *LState, lhs, rhs LValue, raw bool) bool {
 	lt := lhs.Type()
 	if lt != rhs.Type() {
+		// the two number subtypes compare numerically across types
+		if isNumberValue(lhs) && isNumberValue(rhs) {
+			return equalsNumber(lhs, rhs)
+		}
 		return false
 	}
 
@@ -1007,10 +1155,8 @@ func equals(L *LState, lhs, rhs LValue, raw bool) bool {
 	switch lt {
 	case LTNil:
 		ret = true
-	case LTNumber:
-		v1, _ := lhs.(LNumber)
-		v2, _ := rhs.(LNumber)
-		ret = v1 == v2
+	case LTNumber, LTInteger:
+		ret = equalsNumber(lhs, rhs)
 	case LTBool:
 		ret = bool(lhs.(LBool)) == bool(rhs.(LBool))
 	case LTString:

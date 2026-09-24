@@ -17,6 +17,8 @@ func getIntField(L *LState, tb *LTable, key string, v int) int {
 	ret := tb.RawGetString(key)
 
 	switch lv := ret.(type) {
+	case LInteger:
+		return int(lv)
 	case LNumber:
 		return int(lv)
 	case LString:
@@ -30,7 +32,7 @@ func getIntField(L *LState, tb *LTable, key string, v int) int {
 			}
 		}
 		if num, err := parseNumber(slv); err == nil {
-			return int(num)
+			return int(LVAsNumber(num))
 		}
 	default:
 		return v

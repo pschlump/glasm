@@ -345,21 +345,21 @@ func TestCoroutineApi1(t *testing.T) {
 	errorIfNotEqual(t, ResumeYield, st)
 	errorIfNotNil(t, err)
 	errorIfNotEqual(t, 3, len(values))
-	errorIfNotEqual(t, LNumber(1), values[0].(LNumber))
-	errorIfNotEqual(t, LNumber(2), values[1].(LNumber))
-	errorIfNotEqual(t, LNumber(3), values[2].(LNumber))
+	errorIfNotEqual(t, LInteger(1), values[0].(LInteger))
+	errorIfNotEqual(t, LInteger(2), values[1].(LInteger))
+	errorIfNotEqual(t, LInteger(3), values[2].(LInteger))
 
 	st, err, values = L.Resume(co, fn, LNumber(11), LNumber(12))
 	errorIfNotEqual(t, ResumeYield, st)
 	errorIfNotNil(t, err)
 	errorIfNotEqual(t, 1, len(values))
-	errorIfNotEqual(t, LNumber(4), values[0].(LNumber))
+	errorIfNotEqual(t, LInteger(4), values[0].(LInteger))
 
 	st, err, values = L.Resume(co, fn)
 	errorIfNotEqual(t, ResumeOK, st)
 	errorIfNotNil(t, err)
 	errorIfNotEqual(t, 1, len(values))
-	errorIfNotEqual(t, LNumber(5), values[0].(LNumber))
+	errorIfNotEqual(t, LInteger(5), values[0].(LInteger))
 
 	L.Register("myyield", func(L *LState) int {
 		return L.Yield(L.ToNumber(1))
@@ -377,14 +377,16 @@ func TestCoroutineApi1(t *testing.T) {
 	errorIfNotEqual(t, ResumeYield, st)
 	errorIfNotNil(t, err)
 	errorIfNotEqual(t, 3, len(values))
-	errorIfNotEqual(t, LNumber(1), values[0].(LNumber))
-	errorIfNotEqual(t, LNumber(2), values[1].(LNumber))
-	errorIfNotEqual(t, LNumber(3), values[2].(LNumber))
+	errorIfNotEqual(t, LInteger(1), values[0].(LInteger))
+	errorIfNotEqual(t, LInteger(2), values[1].(LInteger))
+	errorIfNotEqual(t, LInteger(3), values[2].(LInteger))
 
 	st, err, values = L.Resume(co, fn)
 	errorIfNotEqual(t, ResumeYield, st)
 	errorIfNotNil(t, err)
 	errorIfNotEqual(t, 1, len(values))
+	// myyield goes through the Go API (L.ToNumber → LNumber), so this
+	// yield keeps the float subtype
 	errorIfNotEqual(t, LNumber(4), values[0].(LNumber))
 
 	st, err, values = L.Resume(co, fn)
@@ -465,7 +467,7 @@ func TestContextWithCroutine(t *testing.T) {
 	fn := L.GetGlobal("coro").(*LFunction)
 	_, err, values := L.Resume(co, fn)
 	errorIfNotNil(t, err)
-	errorIfNotEqual(t, LNumber(0), values[0])
+	errorIfNotEqual(t, LInteger(0), values[0])
 	// cancel the parent context
 	cancel()
 	_, err, values = L.Resume(co, fn)

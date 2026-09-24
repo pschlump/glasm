@@ -41,6 +41,13 @@ func debugGetInfo(L *LState) int {
 			return 1
 		}
 		fn, err = L.GetInfo(what, dbg, LNil)
+	case LInteger:
+		dbg, ok = L.GetStack(int(lv))
+		if !ok {
+			L.Push(LNil)
+			return 1
+		}
+		fn, err = L.GetInfo(what, dbg, LNil)
 	}
 
 	if err != nil {
