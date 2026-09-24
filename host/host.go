@@ -14,9 +14,9 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/pschlump/gopher-lua"
-	"github.com/pschlump/gopher-lua/luawasm"
-	"github.com/pschlump/gopher-lua/parse"
+	"github.com/pschlump/golua55"
+	"github.com/pschlump/golua55/luawasm"
+	"github.com/pschlump/golua55/parse"
 )
 
 // HostFunc is a Lua-visible function implemented in Go (the redis.call

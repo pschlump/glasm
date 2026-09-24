@@ -67,10 +67,10 @@ nsieve ≈ 0.34s, stringwork ≈ 49ms.
   dispatch is a pure-Go callback (no cgo), so it halves to 48x — wazero is
   ~1.9x *faster* than wasmtime here.
 - **Straight-line loop/table code runs faster than the Go interpreter** on
-  wasmtime (nsieve 0.78x of orig TOTAL) — the C rt table ops beat gopher-lua's
+  wasmtime (nsieve 0.78x of orig TOTAL) — the C rt table ops beat golua55's
   Go table implementation.
 - **String-heavy code is 4x slower** on wasmtime: every string op is an rt_* C
-  call from wasm; gopher-lua's native Go string library is fast.
+  call from wasm; golua55's native Go string library is fast.
 - **wazero on darwin/arm64 loses badly on memory-heavy code** (nsieve 9.1s vs
   wasmtime 0.36s ≈ 25x; scales roughly linearly 2^14→2^20, slightly
   superlinear). wazevo *is* compiled in on darwin/arm64 (`isa_arm64.go` has no
@@ -105,7 +105,7 @@ Reading:
   cache, and the M8d globals lockdown is what makes reuse safe).
 - **The per-op string tax remains**: ~10x interp for short string-heavy
   scripts, ~20x for significant string processing (every string op is an
-  rt_* C call from wasm; gopher-lua's native Go string library is fast).
+  rt_* C call from wasm; golua55's native Go string library is fast).
   On darwin/arm64 wazero — the worst-case host (see nsieve note above);
   Linux numbers may be materially better and must be measured before any
   verdict.
@@ -120,7 +120,7 @@ Reading:
 
 ## Incidental finding
 
-`table.concat` of 3000 entries overflows gopher-lua's value registry
+`table.concat` of 3000 entries overflows golua55's value registry
 ("registry overflow", `RegistrySize = 256*20` in config.go) in **both** orig
 and fork — the wasm/C engine runs it fine. Pre-existing upstream behavior, not
 fork-related; l3_stringwork now block-concats by 128 (see script comment).

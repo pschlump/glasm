@@ -61,7 +61,7 @@ typedef int32_t rt_addr;
 #define RT_TUSERDATA 7
 #define RT_TTHREAD 8
 
-/* arith op codes: identical to the Lua 5.1 / gopher-lua opcode numbers
+/* arith op codes: identical to the Lua 5.1 / golua55 opcode numbers
 ** the backend compiles from (OP_ADD=15 .. OP_POW=20) */
 #define RT_OP_ADD 15
 #define RT_OP_SUB 16

@@ -10,7 +10,7 @@ import (
 )
 
 var cluaSkips = map[string]string{
-	"pm.lua":   "fork-adapted file: 'do;' (statement after do) is not Lua 5.1 syntax; gopher-lua's parser accepts it, stock 5.1 does not",
+	"pm.lua":   "fork-adapted file: 'do;' (statement after do) is not Lua 5.1 syntax; golua55's parser accepts it, stock 5.1 does not",
 	"main.lua": "suite driver: spawns the lua binary as subprocesses (RUN/auxrun); the harness runs each test file directly instead",
 	"all.lua":  "suite driver: dofiles main.lua (subprocess driver) — see main.lua skip",
 	"big.lua":  "yield-across-C-boundary test: the boundary error fires outside the suite's guarded position in this port; open investigation carried to M3",

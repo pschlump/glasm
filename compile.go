@@ -5,7 +5,7 @@ import (
 	"math"
 	"reflect"
 
-	"github.com/pschlump/gopher-lua/ast"
+	"github.com/pschlump/golua55/ast"
 )
 
 /* internal constants & structs  {{{ */

@@ -1,7 +1,7 @@
 /*
-** gnumfmt.c — fork-exact number→string conversion (gopher-lua dialect).
+** gnumfmt.c — fork-exact number→string conversion (golua55 dialect).
 **
-** gopher-lua renders a number through LNumber.String():
+** golua55 renders a number through LNumber.String():
 **
 **   if float64(v) == float64(int64(v))  → fmt.Sprint(int64(v))   // integer digits
 **   else                                → fmt.Sprint(float64(v)) // Go %g, shortest

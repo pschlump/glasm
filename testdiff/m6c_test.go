@@ -17,7 +17,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/pschlump/gopher-lua/wasm"
+	"github.com/pschlump/golua55/wasm"
 )
 
 // lua51ProdSHA256 pins the embedded prod blob. Rebuild runtime/build.sh →

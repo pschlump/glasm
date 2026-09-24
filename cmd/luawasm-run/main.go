@@ -16,7 +16,7 @@ import (
 	"os"
 	"strings"
 
-	"github.com/pschlump/gopher-lua/testdiff"
+	"github.com/pschlump/golua55/testdiff"
 )
 
 func main() {

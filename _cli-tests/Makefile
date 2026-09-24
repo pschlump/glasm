@@ -3,7 +3,7 @@
 # Three engines run the same standalone Lua programs and their stdout is
 # diffed byte-for-byte against golden files in ref/:
 #
-#   interp  ../cmd/glua/glua prog.lua args...      gopher-lua interpreter
+#   interp  ../cmd/glua/glua prog.lua args...      golua55 interpreter
 #   wasm    ../cmd/glua/glua -w + -W               Lua->wasm backend
 #   clua    tmp/clua-run prog.lua args...          stock C Lua 5.1 in wasm
 #

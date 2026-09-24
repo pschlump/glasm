@@ -16,7 +16,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/pschlump/gopher-lua/parse"
+	"github.com/pschlump/golua55/parse"
 )
 
 const MultRet = -1

@@ -14,8 +14,8 @@ package luawasm
 import (
 	"fmt"
 
-	"github.com/pschlump/gopher-lua"
-	"github.com/pschlump/gopher-lua/wasm"
+	"github.com/pschlump/golua55"
+	"github.com/pschlump/golua55/wasm"
 )
 
 const opMaxArgSbx = (1<<18 - 1) >> 1

@@ -540,7 +540,7 @@ void rt_gnumfmt(char *s, double n);
 #define luai_numsub(a,b)	((a)-(b))
 #define luai_nummul(a,b)	((a)*(b))
 #define luai_numdiv(a,b)	((a)/(b))
-/* gopher-lua parity (M6e, row 43): the fork's luaModulo is fmod +
+/* golua55 parity (M6e, row 43): the fork's luaModulo is fmod +
    sign-adjust (_vm.go); stock 5.1's floor formula
    ((a) - floor((a)/(b))*(b)) double-rounds — 3%0.1 evaluates to 0
    here (3/0.1 rounds to exactly 30.0) vs the fork's exact

@@ -13,7 +13,7 @@ import (
 
 	"github.com/tetratelabs/wazero"
 
-	w "github.com/pschlump/gopher-lua/wasm"
+	w "github.com/pschlump/golua55/wasm"
 )
 
 func TestSharedMemoryBoundary(t *testing.T) {

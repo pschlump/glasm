@@ -18,7 +18,7 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/pschlump/gopher-lua/wasm"
+	"github.com/pschlump/golua55/wasm"
 )
 
 // The production runtime blob: -DLUAWASM_PROD flavor — base/table/string/

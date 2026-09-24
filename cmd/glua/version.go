@@ -6,7 +6,7 @@ package main
 import (
 	"fmt"
 
-	"github.com/pschlump/gopher-lua"
+	"github.com/pschlump/golua55"
 )
 
 // Overwritten at link time by LDFLAGS in the Makefile; empty in a binary

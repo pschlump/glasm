@@ -5,8 +5,8 @@ package luawasm
 // for loop, TFORLOOP and SETLIST (design doc §4.4).
 
 import (
-	"github.com/pschlump/gopher-lua"
-	"github.com/pschlump/gopher-lua/wasm"
+	"github.com/pschlump/golua55"
+	"github.com/pschlump/golua55/wasm"
 )
 
 // emitArith: R(A) := RK(B) <op> RK(C). Inline fast path when both

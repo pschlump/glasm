@@ -11,7 +11,7 @@ import (
 	"log"
 	"time"
 
-	"github.com/pschlump/gopher-lua/host"
+	"github.com/pschlump/golua55/host"
 )
 
 func main() {

@@ -62,7 +62,7 @@ import (
 	"math/rand"
 	"strings"
 
-	"github.com/pschlump/gopher-lua/parse"
+	"github.com/pschlump/golua55/parse"
 )
 
 // caseRNG derives a per-case deterministic RNG stream from the soak's

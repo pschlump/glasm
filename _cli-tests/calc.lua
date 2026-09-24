@@ -50,7 +50,7 @@ local function number(p)
     end
     local mant = string.sub(p.s, start, p.i - 1)
     -- optional exponent. Applied by repeated *// rather than
-    -- tonumber("1e2"): gopher-lua's tonumber rejects exponent
+    -- tonumber("1e2"): golua55's tonumber rejects exponent
     -- notation (divergence ledger row 25), C accepts it.
     local exp = 0
     local c = string.sub(p.s, p.i, p.i)

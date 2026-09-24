@@ -1,4 +1,4 @@
-module github.com/pschlump/gopher-lua
+module github.com/pschlump/golua55
 
 go 1.27.0
 

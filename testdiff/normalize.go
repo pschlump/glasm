@@ -11,7 +11,7 @@ import (
 	"sort"
 	"strconv"
 
-	"github.com/pschlump/gopher-lua"
+	"github.com/pschlump/golua55"
 )
 
 const (

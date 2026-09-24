@@ -77,7 +77,7 @@ int32_t rt_tail_nargs(void);
 rt_addr rt_tail_funcell(void);
 rt_addr rt_tail_restage(void);
 
-/* ---- M5d: gopher-lua message dialect (internal helpers) ---- */
+/* ---- M5d: golua55 message dialect (internal helpers) ---- */
 
 void rt_set_dialect(int32_t d); /* exported to the host: 1 = gopher texts */
 int rt_gopher_dialect(void);

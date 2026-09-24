@@ -22,7 +22,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/pschlump/gopher-lua/testdiff"
+	"github.com/pschlump/golua55/testdiff"
 )
 
 // ---- generator ----

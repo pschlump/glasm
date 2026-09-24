@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/pschlump/gopher-lua/parse"
+	"github.com/pschlump/golua55/parse"
 )
 
 const maxMemory = 40

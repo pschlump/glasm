@@ -21,12 +21,12 @@ import (
 	"strings"
 	"time"
 
-	newlua "github.com/pschlump/gopher-lua"
-	newparse "github.com/pschlump/gopher-lua/parse"
-	"github.com/pschlump/gopher-lua/testdiff"
+	newlua "github.com/pschlump/golua55"
+	newparse "github.com/pschlump/golua55/parse"
+	"github.com/pschlump/golua55/testdiff"
 
-	origlua "github.com/pschlump/gopher-lua-orig"
-	origparse "github.com/pschlump/gopher-lua-orig/parse"
+	origlua "github.com/pschlump/golua55-orig"
+	origparse "github.com/pschlump/golua55-orig/parse"
 )
 
 const (

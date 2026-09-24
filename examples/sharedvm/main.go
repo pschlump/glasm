@@ -12,7 +12,7 @@ import (
 	"log"
 	"sync"
 
-	"github.com/pschlump/gopher-lua/host"
+	"github.com/pschlump/golua55/host"
 )
 
 func main() {

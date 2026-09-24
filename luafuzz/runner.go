@@ -16,7 +16,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/pschlump/gopher-lua/testdiff"
+	"github.com/pschlump/golua55/testdiff"
 )
 
 // Class is a case outcome (§8.7 plus soak-specific bookkeeping classes).

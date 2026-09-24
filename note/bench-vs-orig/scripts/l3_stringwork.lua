@@ -11,7 +11,7 @@ for i = 1, 3000 do
   local c = words[((i * 13) % 26) + 1]
   lines[i] = string.format("%04d %s %s %s", i, a, b, c)
 end
--- block-concat: gopher-lua's registry (both orig and fork) overflows when
+-- block-concat: golua55's registry (both orig and fork) overflows when
 -- table.concat pushes thousands of entries at once; blocks of 128 keep the
 -- registry flat while producing the identical text.
 local text = ""

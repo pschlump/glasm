@@ -13,7 +13,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/pschlump/gopher-lua"
+	"github.com/pschlump/golua55"
 )
 
 // Interp is the gopher-lua interpreter oracle. Instances are named so two

@@ -26,10 +26,10 @@ import (
 
 	wt "github.com/bytecodealliance/wasmtime-go/v48"
 
-	"github.com/pschlump/gopher-lua"
-	"github.com/pschlump/gopher-lua/luawasm"
-	"github.com/pschlump/gopher-lua/parse"
-	"github.com/pschlump/gopher-lua/wasm"
+	"github.com/pschlump/golua55"
+	"github.com/pschlump/golua55/luawasm"
+	"github.com/pschlump/golua55/parse"
+	"github.com/pschlump/golua55/wasm"
 )
 
 // gcStop runs collectgarbage('stop') in the runtime state via the M2
