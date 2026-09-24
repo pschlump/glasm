@@ -24,9 +24,9 @@ for file in sorted(files, reverse=True):
     name = ""
     while i < len(contents):
         line = contents[i]
-        m = re.match(".*\/\/ \+inline-start", line)
+        m = re.match(r".*\/\/ \+inline-start", line)
         if m:
-            m2 = re.match("^func\s*(\([\*\s\w]+\))?\s*(\w+)\(([^\)]*)\)", line)
+            m2 = re.match(r"^func\s*(\([\*\s\w]+\))?\s*(\w+)\(([^\)]*)\)", line)
             name = m2.group(2)
             tinline = inline(name)
             tinline.original = line.split("//")[0].strip().rstrip("{")
@@ -36,7 +36,7 @@ for file in sorted(files, reverse=True):
             tinline.args = [arg.strip().split(" ")[0] for arg in m2.group(3).split(",")]
             inlines[name] = tinline
         else:
-            if re.match(".*\/\/\s*\+inline-end", line):
+            if re.match(r".*\/\/\s*\+inline-end", line):
                 inlines[name].contents = "\n".join(inlines[name].contents)
                 name = ""
             elif len(name) > 0:
@@ -50,7 +50,7 @@ def do_inlining(text):
     i = 0
     while i < len(contents):
         line = contents[i]
-        m = re.match("\s*\/\/\s*\+inline-call\s+([\w\.]+)\s+(.*)", line)
+        m = re.match(r"\s*\/\/\s*\+inline-call\s+([\w\.]+)\s+(.*)", line)
         if m:
             inlinet = inlines[m.group(1).split(".")[-1]]
             buf.append("// this section is inlined by go-inline")

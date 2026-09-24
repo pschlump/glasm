@@ -1,4 +1,4 @@
-// Command luabench compares the modified gopher-lua fork against the
+// Command luabench compares the modified golua55 fork against the
 // near-original baseline, side by side in one process:
 //
 //   - parse+compile time      (orig vs new frontend)
@@ -43,7 +43,7 @@ func must(err error) {
 }
 
 type stats struct {
-	n             int
+	n              int
 	min, med, mean time.Duration
 }
 

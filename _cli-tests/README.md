@@ -4,11 +4,11 @@ Standalone Lua programs run as real CLI invocations across **three
 engines**, with stdout diffed byte-for-byte against golden files in
 `ref/`:
 
-| engine | invocation | what it is |
-|---|---|---|
-| interp | `../cmd/glua/glua prog.lua args...` | the gopher-lua interpreter |
-| wasm | `glua -w tmp/p.wasm prog.lua` then `glua -W tmp/p.wasm args...` | the Lua→wasm backend (compile, then run precompiled) |
-| clua | `tmp/clua-run prog.lua args...` | stock C Lua 5.1 in wasm — the semantic authority |
+| engine | invocation                                                      | what it is                                           |
+|--------|-----------------------------------------------------------------|------------------------------------------------------|
+| interp | `../cmd/glua/glua prog.lua args...`                             | the golua55 interpreter                              |
+| wasm   | `glua -w tmp/p.wasm prog.lua` then `glua -W tmp/p.wasm args...` | the Lua→wasm backend (compile, then run precompiled) |
+| clua   | `tmp/clua-run prog.lua args...`                                 | stock C Lua 5.1 in wasm — the semantic authority     |
 
 `make test` runs everything (~35 targets). `make refs` regenerates the
 golden files — from interp (the primary oracle) except the per-engine
