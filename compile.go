@@ -1370,7 +1370,7 @@ func compileExpr(context *funcContext, reg int, expr ast.Expr, ec *expcontext) i
 	case *ast.StringConcatOpExpr:
 		compileStringConcatOpExpr(context, reg, ex, ec)
 		return sused
-	case *ast.UnaryMinusOpExpr, *ast.UnaryNotOpExpr, *ast.UnaryLenOpExpr:
+	case *ast.UnaryMinusOpExpr, *ast.UnaryNotOpExpr, *ast.UnaryLenOpExpr, *ast.UnaryBNotOpExpr:
 		compileUnaryOpExpr(context, reg, ex, ec)
 		return sused
 	case *ast.RelationalOpExpr:
@@ -1425,35 +1425,51 @@ func compileExprWithMVPropagation(context *funcContext, expr ast.Expr, reg *int,
 	compileExprWithPropagation(context, expr, reg, save, context.Code.PropagateMV)
 } // }}}
 
+// constFold folds arithmetic on numerals, porting stock lcode.c
+// constfolding/validop (U2b): operands keep their syntactic subtype, int
+// ops fold with 5.3 wrap-around semantics, ops that would error are left
+// for runtime (division by zero, non-integral bitwise operands), and
+// float results equal to 0 or NaN are never folded (avoids -0.0/NaN in
+// the constant pool).
 func constFold(exp ast.Expr) ast.Expr { // {{{
 	switch expr := exp.(type) {
 	case *ast.ArithmeticOpExpr:
-		lvalue, lisconst := lnumberValue(constFold(expr.Lhs))
-		rvalue, risconst := lnumberValue(constFold(expr.Rhs))
+		lvalue, lisconst := constNumberValue(constFold(expr.Lhs))
+		rvalue, risconst := constNumberValue(constFold(expr.Rhs))
 		if lisconst && risconst {
-			switch expr.Operator {
-			case "+":
-				return &constLValueExpr{Value: lvalue + rvalue}
-			case "-":
-				return &constLValueExpr{Value: lvalue - rvalue}
-			case "*":
-				return &constLValueExpr{Value: lvalue * rvalue}
-			case "/":
-				return &constLValueExpr{Value: lvalue / rvalue}
-			case "%":
-				return &constLValueExpr{Value: luaModulo(lvalue, rvalue)}
-			case "^":
-				return &constLValueExpr{Value: LNumber(math.Pow(float64(lvalue), float64(rvalue)))}
-			default:
-				panic(fmt.Sprintf("unknown binop: %v", expr.Operator))
+			op := arithOpForOperator(expr.Operator)
+			if !foldValidOp(op, lvalue, rvalue) {
+				return expr
 			}
-		} else {
-			return expr
+			if v, _, res := arithCompute(op, lvalue, rvalue); res == arithDone {
+				if f, isFloat := v.(LNumber); isFloat && (f != f || f == 0) {
+					return expr
+				}
+				return &constLValueExpr{Value: v}
+			}
 		}
+		return expr
 	case *ast.UnaryMinusOpExpr:
 		expr.Expr = constFold(expr.Expr)
-		if value, ok := lnumberValue(expr.Expr); ok {
-			return &constLValueExpr{Value: LNumber(-value)}
+		if value, ok := constNumberValue(expr.Expr); ok {
+			if iv, isInt := value.(LInteger); isInt {
+				return &constLValueExpr{Value: -iv}
+			}
+			if fv := value.(LNumber); fv != 0 && fv == fv {
+				return &constLValueExpr{Value: -fv}
+			}
+		}
+		return expr
+	case *ast.UnaryBNotOpExpr:
+		expr.Expr = constFold(expr.Expr)
+		if value, ok := constNumberValue(expr.Expr); ok {
+			// validop's rule: both operands must convert to integers
+			if iv, isInt := value.(LInteger); isInt {
+				return &constLValueExpr{Value: ^iv}
+			}
+			if iv, ok := toIntBitwise(value); ok {
+				return &constLValueExpr{Value: ^LInteger(iv)}
+			}
 		}
 		return expr
 	default:
@@ -1461,6 +1477,70 @@ func constFold(exp ast.Expr) ast.Expr { // {{{
 		return exp
 	}
 } // }}}
+
+// constNumberValue extracts the numeral value (subtype preserved) of a
+// constant expression.
+func constNumberValue(expr ast.Expr) (LValue, bool) {
+	if ex, ok := expr.(*ast.NumberExpr); ok {
+		lv, err := parseNumber(ex.Value)
+		if err != nil {
+			return LNumber(math.NaN()), true
+		}
+		return lv, true
+	} else if ex, ok := expr.(*constLValueExpr); ok {
+		switch ex.Value.(type) {
+		case LNumber, LInteger:
+			return ex.Value, true
+		}
+	}
+	return nil, false
+}
+
+// arithOpForOperator maps the AST operator string to its opcode.
+func arithOpForOperator(opr string) int {
+	switch opr {
+	case "+":
+		return OP_ADD
+	case "-":
+		return OP_SUB
+	case "*":
+		return OP_MUL
+	case "/":
+		return OP_DIV
+	case "%":
+		return OP_MOD
+	case "^":
+		return OP_POW
+	case "//":
+		return OP_IDIV
+	case "&":
+		return OP_BAND
+	case "|":
+		return OP_BOR
+	case "~":
+		return OP_BXOR
+	case "<<":
+		return OP_SHL
+	case ">>":
+		return OP_SHR
+	}
+	panic(fmt.Sprintf("unknown binop: %v", opr))
+}
+
+// foldValidOp ports stock lcode.c validop: the folding guard for
+// error-prone operations (bitwise needs integer-convertible operands;
+// the divisions need a nonzero divisor).
+func foldValidOp(op int, v1, v2 LValue) bool {
+	switch op {
+	case OP_BAND, OP_BOR, OP_BXOR, OP_SHL, OP_SHR, OP_BNOT:
+		_, ok1 := toIntBitwise(v1)
+		_, ok2 := toIntBitwise(v2)
+		return ok1 && ok2
+	case OP_DIV, OP_IDIV, OP_MOD:
+		return LVAsNumber(v2) != 0
+	}
+	return true
+}
 
 func compileFunctionExpr(context *funcContext, funcexpr *ast.FunctionExpr, ec *expcontext) { // {{{
 	context.Proto.LineDefined = sline(funcexpr)
@@ -1608,6 +1688,18 @@ func compileArithmeticOpExpr(context *funcContext, reg int, expr *ast.Arithmetic
 		op = OP_MOD
 	case "^":
 		op = OP_POW
+	case "//":
+		op = OP_IDIV
+	case "&":
+		op = OP_BAND
+	case "|":
+		op = OP_BOR
+	case "~":
+		op = OP_BXOR
+	case "<<":
+		op = OP_SHL
+	case ">>":
+		op = OP_SHR
 	}
 	context.Code.AddABC(op, a, b, c, sline(expr))
 } // }}}
@@ -1648,6 +1740,16 @@ func compileUnaryOpExpr(context *funcContext, reg int, expr ast.Expr, ec *expcon
 		ex, _ = exp.(*ast.UnaryMinusOpExpr)
 		operandexpr = ex.Expr
 		opcode = OP_UNM
+	case *ast.UnaryBNotOpExpr:
+		exp := constFold(ex)
+		if lvexpr, ok := exp.(*constLValueExpr); ok {
+			exp.SetLine(sline(expr))
+			compileExpr(context, reg, lvexpr, ec)
+			return
+		}
+		ex, _ = exp.(*ast.UnaryBNotOpExpr)
+		operandexpr = ex.Expr
+		opcode = OP_BNOT
 	case *ast.UnaryNotOpExpr:
 		switch ex.Expr.(type) {
 		case *ast.TrueExpr:

@@ -324,3 +324,23 @@ U5).
   regenerated; `_cli-tests make` PASS. (3) key02 case added covering explicit-key `next`.
   Final U2a state: `go test ./...` exit=0 (testdiff full gates ~6 min), `_cli-tests` PASS,
   `TestU2Gate` 6/6 byte-exact. **Next: U2b** (operators + integer arithmetic semantics).
+- **2026-09-24 (U2b)** — **implemented and gated**: operators `// & | ~ << >>` + unary `~`
+  end-to-end (lexer tokens, goyacc grammar with stock's precedence ladder — parse trees
+  oracle-verified incl. `~2^3` == `~(2^3)`, `\u{XXX}` escapes with stock's error near-texts),
+  7 appended opcodes (42–48; 0–41 stay stable for the frozen rt ABI), subtype const-folding
+  (validop + NaN/0 port), and the semantics core in `_vm.go`: `arithCompute` (int wrap, float
+  promotion, `/`+`^` always float, floor `//`/`%` with 5.5.1's texts — note **idiv by zero is
+  "attempt to divide by zero"**, not 5.4's 'n//0' wording), bitwise via F2Ieq with
+  **LOGICAL right shifts** (intop's unsigned cast: `-1 >> 1` == maxint), `#` returns integers,
+  count-based integer for-loops on the fork's test-first flow (row 57's saturation edge), and
+  the float flavor now coerces/rewrites its cells (string limits work) with stock's
+  `bad 'for' …` texts + `'for' step is zero`. Oracle-corrected along the way: `math.huge` →
+  Inf (was MaxFloat64), and **no string coercion for bitwise ops** (stock stringmetamethods
+  carries only __add…__unm — `"3" & 5` is a type error; bwcoercion.lua tests exactly that).
+  Triage: `_glua-tests/vm.lua` old-text asserts made engine-neutral; `_wasm-tests` (7 cases)
+  + `_wasm-err-tests` (ar00–17, fo00–05, mi00–01) skip on ledger row 56 (interp speaks
+  stock-5.5 texts/semantics, the 5.1 rt blob doesn't until U2e; corpus re-pins at U2f); the
+  fuzzer folds row-56 text families in its runner comparison and its generator avoids
+  %-by-zero forms. **Gates**: `TestU2Gate` 10/10 byte-exact (`_u2` +bit01/ari02/for01/esc03),
+  `go test ./...` exit=0 (testdiff full ~6.5 min), `_cli-tests` PASS. Ledger rows 56–58.
+  **Next: U2c** (encoding cutover in Go).

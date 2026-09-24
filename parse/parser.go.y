@@ -55,16 +55,21 @@ import (
 %token<token> TAnd TBreak TDo TElse TElseIf TEnd TFalse TFor TFunction TIf TIn TLocal TNil TNot TOr TReturn TRepeat TThen TTrue TUntil TWhile TGoto
 
 /* Literals */
-%token<token> TEqeq TNeq TLte TGte T2Comma T3Comma T2Colon TIdent TNumber TString '{' '('
+%token<token> TEqeq TNeq TLte TGte T2Comma T3Comma T2Colon TIdent TNumber TString '{' '(' TIDiv TBand TBor TBXor TShl TShr
 
-/* Operators */
+/* Operators — precedence follows stock lparser.c priority[] (U2b):
+   | < ~ < & < shifts < .. < + - < * / // % < unary < ^ */
 %left TOr
 %left TAnd
 %left '>' '<' TGte TLte TEqeq TNeq
+%left TBor
+%left TBXor
+%left TBand
+%left TShl TShr
 %right T2Comma
 %left '+' '-'
-%left '*' '/' '%'
-%right UNARY /* not # -(unary) */
+%left '*' '/' '%' TIDiv
+%right UNARY /* not # -(unary) ~(unary) */
 %right '^'
 
 %%
@@ -371,6 +376,30 @@ expr:
             $$ = &ast.ArithmeticOpExpr{Lhs: $1, Operator: "/", Rhs: $3}
             $$.SetLine($1.Line())
         } |
+        expr TIDiv expr {
+            $$ = &ast.ArithmeticOpExpr{Lhs: $1, Operator: "//", Rhs: $3}
+            $$.SetLine($1.Line())
+        } |
+        expr TBand expr {
+            $$ = &ast.ArithmeticOpExpr{Lhs: $1, Operator: "&", Rhs: $3}
+            $$.SetLine($1.Line())
+        } |
+        expr TBor expr {
+            $$ = &ast.ArithmeticOpExpr{Lhs: $1, Operator: "|", Rhs: $3}
+            $$.SetLine($1.Line())
+        } |
+        expr TBXor expr {
+            $$ = &ast.ArithmeticOpExpr{Lhs: $1, Operator: "~", Rhs: $3}
+            $$.SetLine($1.Line())
+        } |
+        expr TShl expr {
+            $$ = &ast.ArithmeticOpExpr{Lhs: $1, Operator: "<<", Rhs: $3}
+            $$.SetLine($1.Line())
+        } |
+        expr TShr expr {
+            $$ = &ast.ArithmeticOpExpr{Lhs: $1, Operator: ">>", Rhs: $3}
+            $$.SetLine($1.Line())
+        } |
         expr '%' expr {
             $$ = &ast.ArithmeticOpExpr{Lhs: $1, Operator: "%", Rhs: $3}
             $$.SetLine($1.Line())
@@ -381,6 +410,10 @@ expr:
         } |
         '-' expr %prec UNARY {
             $$ = &ast.UnaryMinusOpExpr{Expr: $2}
+            $$.SetLine($2.Line())
+        } |
+        TBXor expr %prec UNARY {
+            $$ = &ast.UnaryBNotOpExpr{Expr: $2}
             $$.SetLine($2.Line())
         } |
         TNot expr %prec UNARY {

@@ -96,8 +96,20 @@ const (
 	OP_VARARG /*     A B     R(A) R(A+1) ... R(A+B-1) = vararg            */
 
 	OP_NOP /* NOP */
+
+	// U2b additions (5.3 operators on the fork encoding; appended after
+	// OP_NOP so opcode numbers 0..41 stay stable — the wasm rt ABI froze
+	// RT_OP_ADD..RT_OP_UNM against them). The 5.5-format cutover (U2c)
+	// renumbers the whole set.
+	OP_IDIV /*    A B C   R(A) := RK(B) // RK(C)                          */
+	OP_BAND /*    A B C   R(A) := RK(B) & RK(C)                           */
+	OP_BOR  /*    A B C   R(A) := RK(B) | RK(C)                           */
+	OP_BXOR /*    A B C   R(A) := RK(B) ~ RK(C)                           */
+	OP_SHL  /*    A B C   R(A) := RK(B) << RK(C)                          */
+	OP_SHR  /*    A B C   R(A) := RK(B) >> RK(C)                          */
+	OP_BNOT /*    A B     R(A) := ~R(B)                                   */
 )
-const opCodeMax = OP_NOP
+const opCodeMax = OP_BNOT
 
 type opArgMode int
 
@@ -168,6 +180,13 @@ var opProps = []opProp{
 	opProp{"CLOSURE", false, true, opArgModeU, opArgModeN, opTypeABx},
 	opProp{"VARARG", false, true, opArgModeU, opArgModeN, opTypeABC},
 	opProp{"NOP", false, false, opArgModeR, opArgModeN, opTypeASbx},
+	opProp{"IDIV", false, true, opArgModeK, opArgModeK, opTypeABC},
+	opProp{"BAND", false, true, opArgModeK, opArgModeK, opTypeABC},
+	opProp{"BOR", false, true, opArgModeK, opArgModeK, opTypeABC},
+	opProp{"BXOR", false, true, opArgModeK, opArgModeK, opTypeABC},
+	opProp{"SHL", false, true, opArgModeK, opArgModeK, opTypeABC},
+	opProp{"SHR", false, true, opArgModeK, opArgModeK, opTypeABC},
+	opProp{"BNOT", false, true, opArgModeR, opArgModeN, opTypeABC},
 }
 
 func opGetOpCode(inst uint32) int {
@@ -366,6 +385,20 @@ func opToString(inst uint32) string {
 		buf += fmt.Sprintf(";  R(%v) R(%v+1) ... R(%v+%v-1) = vararg", arga, arga, arga, argb)
 	case OP_NOP:
 		/* nothing to do */
+	case OP_IDIV:
+		buf += fmt.Sprintf("; R(%v) := RK(%v) // RK(%v)", arga, argb, argc)
+	case OP_BAND:
+		buf += fmt.Sprintf("; R(%v) := RK(%v) & RK(%v)", arga, argb, argc)
+	case OP_BOR:
+		buf += fmt.Sprintf("; R(%v) := RK(%v) | RK(%v)", arga, argb, argc)
+	case OP_BXOR:
+		buf += fmt.Sprintf("; R(%v) := RK(%v) ~ RK(%v)", arga, argb, argc)
+	case OP_SHL:
+		buf += fmt.Sprintf("; R(%v) := RK(%v) << RK(%v)", arga, argb, argc)
+	case OP_SHR:
+		buf += fmt.Sprintf("; R(%v) := RK(%v) >> RK(%v)", arga, argb, argc)
+	case OP_BNOT:
+		buf += fmt.Sprintf("; R(%v) := ~R(%v)", arga, argb)
 	}
 	return buf
 }

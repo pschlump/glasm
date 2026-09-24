@@ -228,10 +228,15 @@ func RunCase(engines []testdiff.Engine, dir string, idx int, src []byte) CaseOut
 	}
 
 	// byte-for-byte event-log diff (GLOBALS/traceback exclusions are
-	// the harness contract)
-	base := logs[0]
+	// the harness contract), after folding the ledgered error-text
+	// families to one canonical form: the interp re-pinned its arith/
+	// bitwise/for/len wording to stock 5.5 (U2b, ledger row 56) while
+	// the 5.1 rt blob still speaks gopher wording until the 5.5 rt port
+	// — a generator can emit those ops, so both sides normalize here.
+	// U2f's corpus re-pin retires this folding.
+	base := normalizeRow56(logs[0])
 	for i := 1; i < len(logs); i++ {
-		if d := testdiff.DiffLogs(base, logs[i]); d != "" {
+		if d := testdiff.DiffLogs(base, normalizeRow56(logs[i])); d != "" {
 			out.Class = ClassDiverge
 			out.Detail = fmt.Sprintf("%s vs %s:\n%s", names[0], names[i], d)
 			out.Sig = sigOf(firstWords(d, 6))
@@ -239,6 +244,57 @@ func RunCase(engines []testdiff.Engine, dir string, idx int, src []byte) CaseOut
 		}
 	}
 	out.Class = ClassPass
+	return out
+}
+
+// row56Folds maps the fragments of each ruled error family — gopher
+// wording (the wasm rt's) and the stock-5.5 wording (the interp's, since
+// U2b) — to one token, so the families compare equal across engines
+// (ledger row 56). The interp's UNM error text equals its binary-arith
+// text, so "__unm undefined" folds into the arithmetic family.
+var row56Folds = []struct {
+	fragments []string
+	token     string
+}{
+	{[]string{"cannot perform ", "attempt to perform arithmetic on ", "__unm undefined"}, "<ARITHERR>"},
+	{[]string{"attempt to perform bitwise operation on "}, "<BITERR>"},
+	{[]string{"for statement ", "bad 'for' "}, "<FORERR>"},
+	{[]string{"__len undefined", "attempt to get length of "}, "<LENERR>"},
+}
+
+// normalizeRow56 folds the row-56 error-text families in an event log.
+// Lines not carrying any family fragment pass through untouched.
+func normalizeRow56(log []string) []string {
+	out := make([]string, len(log))
+	for i, l := range log {
+		folded := l
+		for _, f := range row56Folds {
+			match := false
+			for _, frag := range f.fragments {
+				if strings.Contains(folded, frag) {
+					match = true
+					break
+				}
+			}
+			if match {
+				// keep the position prefix (through the first ": " of
+				// the message HEAD — interp ERROR lines embed traceback
+				// tails whose own ": " must not be folded from) and
+				// replace the message; DiffLogs strips tails anyway
+				head := folded
+				if nl := strings.IndexByte(head, '\n'); nl >= 0 {
+					head = head[:nl]
+				}
+				if idx := strings.Index(head, ": "); idx >= 0 {
+					folded = head[:idx+2] + f.token
+				} else {
+					folded = f.token
+				}
+				break
+			}
+		}
+		out[i] = folded
+	}
 	return out
 }
 

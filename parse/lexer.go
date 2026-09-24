@@ -437,6 +437,51 @@ func (sc *Scanner) scanEscape(buf *bytes.Buffer, raw *[]byte) error {
 				break
 			}
 		}
+	case 'u': // \u{XXX}: UTF-8 escape (5.3; port of utf8esc/readutf8esc)
+		saved('u')
+		if c := sc.Peek(); c != '{' {
+			if c != EOF {
+				sc.Next()
+				saved(byte(c))
+			}
+			return sc.Error(string(*raw), "missing '{'")
+		}
+		saved('{')
+		sc.Next() // consume '{'
+		c := sc.Peek()
+		if c == EOF || !isHexDigit(byte(c)) {
+			if c != EOF {
+				sc.Next()
+				saved(byte(c))
+			}
+			return sc.Error(string(*raw), "hexadecimal digit expected")
+		}
+		r := uint32(hexValue(byte(c)))
+		i := 4 // saved chars to drop: "\u{X"
+		for {
+			saved(byte(c)) // save_and_next of the digit folded into r
+			sc.Next()
+			if c = sc.Peek(); c == EOF || !isHexDigit(byte(c)) {
+				break
+			}
+			i++
+			if r > 0x7FFFFFFF>>4 {
+				sc.Next()
+				saved(byte(c))
+				return sc.Error(string(*raw), "UTF-8 value too large")
+			}
+			r = r<<4 + uint32(hexValue(byte(c)))
+		}
+		if c != '}' {
+			if c != EOF {
+				sc.Next()
+				saved(byte(c))
+			}
+			return sc.Error(string(*raw), "missing '}'")
+		}
+		sc.Next() // skip '}'
+		*raw = (*raw)[:len(*raw)-i]
+		writeUtf8Esc(buf, r)
 	default:
 		if '0' <= ch && ch <= '9' { // \ddd: up to three digits, ≤ 255
 			ndigits := 1
@@ -476,6 +521,26 @@ func hexValue(c byte) int {
 	default:
 		return int(c-'A') + 10
 	}
+}
+
+// writeUtf8Esc ports stock luaO_utf8esc: encode x (<= 0x7FFFFFFF) in up to
+// six bytes of Lua's extended UTF-8 scheme (not capped at 0x10FFFF).
+func writeUtf8Esc(buf *bytes.Buffer, x uint32) {
+	var b [8]byte
+	n := 1
+	if x < 0x80 {
+		b[7] = byte(x)
+	} else {
+		mfb := uint32(0x3f) // maximum that fits in the first byte
+		for x > mfb {       // add continuation bytes
+			b[8-n] = byte(0x80 | (x & 0x3f))
+			n++
+			x >>= 6
+			mfb >>= 1
+		}
+		b[8-n] = byte((^mfb << 1) | x) // add first byte
+	}
+	buf.Write(b[8-n : 8])
 }
 
 func (sc *Scanner) countSep(ch int) (int, int) {
@@ -614,26 +679,35 @@ redo:
 				sc.Next()
 			} else {
 				// stock 5.5 returns '~' as a single-char token (BXOR);
-				// the 5.2-era grammar here has no use for it yet, so it
-				// reaches the parser and fails as "unexpected symbol"
-				tok.Type = ch
-				tok.Str = string(rune(ch))
+				// U2b gives the grammar its binary/unary uses
+				tok.Type = TBXor
+				tok.Str = "~"
 			}
 		case '<':
-			if sc.Peek() == '=' {
+			switch sc.Peek() {
+			case '=':
 				tok.Type = TLte
 				tok.Str = "<="
 				sc.Next()
-			} else {
+			case '<':
+				tok.Type = TShl
+				tok.Str = "<<"
+				sc.Next()
+			default:
 				tok.Type = ch
 				tok.Str = string(rune(ch))
 			}
 		case '>':
-			if sc.Peek() == '=' {
+			switch sc.Peek() {
+			case '=':
 				tok.Type = TGte
 				tok.Str = ">="
 				sc.Next()
-			} else {
+			case '>':
+				tok.Type = TShr
+				tok.Str = ">>"
+				sc.Next()
+			default:
 				tok.Type = ch
 				tok.Str = string(rune(ch))
 			}
@@ -667,7 +741,22 @@ redo:
 				tok.Type = ch
 				tok.Str = string(rune(ch))
 			}
-		case '+', '*', '/', '%', '^', '#', '(', ')', '{', '}', ']', ';', ',':
+		case '/':
+			if sc.Peek() == '/' {
+				tok.Type = TIDiv
+				tok.Str = "//"
+				sc.Next()
+			} else {
+				tok.Type = ch
+				tok.Str = string(rune(ch))
+			}
+		case '&':
+			tok.Type = TBand
+			tok.Str = "&"
+		case '|':
+			tok.Type = TBor
+			tok.Str = "|"
+		case '+', '*', '%', '^', '#', '(', ')', '{', '}', ']', ';', ',':
 			tok.Type = ch
 			tok.Str = string(rune(ch))
 		default:

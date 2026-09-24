@@ -348,7 +348,13 @@ func (g *gen) num(d int) string {
 		// 0.1^2 (repeated squaring vs correct rounding). Ledgered libm
 		// ruling (row 48); the durable fix is porting Go's
 		// exp/log/pow into the runtime for byte-parity.
-		op := g.pick([]string{"+", "-", "*", "/", "%"})
+		// no general "%": interp errors on integer n%0 (5.5, ledger row
+		// 56) while the 5.1 rt computes nan — ruled until the ABI v4
+		// port, so modulo always takes a nonzero literal RHS.
+		if g.rnd.Intn(5) == 0 {
+			return fmt.Sprintf("(%s %% %s)", g.arithOperand(), g.pick([]string{"1", "2", "3", "7", "0.5", "1.5"}))
+		}
+		op := g.pick([]string{"+", "-", "*", "/"})
 		return fmt.Sprintf("(%s %s %s)", g.arithOperand(), op, g.arithOperand())
 	case r < 8:
 		// operand parenthesized: a pool literal like "-2" after the

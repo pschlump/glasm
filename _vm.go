@@ -392,19 +392,15 @@ func init() {
 					reg.Push(unaryv)
 					L.Call(1, 1)
 					// +inline-call reg.Set RA reg.Pop()
-				} else if str, ok1 := unaryv.(LString); ok1 {
-					if num, err := parseNumber(string(str)); err == nil {
-						if iv, ok2 := num.(LInteger); ok2 {
-							// +inline-call reg.SetInteger RA -iv
-						} else {
-							fv := num.(LNumber)
-							// +inline-call reg.Set RA -fv
-						}
+				} else if num, ok1 := coerceStringNumber(unaryv); ok1 {
+					if iv, ok2 := num.(LInteger); ok2 {
+						// +inline-call reg.SetInteger RA -iv
 					} else {
-						L.RaiseError("__unm undefined")
+						fv := num.(LNumber)
+						// +inline-call reg.Set RA -fv
 					}
 				} else {
-					L.RaiseError("__unm undefined")
+					L.RaiseError("attempt to perform arithmetic on a %s value", unaryv.Type().String())
 				}
 			}
 			return 0
@@ -432,7 +428,8 @@ func init() {
 			B := int(inst & 0x1ff) //GETB
 			switch lv := L.rkValue(B).(type) {
 			case LString:
-				// +inline-call reg.SetNumber RA LNumber(len(lv))
+				nv := LInteger(len(lv))
+				// +inline-call reg.SetInteger RA nv
 			default:
 				op := L.metaOp1(lv, "__len")
 				if op.Type() == LTFunction {
@@ -440,16 +437,12 @@ func init() {
 					reg.Push(lv)
 					L.Call(1, 1)
 					ret := reg.Pop()
-					if ret.Type() == LTNumber {
-						v, _ := ret.(LNumber)
-						// +inline-call reg.SetNumber RA v
-					} else {
-						// +inline-call reg.Set RA ret
-					}
+					// +inline-call reg.Set RA ret
 				} else if lv.Type() == LTTable {
-					// +inline-call reg.SetNumber RA LNumber(lv.(*LTable).Len())
+					nv := LInteger(lv.(*LTable).Len())
+					// +inline-call reg.SetInteger RA nv
 				} else {
-					L.RaiseError("__len undefined")
+					L.RaiseError("attempt to get length of a %s value", lv.Type().String())
 				}
 			}
 			return 0
@@ -701,7 +694,22 @@ func init() {
 			lbase := cf.LocalBase
 			A := int(inst>>18) & 0xff //GETA
 			RA := lbase + A
-			if init, ok1 := arithNumber(reg.Get(RA)); ok1 {
+			if count, ok := reg.Get(RA).(LInteger); ok {
+				// integer loop: RA=count, RA+1=step, RA+2=idx, RA+3=visible
+				if count > 0 {
+					nv := count - 1
+					// +inline-call reg.SetInteger RA nv
+					step := int64(reg.Get(RA + 1).(LInteger))
+					idx := int64(reg.Get(RA+2).(LInteger)) + step
+					iv := LInteger(idx)
+					// +inline-call reg.SetInteger RA+2 iv
+					// +inline-call reg.SetInteger RA+3 iv
+					Sbx := int(inst&0x3ffff) - opMaxArgSbx //GETSBX
+					cf.Pc += Sbx
+				} else {
+					// +inline-call reg.SetTop RA+1
+				}
+			} else if init, ok1 := arithNumber(reg.Get(RA)); ok1 {
 				if limit, ok2 := arithNumber(reg.Get(RA + 1)); ok2 {
 					if step, ok3 := arithNumber(reg.Get(RA + 2)); ok3 {
 						init += step
@@ -714,14 +722,8 @@ func init() {
 						} else {
 							// +inline-call reg.SetTop RA+1
 						}
-					} else {
-						L.RaiseError("for statement step must be a number")
 					}
-				} else {
-					L.RaiseError("for statement limit must be a number")
 				}
-			} else {
-				L.RaiseError("for statement init must be a number")
 			}
 			return 0
 		},
@@ -732,14 +734,67 @@ func init() {
 			A := int(inst>>18) & 0xff //GETA
 			RA := lbase + A
 			Sbx := int(inst&0x3ffff) - opMaxArgSbx //GETSBX
-			if init, ok1 := arithNumber(reg.Get(RA)); ok1 {
-				if step, ok2 := arithNumber(reg.Get(RA + 2)); ok2 {
-					// +inline-call reg.SetNumber RA LNumber(init-step)
+			initv := reg.Get(RA)
+			stepv := reg.Get(RA + 2)
+			initi, initIsInt := initv.(LInteger)
+			stepi, stepIsInt := stepv.(LInteger)
+			if initIsInt && stepIsInt {
+				// integer loop (init and step are integer-Typed, per stock
+				// forprep; the limit converts below). Layout: RA=count,
+				// RA+1=step, RA+2=idx, RA+3=visible (the compiler's slots).
+				if stepi == 0 {
+					L.RaiseError("'for' step is zero")
+				}
+				limit, skip := forLimitInt(L, int64(initi), reg.Get(RA+1), int64(stepi))
+				if skip {
+					zv := LInteger(0)
+					// +inline-call reg.SetInteger RA zv
 				} else {
-					L.RaiseError("for statement step must be a number")
+					var count uint64
+					if stepi > 0 {
+						count = uint64(limit) - uint64(initi)
+						if stepi != 1 {
+							count /= uint64(stepi)
+						}
+					} else {
+						count = uint64(initi) - uint64(limit)
+						// 'step+1' avoids negating minint
+						count /= uint64(-(stepi + 1)) + 1
+					}
+					count++ // this VM tests before each body pass (5.1 flow)
+					if count == 0 {
+						// (init,limit)=(minint,maxint), step 1: 2^64
+						// iterations saturates the counter — the final
+						// pass is lost (ledger row: U2b; stock's flow
+						// counts iterations-1 and never wraps — U2c)
+						count = 0xFFFFFFFFFFFFFFFF
+					}
+					cv := LInteger(int64(count))
+					sv := LInteger(stepi)
+					iv := LInteger(int64(uint64(initi) - uint64(stepi)))
+					// +inline-call reg.SetInteger RA cv
+					// +inline-call reg.SetInteger RA+1 sv
+					// +inline-call reg.SetInteger RA+2 iv
 				}
 			} else {
-				L.RaiseError("for statement init must be a number")
+				// float loop: coerce all three (strings included, per
+				// stock's tonumber), checking limit/step/init in order
+				limitf, ok1 := forNumber(L, reg.Get(RA+1), "limit")
+				stepf, ok2 := forNumber(L, stepv, "step")
+				initf, ok3 := forNumber(L, initv, "initial value")
+				if ok1 && ok2 && ok3 {
+					if stepf == 0 {
+						L.RaiseError("'for' step is zero")
+					}
+					// make sure all three cells hold floats (stock's
+					// forprep rewrites the slots; string limits included)
+					lv := LNumber(limitf)
+					sv2 := LNumber(stepf)
+					v := LNumber(initf - stepf)
+					// +inline-call reg.SetNumber RA v
+					// +inline-call reg.SetNumber RA+1 lv
+					// +inline-call reg.SetNumber RA+2 sv2
+				}
 			}
 			cf.Pc += Sbx
 			return 0
@@ -841,13 +896,116 @@ func init() {
 		func(L *LState, inst uint32, baseframe *callFrame) int { //OP_NOP
 			return 0
 		},
+		opArith, // OP_IDIV
+		opArith, // OP_BAND
+		opArith, // OP_BOR
+		opArith, // OP_BXOR
+		opArith, // OP_SHL
+		opArith, // OP_SHR
+		func(L *LState, inst uint32, baseframe *callFrame) int { //OP_BNOT
+			reg := L.reg
+			cf := L.currentFrame
+			lbase := cf.LocalBase
+			A := int(inst>>18) & 0xff //GETA
+			RA := lbase + A
+			B := int(inst & 0x1ff) //GETB
+			unaryv := L.rkValue(B)
+			if iv, ok := unaryv.(LInteger); ok {
+				nv := ^iv
+				// +inline-call reg.SetInteger RA nv
+			} else if fv, ok := unaryv.(LNumber); ok {
+				if iv, ok2 := floatToIntExact(float64(fv)); ok2 {
+					nv := ^LInteger(iv)
+					// +inline-call reg.SetInteger RA nv
+				} else {
+					L.RaiseError("number has no integer representation")
+				}
+			} else {
+				op := L.metaOp1(unaryv, "__bnot")
+				if op.Type() == LTFunction {
+					reg.Push(op)
+					reg.Push(unaryv)
+					L.Call(1, 1)
+					// +inline-call reg.Set RA reg.Pop()
+				} else {
+					// no string coercion: the string metatable has no
+					// __bnot (stock stringmetamethods)
+					L.RaiseError("attempt to perform bitwise operation on a %s value", unaryv.Type().String())
+				}
+			}
+			return 0
+		},
 	}
 }
 
-// arithNumber returns the float view of either number subtype. Temporary
-// U2a shape: the integer-integer arithmetic paths land in U2b; until then
-// integer operands compute as floats (value-equal for every result the
-// corpora can print, since integral floats still print as integers).
+// coerceStringNumber converts a numeric string to its number value with
+// the syntactic subtype preserved (parseNumber); anything else fails.
+func coerceStringNumber(v LValue) (LValue, bool) {
+	if str, ok := v.(LString); ok {
+		if num, err := parseNumber(string(str)); err == nil {
+			return num, true
+		}
+	}
+	return nil, false
+}
+
+// forNumber coerces one numeric-for operand for the float flavor
+// (tonumber: numbers pass, numeric strings convert); raises stock's
+// "bad 'for'" error otherwise.
+func forNumber(L *LState, v LValue, what string) (LNumber, bool) {
+	if n, ok := arithNumber(v); ok {
+		return n, true
+	}
+	if num, ok := coerceStringNumber(v); ok {
+		if n, ok2 := arithNumber(num); ok2 {
+			return n, true
+		}
+	}
+	L.RaiseError("bad 'for' %s (number expected, got %s)", what, v.Type().String())
+	return 0, false
+}
+
+// forLimitInt ports stock forLimit: the integer loop's limit — exact
+// conversion per step direction (floor ascending, ceil descending), a
+// float beyond int64 clamps into range, and a limit smaller/larger than
+// every integer skips the loop outright.
+func forLimitInt(L *LState, init int64, lim LValue, step int64) (int64, bool) {
+	var p int64
+	if iv, ok := lim.(LInteger); ok {
+		p = int64(iv)
+	} else if fv, ok := arithNumber(lim); ok {
+		var ok2 bool
+		if step < 0 {
+			p, ok2 = floatToCeilInt(float64(fv))
+		} else {
+			p, ok2 = floatToFloorInt(float64(fv))
+		}
+		if !ok2 {
+			if float64(fv) > 0 { // too large
+				if step < 0 {
+					return 0, true
+				}
+				p = math.MaxInt64
+			} else { // less than min integer
+				if step > 0 {
+					return 0, true
+				}
+				p = math.MinInt64
+			}
+		}
+	} else if num, ok := coerceStringNumber(lim); ok {
+		return forLimitInt(L, init, num, step)
+	} else {
+		L.RaiseError("bad 'for' limit (number expected, got %s)", lim.Type().String())
+	}
+	if step > 0 {
+		return p, init > p
+	}
+	return p, init < p
+}
+
+// arithNumber returns the float view of either number subtype (the
+// tonumberns macro: no string coercion).
 func arithNumber(v LValue) (LNumber, bool) {
 	switch n := v.(type) {
 	case LNumber:
@@ -858,7 +1016,7 @@ func arithNumber(v LValue) (LNumber, bool) {
 	return 0, false
 }
 
-func opArith(L *LState, inst uint32, baseframe *callFrame) int { //OP_ADD, OP_SUB, OP_MUL, OP_DIV, OP_MOD, OP_POW
+func opArith(L *LState, inst uint32, baseframe *callFrame) int { //OP_ADD..OP_SHR
 	reg := L.reg
 	cf := L.currentFrame
 	lbase := cf.LocalBase
@@ -869,11 +1027,15 @@ func opArith(L *LState, inst uint32, baseframe *callFrame) int { //OP_ADD, OP_SU
 	C := int(inst>>9) & 0x1ff //GETC
 	lhs := L.rkValue(B)
 	rhs := L.rkValue(C)
-	v1, ok1 := arithNumber(lhs)
-	v2, ok2 := arithNumber(rhs)
-	if ok1 && ok2 {
-		v := numberArith(L, opcode, LNumber(v1), LNumber(v2))
-		// +inline-call reg.SetNumber RA v
+	if v, errText, res := arithCompute(opcode, lhs, rhs); res == arithDone {
+		if iv, isInt := v.(LInteger); isInt {
+			// +inline-call reg.SetInteger RA iv
+		} else {
+			fv := v.(LNumber)
+			// +inline-call reg.SetNumber RA fv
+		}
+	} else if res == arithRaise {
+		L.RaiseError("%s", errText)
 	} else {
 		v := objectArith(L, opcode, lhs, rhs)
 		// +inline-call reg.Set RA v
@@ -891,43 +1053,8 @@ func luaModulo(lhs, rhs LNumber) LNumber {
 	return LNumber(v)
 }
 
-func numberArith(L *LState, opcode int, lhs, rhs LNumber) LNumber {
-	switch opcode {
-	case OP_ADD:
-		return lhs + rhs
-	case OP_SUB:
-		return lhs - rhs
-	case OP_MUL:
-		return lhs * rhs
-	case OP_DIV:
-		return lhs / rhs
-	case OP_MOD:
-		return luaModulo(lhs, rhs)
-	case OP_POW:
-		flhs := float64(lhs)
-		frhs := float64(rhs)
-		return LNumber(math.Pow(flhs, frhs))
-	}
-	panic("should not reach here")
-	return LNumber(0)
-}
-
 func objectArith(L *LState, opcode int, lhs, rhs LValue) LValue {
-	event := ""
-	switch opcode {
-	case OP_ADD:
-		event = "__add"
-	case OP_SUB:
-		event = "__sub"
-	case OP_MUL:
-		event = "__mul"
-	case OP_DIV:
-		event = "__div"
-	case OP_MOD:
-		event = "__mod"
-	case OP_POW:
-		event = "__pow"
-	}
+	event := arithEvent(opcode)
 	op := L.metaOp2(lhs, rhs, event)
 	if _, ok := op.(*LFunction); ok {
 		L.reg.Push(op)
@@ -936,25 +1063,255 @@ func objectArith(L *LState, opcode int, lhs, rhs LValue) LValue {
 		L.Call(2, 1)
 		return L.reg.Pop()
 	}
-	if str, ok := lhs.(LString); ok {
-		if lnum, err := parseNumber(string(str)); err == nil {
-			lhs = lnum
+	// string→number coercion preserving the syntactic subtype, for the
+	// ARITHMETIC ops only — stock's string metatable carries __add…
+	// __unm but no bitwise metamethods (lstrlib.c stringmetamethods), so
+	// "3" & 5 is a type error, never a coercion. 5.5 routes the
+	// arithmetic coercion through the string metatable — U3 (row 58).
+	if !isBitwiseOp(opcode) {
+		if str, ok := lhs.(LString); ok {
+			if lnum, err := parseNumber(string(str)); err == nil {
+				lhs = lnum
+			}
+		}
+		if str, ok := rhs.(LString); ok {
+			if rnum, err := parseNumber(string(str)); err == nil {
+				rhs = rnum
+			}
 		}
 	}
-	if str, ok := rhs.(LString); ok {
-		if rnum, err := parseNumber(string(str)); err == nil {
-			rhs = rnum
-		}
+	if v, errText, res := arithCompute(opcode, lhs, rhs); res == arithDone {
+		return v
+	} else if res == arithRaise {
+		L.RaiseError("%s", errText)
 	}
-	if v1, ok1 := arithNumber(lhs); ok1 {
-		if v2, ok2 := arithNumber(rhs); ok2 {
-			return numberArith(L, opcode, LNumber(v1), LNumber(v2))
-		}
+	// stock luaT_trybinTM error shapes (luaG_opinterror picks the
+	// non-number operand; both non-numbers reports the first)
+	what := "arithmetic"
+	if isBitwiseOp(opcode) {
+		what = "bitwise operation"
 	}
-	L.RaiseError("cannot perform %v operation between %v and %v",
-		strings.TrimLeft(event, "_"), lhs.Type().String(), rhs.Type().String())
+	bad := lhs
+	if isNumberValue(lhs) {
+		bad = rhs
+	}
+	L.RaiseError("attempt to perform %s on a %s value", what, bad.Type().String())
 
 	return LNil
+}
+
+// arithEvent maps an arith opcode to its metamethod name.
+func arithEvent(opcode int) string {
+	switch opcode {
+	case OP_ADD:
+		return "__add"
+	case OP_SUB:
+		return "__sub"
+	case OP_MUL:
+		return "__mul"
+	case OP_DIV:
+		return "__div"
+	case OP_MOD:
+		return "__mod"
+	case OP_POW:
+		return "__pow"
+	case OP_IDIV:
+		return "__idiv"
+	case OP_BAND:
+		return "__band"
+	case OP_BOR:
+		return "__bor"
+	case OP_BXOR:
+		return "__bxor"
+	case OP_SHL:
+		return "__shl"
+	case OP_SHR:
+		return "__shr"
+	}
+	return "__arith"
+}
+
+func isBitwiseOp(opcode int) bool {
+	switch opcode {
+	case OP_BAND, OP_BOR, OP_BXOR, OP_SHL, OP_SHR:
+		return true
+	}
+	return false
+}
+
+type arithOutcome int
+
+const (
+	arithDone  arithOutcome = iota // numeric result staged in v
+	arithRaise                     // numeric operands, erroring op (text in err)
+	arithSlow                      // non-numeric pair: metamethods / coercion
+)
+
+// arithCompute is the numeric core of every binary arith/bitwise opcode —
+// the executable-spec twin of stock's op_arith/op_arithf/op_bitwise macros.
+// int/int keeps the integer subtype with 5.3 wrap-around semantics; any
+// float operand promotes to float ('/' and '^' are always float); bitwise
+// ops convert through luaV_tointegerns F2Ieq (strings are NOT accepted
+// here — they take the slow path).
+func arithCompute(opcode int, lhs, rhs LValue) (v LValue, err string, res arithOutcome) {
+	li, liOK := lhs.(LInteger)
+	ri, riOK := rhs.(LInteger)
+	lf, lfOK := lhs.(LNumber)
+	rf, rfOK := rhs.(LNumber)
+	lNum := liOK || lfOK
+	rNum := riOK || rfOK
+	switch opcode {
+	case OP_DIV, OP_POW: // float-only ops (int operands promote)
+		if lNum && rNum {
+			return LNumber(floatArith(opcode, asFloat(li, lf, liOK), asFloat(ri, rf, riOK))), "", arithDone
+		}
+	case OP_ADD, OP_SUB, OP_MUL, OP_MOD, OP_IDIV:
+		if liOK && riOK {
+			if iv, ok := intArith(opcode, int64(li), int64(ri)); ok {
+				return LInteger(iv), "", arithDone
+			}
+			return nil, intArithError(opcode), arithRaise
+		}
+		if lNum && rNum {
+			return LNumber(floatArith(opcode, asFloat(li, lf, liOK), asFloat(ri, rf, riOK))), "", arithDone
+		}
+	case OP_BAND, OP_BOR, OP_BXOR, OP_SHL, OP_SHR:
+		if lNum && rNum {
+			i1, ok1 := toIntBitwise(lhs)
+			i2, ok2 := toIntBitwise(rhs)
+			if !ok1 || !ok2 {
+				return nil, "number has no integer representation", arithRaise
+			}
+			return LInteger(bitwiseInt(opcode, i1, i2)), "", arithDone
+		}
+	}
+	return nil, "", arithSlow
+}
+
+func asFloat(iv LInteger, fv LNumber, isInt bool) float64 {
+	if isInt {
+		return float64(iv)
+	}
+	return float64(fv)
+}
+
+// intArithError gives stock's message for the failing integer ops
+// (luaV_idiv / luaV_mod in 5.5.1 — note idiv's text differs from 5.4).
+func intArithError(opcode int) string {
+	if opcode == OP_MOD {
+		return "attempt to perform 'n%0'"
+	}
+	return "attempt to divide by zero"
+}
+
+// intArith: integer ops with 5.3 semantics — +,-,* wrap; // and % follow
+// the floor with the -1/0 special cases (ports of luaV_idiv/luaV_mod).
+// ok=false only for the erroring divisor cases.
+func intArith(op int, m, n int64) (int64, bool) {
+	switch op {
+	case OP_ADD:
+		return m + n, true
+	case OP_SUB:
+		return m - n, true
+	case OP_MUL:
+		return m * n, true
+	case OP_MOD:
+		if uint64(n)+1 <= 1 { // special cases: -1 or 0
+			if n == 0 {
+				return 0, false
+			}
+			return 0, true // m % -1 == 0, avoids minint overflow
+		}
+		r := m % n
+		if r != 0 && (r^n) < 0 { // 'm/n' would be non-integer negative?
+			r += n
+		}
+		return r, true
+	case OP_IDIV:
+		if uint64(n)+1 <= 1 {
+			if n == 0 {
+				return 0, false
+			}
+			return 0 - m, true // n == -1, avoids minint overflow
+		}
+		q := m / n
+		if (m^n) < 0 && m%n != 0 { // negative non-integer quotient?
+			q--
+		}
+		return q, true
+	}
+	panic("should not reach here")
+}
+
+// floatArith: float paths. MOD follows the fmod-with-sign-fix luai_nummod;
+// IDIV is floor(a/b) (luai_numidiv); POW squares exactly when the exponent
+// is 2, like luai_numpow.
+func floatArith(op int, m, n float64) float64 {
+	switch op {
+	case OP_ADD:
+		return m + n
+	case OP_SUB:
+		return m - n
+	case OP_MUL:
+		return m * n
+	case OP_DIV:
+		return m / n
+	case OP_MOD:
+		return float64(luaModulo(LNumber(m), LNumber(n)))
+	case OP_IDIV:
+		return math.Floor(m / n)
+	case OP_POW:
+		if n == 2 {
+			return m * m
+		}
+		return math.Pow(m, n)
+	}
+	panic("should not reach here")
+}
+
+// toIntBitwise is luaV_tointegerns with F2Ieq: integers pass, floats must
+// have an exact integer value (strings and everything else fail).
+func toIntBitwise(v LValue) (int64, bool) {
+	switch n := v.(type) {
+	case LInteger:
+		return int64(n), true
+	case LNumber:
+		i, ok := floatToIntExact(float64(n))
+		return i, ok
+	}
+	return 0, false
+}
+
+// shiftInt is stock luaV_shiftl: a negative count shifts the other way,
+// and any count outside (-64,64) yields zero. Right shifts are LOGICAL —
+// stock's intop casts through lua_Unsigned before shifting.
+func shiftInt(x, y int64) int64 {
+	if y < 0 {
+		if y <= -64 {
+			return 0
+		}
+		return int64(uint64(x) >> uint64(-y))
+	}
+	if y >= 64 {
+		return 0
+	}
+	return x << y
+}
+
+func bitwiseInt(op int, x, y int64) int64 {
+	switch op {
+	case OP_BAND:
+		return x & y
+	case OP_BOR:
+		return x | y
+	case OP_BXOR:
+		return x ^ y
+	case OP_SHL:
+		return shiftInt(x, y)
+	case OP_SHR:
+		return shiftInt(x, -y)
+	}
+	panic("should not reach here")
 }
 
 func stringConcat(L *LState, total, last int) LValue {

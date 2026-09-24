@@ -120,6 +120,12 @@ type UnaryMinusOpExpr struct {
 	Expr Expr
 }
 
+// UnaryBNotOpExpr is integer bitwise-not (~x, 5.3).
+type UnaryBNotOpExpr struct {
+	ExprBase
+	Expr Expr
+}
+
 type UnaryNotOpExpr struct {
 	ExprBase
 	Expr Expr
