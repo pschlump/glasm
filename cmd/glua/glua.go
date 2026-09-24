@@ -3,7 +3,7 @@ package main
 import (
 	"flag"
 	"fmt"
-	"github.com/chzyer/readline"
+	"github.com/ergochat/readline"
 	"github.com/pschlump/golua55"
 	"github.com/pschlump/golua55/parse"
 	"github.com/pschlump/golua55/testdiff"
