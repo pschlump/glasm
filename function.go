@@ -34,6 +34,13 @@ type FunctionProto struct {
 	Constants          []LValue
 	FunctionPrototypes []*FunctionProto
 
+	// EnvUpvalueIndex: the upvalue slot holding _ENV, the table global
+	// accesses resolve through (5.2 scheme, upgrade plan D3). -1 when the
+	// function references no globals. Used by OP_GETGLOBAL/OP_SETGLOBAL
+	// to read the current environment cell. Go-side only — the wasm
+	// backend keeps its own globals lowering.
+	EnvUpvalueIndex int8
+
 	DbgSourcePositions []int
 	DbgLocals          []*DbgLocalInfo
 	DbgCalls           []DbgCall
@@ -96,6 +103,7 @@ func newFunctionProto(name string) *FunctionProto {
 		NumParameters:      0,
 		IsVarArg:           0,
 		NumUsedRegisters:   2,
+		EnvUpvalueIndex:    -1,
 		Code:               make([]uint32, 0, 128),
 		Constants:          make([]LValue, 0, 32),
 		FunctionPrototypes: make([]*FunctionProto, 0, 16),

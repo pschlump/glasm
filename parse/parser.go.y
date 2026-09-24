@@ -2,7 +2,7 @@
 package parse
 
 import (
-  "github.com/yuin/gopher-lua/ast"
+  "github.com/pschlump/golua55/ast"
 )
 %}
 %type<stmts> chunk
@@ -113,7 +113,9 @@ stat:
         /* 'stat = functioncal' causes a reduce/reduce conflict */
         prefixexp {
             if _, ok := $1.(*ast.FuncCallExpr); !ok {
-               yylex.(*Lexer).Error("parse error")
+               /* stock exprstat: "syntax error" at the token after the
+                  non-call expression (5.5 lparser.c check_condition) */
+               yylex.(*Lexer).SyntaxErrorAtNext()
             } else {
               $$ = &ast.FuncCallStmt{Expr: $1}
               $$.SetLine($1.Line())
@@ -195,6 +197,13 @@ stat:
         TGoto TIdent {
             $$ = &ast.GotoStmt{Label: $2.Str}
             $$.SetLine($1.Pos.Line)
+        } |
+        /* 5.2: break is a regular statement, no longer restricted to the
+           end of a block (it lowers as a jump to the loop's end, with
+           OP_CLOSE for any local scope it exits — compileBreakStmt) */
+        TBreak {
+            $$ = &ast.BreakStmt{}
+            $$.SetLine($1.Pos.Line)
         }
 
 elseifs: 
@@ -213,10 +222,6 @@ laststat:
         } |
         TReturn exprlist {
             $$ = &ast.ReturnStmt{Exprs:$2}
-            $$.SetLine($1.Pos.Line)
-        } |
-        TBreak  {
-            $$ = &ast.BreakStmt{}
             $$.SetLine($1.Pos.Line)
         }
 

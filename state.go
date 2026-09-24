@@ -788,7 +788,9 @@ func (ls *LState) where(level int, skipg bool) string {
 	proto := cf.Fn.Proto
 	sourcename := "[G]"
 	if proto != nil {
-		sourcename = proto.SourceName
+		// U1: source names follow stock's sigil convention (@file,
+		// =literal, or [string "..."]) — ChunkID is the shared renderer
+		sourcename = parse.ChunkID(proto.SourceName)
 	} else if skipg {
 		return ls.where(level+1, skipg)
 	}
@@ -859,14 +861,14 @@ func (ls *LState) frameFuncName(fr *callFrame) (string, bool) {
 			if call.Pc == pc {
 				name := call.Name
 				if (name == "?" || fr.TailCall > 0) && !fr.Fn.IsG {
-					name = fmt.Sprintf("<%v:%v>", fr.Fn.Proto.SourceName, fr.Fn.Proto.LineDefined)
+					name = fmt.Sprintf("<%v:%v>", parse.ChunkID(fr.Fn.Proto.SourceName), fr.Fn.Proto.LineDefined)
 				}
 				return name, false
 			}
 		}
 	}
 	if !fr.Fn.IsG {
-		return fmt.Sprintf("<%v:%v>", fr.Fn.Proto.SourceName, fr.Fn.Proto.LineDefined), false
+		return fmt.Sprintf("<%v:%v>", parse.ChunkID(fr.Fn.Proto.SourceName), fr.Fn.Proto.LineDefined), false
 	}
 	return "(anonymous)", false
 }
@@ -1632,7 +1634,14 @@ func (ls *LState) NewThread() (*LState, context.CancelFunc) {
 }
 
 func (ls *LState) NewFunctionFromProto(proto *FunctionProto) *LFunction {
-	return newLFunctionL(proto, ls.Env, int(proto.NumUpvalues))
+	fn := newLFunctionL(proto, ls.Env, int(proto.NumUpvalues))
+	if idx := proto.EnvUpvalueIndex; idx >= 0 {
+		uv := &Upvalue{}
+		uv.Close()
+		uv.SetValue(ls.Env)
+		fn.Upvalues[idx] = uv
+	}
+	return fn
 }
 
 func (ls *LState) NewUserData() *LUserData {
@@ -2016,7 +2025,24 @@ func (ls *LState) Register(name string, fn LGFunction) {
 
 /* load and function call operations {{{ */
 
+// Load parses, compiles, and wraps a chunk as a callable function. The
+// chunk's _ENV upvalue (D3) is seeded with the thread's environment.
 func (ls *LState) Load(reader io.Reader, name string) (*LFunction, error) {
+	return ls.loadAux(reader, name, ls.currentEnv())
+}
+
+// LoadEnv is Load with an explicit chunk environment (5.2 load's env
+// argument): the compiled main chunk's _ENV upvalue cell is seeded with
+// env, so the chunk (and every closure it creates) resolves globals
+// there. A nil env falls back to the thread environment.
+func (ls *LState) LoadEnv(reader io.Reader, name string, env *LTable) (*LFunction, error) {
+	if env == nil {
+		env = ls.currentEnv()
+	}
+	return ls.loadAux(reader, name, env)
+}
+
+func (ls *LState) loadAux(reader io.Reader, name string, env *LTable) (*LFunction, error) {
 	chunk, err := parse.Parse(reader, name)
 	if err != nil {
 		return nil, newApiErrorE(ApiErrorSyntax, err)
@@ -2025,7 +2051,16 @@ func (ls *LState) Load(reader io.Reader, name string) (*LFunction, error) {
 	if err != nil {
 		return nil, newApiErrorE(ApiErrorSyntax, err)
 	}
-	return newLFunctionL(proto, ls.currentEnv(), 0), nil
+	fn := newLFunctionL(proto, env, int(proto.NumUpvalues))
+	// seed the main chunk's _ENV cell (the only upvalue a main proto
+	// declares — Compile registers it at index 0)
+	if idx := proto.EnvUpvalueIndex; idx >= 0 {
+		uv := &Upvalue{}
+		uv.Close()
+		uv.SetValue(env)
+		fn.Upvalues[idx] = uv
+	}
+	return fn, nil
 }
 
 func (ls *LState) Call(nargs, nret int) {

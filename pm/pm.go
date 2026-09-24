@@ -170,6 +170,7 @@ const (
 	opPSave
 	opBrace
 	opNumber
+	opFrontier // 5.2 %f(set): empty-width frontier match
 )
 
 type inst struct {
@@ -185,6 +186,14 @@ type inst struct {
 
 type class interface {
 	Matches(ch int) bool
+}
+
+// frontierPattern is %f(set): matches the empty string at a transition
+// from a char NOT in set to a char IN set (both boundaries compare
+// against '\0' beyond the subject ends, like stock's matchbalance-less
+// frontier implementation).
+type frontierPattern struct {
+	Class class
 }
 
 type dotClass struct{}
@@ -226,6 +235,8 @@ func (pn *singleClass) Matches(ch int) bool {
 	case 'x', 'X':
 		ret = '0' <= ch && ch <= '9' || 'a' <= ch && ch <= 'f' || 'A' <= ch && ch <= 'F'
 	case 'z', 'Z':
+		// deprecated since 5.2, but 5.5.1 lstrlib still implements it
+		// ("case 'z': res = (c == 0)") — the oracle is the authority
 		ret = ch == 0
 	default:
 		return ch == pn.Class
@@ -399,6 +410,13 @@ func parsePattern(sc *scanner, toplevel bool) *seqPattern {
 			case 'b':
 				sc.Next()
 				pat.Patterns = append(pat.Patterns, &bracePattern{sc.Next(), sc.Next()})
+			case 'f': // 5.2 frontier pattern: %f[set]
+				sc.Next()
+				chk := sc.Next()
+				if chk != '[' {
+					panic(newError(sc.CurrentPos(), "missing '[' after %%f in pattern"))
+				}
+				pat.Patterns = append(pat.Patterns, &frontierPattern{parseClassSet(sc)})
 			default:
 				sc.Restore()
 				pat.Patterns = append(pat.Patterns, &singlePattern{parseClass(sc, true)})
@@ -507,6 +525,8 @@ func compilePattern(p pattern, ps ...*iptr) []inst {
 		ptr.insts = append(ptr.insts, inst{opSave, nil, c0, -1})
 		compilePattern(pat.Pattern, ptr)
 		ptr.insts = append(ptr.insts, inst{opSave, nil, c1, -1})
+	case *frontierPattern:
+		ptr.insts = append(ptr.insts, inst{opFrontier, pat.Class, -1, -1})
 	case *bracePattern:
 		ptr.insts = append(ptr.insts, inst{opBrace, nil, pat.Begin, pat.End})
 	case *numberPattern:
@@ -591,6 +611,22 @@ redo:
 			}
 		}
 		return false, sp, m
+	case opFrontier:
+		// %f[set]: prev char not in set, current char in set; the
+		// positions just outside the subject read as '\0'
+		prev := 0
+		if sp > 0 {
+			prev = int(src[sp-1])
+		}
+		curr := 0
+		if sp < len(src) {
+			curr = int(src[sp])
+		}
+		if inst.Class.Matches(prev) || !inst.Class.Matches(curr) {
+			return false, sp, m
+		}
+		pc++
+		goto redo
 	case opNumber:
 		idx := inst.Operand1 * 2
 		if idx >= m.CaptureLength()-1 {

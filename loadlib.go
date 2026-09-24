@@ -51,12 +51,13 @@ func OpenPackage(L *LState) int {
 
 	L.SetField(packagemod, "preload", L.NewTable())
 
-	loaders := L.CreateTable(len(loLoaders), 0)
+	// 5.2 (U1): package.loaders renamed package.searchers (D8 hard cut)
+	searchers := L.CreateTable(len(loLoaders), 0)
 	for i, loader := range loLoaders {
-		L.RawSetInt(loaders, i+1, L.NewFunction(loader))
+		L.RawSetInt(searchers, i+1, L.NewFunction(loader))
 	}
-	L.SetField(packagemod, "loaders", loaders)
-	L.SetField(L.Get(RegistryIndex), "_LOADERS", loaders)
+	L.SetField(packagemod, "searchers", searchers)
+	L.SetField(L.Get(RegistryIndex), "_LOADERS", searchers)
 
 	loaded := L.NewTable()
 	L.SetField(packagemod, "loaded", loaded)
@@ -75,6 +76,8 @@ func OpenPackage(L *LState) int {
 var loFuncs = map[string]LGFunction{
 	"loadlib": loLoadLib,
 	"seeall":  loSeeAll,
+	// 5.2 (U1): searchpath — the pure search half of require's path walk
+	"searchpath": loSearchPath,
 }
 
 func loLoaderPreload(L *LState) int {
@@ -105,6 +108,31 @@ func loLoaderLua(L *LState) int {
 	}
 	L.Push(fn)
 	return 1
+}
+
+// loSearchPath implements 5.2 package.searchpath(name, path [, sep [,
+// rep]]): walk a ;-separated template path substituting ? for name (dots
+// in name replaced by the sep string, "/" by default); return the first
+// existing file, or nil + a "no file" trail.
+func loSearchPath(L *LState) int {
+	name := strings.Replace(L.CheckString(1), L.OptString(3, "."), "/", -1)
+	path := L.CheckString(2)
+	messages := []string{}
+	for _, pattern := range strings.Split(path, ";") {
+		if pattern == "" {
+			continue
+		}
+		candidate := strings.Replace(pattern, "?", name, -1)
+		if _, err := os.Stat(candidate); err == nil {
+			L.Push(LString(candidate))
+			return 1
+		}
+		messages = append(messages, fmt.Sprintf("no file '%s'", candidate))
+	}
+	L.Push(LNil)
+	// stock: per-file "no file '%s'" joined by "\n\t"
+	L.Push(LString(strings.Join(messages, "\n\t")))
+	return 2
 }
 
 func loLoadLib(L *LState) int {

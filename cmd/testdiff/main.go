@@ -3,7 +3,7 @@
 //
 //	go run ./cmd/testdiff -corpus _glua-tests -engines interp,interp
 //
-// Exit code 1 on any diff. Engine names: interp (the gopher-lua oracle),
+// Exit code 1 on any diff. Engine names: interp (the golua55 oracle),
 // clua (stock C Lua 5.1 in wasm), wasm (the Lua→wasm backend on wasmtime,
 // the dev oracle host), wazero (the same backend on the pure-Go production
 // engine — M6b's engine-parity leg, ledger row 32), wazero-prod (the M6c
@@ -32,6 +32,8 @@ func main() {
 			engines = append(engines, testdiff.NewCLua(fmt.Sprintf("clua-%c", 'a'+i)))
 		case "interp":
 			engines = append(engines, testdiff.NewInterp(fmt.Sprintf("interp-%c", 'a'+i)))
+		case "clua55":
+			engines = append(engines, testdiff.NewCLua55(fmt.Sprintf("clua55-%c", 'a'+i)))
 		case "wasm":
 			e := testdiff.NewWasmEngine(fmt.Sprintf("wasm-%c", 'a'+i))
 			e.SkipUnsupported = true
@@ -46,7 +48,7 @@ func main() {
 			e.UseProdBlob()
 			engines = append(engines, e)
 		default:
-			fmt.Fprintf(os.Stderr, "unknown engine %q (known: interp, clua, wasm, wazero, wazero-prod)\n", name)
+			fmt.Fprintf(os.Stderr, "unknown engine %q (known: interp, clua, clua55, wasm, wazero, wazero-prod)\n", name)
 			os.Exit(2)
 		}
 	}

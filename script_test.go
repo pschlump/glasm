@@ -26,19 +26,17 @@ var gluaTests []string = []string{
 	"goto.lua",
 }
 
+// luaTests: the official 5.1-suite files run on the interpreter. U1
+// re-triage (upgrade plan D8/D11): the files using 5.2-removed features —
+// module (attrib.lua), setfenv (closure.lua, events.lua), loadstring
+// (calls.lua, constructs.lua, literals.lua, locals.lua, math.lua),
+// unpack/arg (vararg.lua, pm.lua) — are dropped from the interp leg with
+// ledger rows; they stay attached to the frozen 5.1 engines (clua) until
+// U8. Portable cases are re-landed by the _u1 corpus (TestU1Gate) and the
+// version-neutral 5.5-suite subsets.
 var luaTests []string = []string{
-	"attrib.lua",
-	"calls.lua",
-	"closure.lua",
-	"constructs.lua",
-	"events.lua",
-	"literals.lua",
-	"locals.lua",
-	"math.lua",
 	"sort.lua",
 	"strings.lua",
-	"vararg.lua",
-	"pm.lua",
 	"files.lua",
 }
 

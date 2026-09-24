@@ -3,11 +3,6 @@ local ok, msg = pcall(function()
 end)
 assert(not ok and string.find(msg, ".*notexist.*"))
 
-local ok, msg = pcall(function()
-  assert(getfenv(2) == _G)
-end)
-assert(ok)
-
 local i = 1
 local fn = assert(load(function()
   local tbl = {"return ", "1", "+", "1"}

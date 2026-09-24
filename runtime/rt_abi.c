@@ -61,7 +61,7 @@ static int64_t rt_mem_used;
 static int rt_oom_inflight;
 #define RT_MEM_EMERGENCY (64 * 1024)
 
-/* ---- M5d: the gopher-lua message dialect ----
+/* ---- M5d: the golua55 message dialect ----
 **
 ** The wasm engine enables it (rt_set_dialect(1)); the clua oracle keeps
 ** the stock C 5.1 texts (M2 gate untouched). Texts mirror the fork's
@@ -1305,6 +1305,22 @@ static void newclosure_body(void) {
       cl->l.upvals[i] = uv;
     } else if (parent != NULL) {
       cl->l.upvals[i] = parent->l.upvals[m->uv[i].idx];
+    } else if (m->uv[i].idx == 0) {
+      /* U1 (_ENV): the main chunk declares _ENV as its only upvalue, and
+         lua_main runs proto 0 with cl=0 — closures created directly by
+         the main chunk capture parentless, their instack-0 descriptors
+         all pointing at main's _ENV slot 0. Seed a closed upvalue with
+         the globals table — the table the fork's OP_GETGLOBAL lowering
+         reads anyway, so wasm chunks that merely read _ENV stay
+         consistent (writes to _ENV and shadowed envs remain a ledgered
+         divergence until the U6 rt port). */
+      UpVal *uv = luaF_newupval(curL);
+      if (uv == NULL) {
+        luaG_runerror(curL, "not enough memory");
+        return;
+      }
+      setobj2s(curL, uv->v, &curL->l_gt);
+      cl->l.upvals[i] = uv;
     } else {
       luaG_runerror(curL,
                     "rt_newclosure: upvalue capture without a parent");

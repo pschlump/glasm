@@ -6,6 +6,7 @@ import (
 	"reflect"
 
 	"github.com/pschlump/golua55/ast"
+	"github.com/pschlump/golua55/parse"
 )
 
 /* internal constants & structs  {{{ */
@@ -42,6 +43,11 @@ type assigncontext struct {
 	valuerk  int
 	keyks    bool
 	needmove bool
+	// envLocalIdx: for a global-assignment target whose _ENV is shadowed
+	// by a local (D3), the register of that local — the write compiles as
+	// SETTABLEKS on it. -1 when the write stays an OP_SETGLOBAL (resolved
+	// through the _ENV upvalue cell at runtime).
+	envLocalIdx int
 }
 
 type lblabels struct {
@@ -168,7 +174,7 @@ type CompileError struct { // {{{
 }
 
 func (e *CompileError) Error() string {
-	return fmt.Sprintf("compile error near line(%v) %v: %v", e.Line, e.context.Proto.SourceName, e.Message)
+	return fmt.Sprintf("%v:%d: %s", parse.ChunkID(e.context.Proto.SourceName), e.Line, e.Message)
 } // }}}
 
 type codeStore struct { // {{{
@@ -714,17 +720,21 @@ func compileAssignStmtLeft(context *funcContext, stmt *ast.AssignStmt) (int, []*
 		case *ast.IdentExpr:
 			identtype := getIdentRefType(context, context, st)
 			ec := &expcontext{identtype, regNotDefined, 0}
+			ac := &assigncontext{ec, 0, 0, false, false, -1}
 			switch identtype {
 			case ecGlobal:
 				context.ConstIndex(LString(st.Value))
+				if envlocal, _ := envAccess(context); envlocal > -1 {
+					ac.envLocalIdx = envlocal
+				}
 			case ecUpvalue:
 				context.Upvalues.RegisterUnique(st.Value)
 			case ecLocal:
 				ec.reg = context.FindLocalVar(st.Value)
 			}
-			acs = append(acs, &assigncontext{ec, 0, 0, false, false})
+			acs = append(acs, ac)
 		case *ast.AttrGetExpr:
-			ac := &assigncontext{&expcontext{ecTable, regNotDefined, 0}, 0, 0, false, false}
+			ac := &assigncontext{&expcontext{ecTable, regNotDefined, 0}, 0, 0, false, false, -1}
 			compileExprWithKMVPropagation(context, st.Object, &reg, &ac.ec.reg)
 			ac.keyrk = reg
 			reg += compileExpr(context, reg, st.Key, ecnone(0))
@@ -782,7 +792,7 @@ func compileAssignStmtRight(context *funcContext, stmt *ast.AssignStmt, reg int,
 			// slot instead; the reverse assignment loop below moves it,
 			// which also restores stock 5.1's leftmost-wins order for
 			// duplicate targets (a, a = 1, 2 → 1). (Upstream
-			// yuin/gopher-lua has the sequential bug; found by
+			// yuin/golua55 has the sequential bug; found by
 			// _cli-tests fib vs C Lua.) varargopt 0: a non-last RHS
 			// adjusts to exactly one value (`...` and call results
 			// alike); the multi-return case is the branch above.
@@ -903,7 +913,14 @@ func compileAssignStmt(context *funcContext, stmt *ast.AssignStmt) { // {{{
 				reg -= 1
 			}
 		case ecGlobal:
-			code.AddABx(OP_SETGLOBAL, reg, context.ConstIndex(LString(ex.(*ast.IdentExpr).Value)), sline(ex))
+			if acs[i].envLocalIdx > -1 {
+				// D3: _ENV shadowed by a local — the global write is a
+				// keyed table write on that register
+				cindex := context.ConstIndex(LString(ex.(*ast.IdentExpr).Value))
+				code.AddABC(OP_SETTABLEKS, acs[i].envLocalIdx, opRkAsk(cindex), reg, sline(ex))
+			} else {
+				code.AddABx(OP_SETGLOBAL, reg, context.ConstIndex(LString(ex.(*ast.IdentExpr).Value)), sline(ex))
+			}
 			reg -= 1
 		case ecUpvalue:
 			code.AddABC(OP_SETUPVAL, reg, context.Upvalues.RegisterUnique(ex.(*ast.IdentExpr).Value), 0, sline(ex))
@@ -1126,11 +1143,25 @@ func compileRepeatStmt(context *funcContext, stmt *ast.RepeatStmt) { // {{{
 
 } // }}}
 
+// compileBreakStmt lowers break as a jump to the innermost loop's end
+// label. 5.2 allows break mid-block, so the jump may exit the scope of
+// locals in ANY block between the current one and the loop's (inclusive);
+// OP_CLOSE at the outermost such boundary closes every open upvalue above
+// it (one instruction, register-range semantics). The pre-5.2 code only
+// considered the loop block itself and missed nested do/local scopes
+// (e.g. `while true do do local t = {}; local f = function() return t
+// end; break end end` left t's upvalue open across loop iterations).
 func compileBreakStmt(context *funcContext, stmt *ast.BreakStmt) { // {{{
+	closeIdx := -1
 	for block := context.Block; block != nil; block = block.Parent {
+		if block.RefUpvalue && block.Parent != nil {
+			// keep overwriting: the OUTERMOST crossed block with captured
+			// locals owns the close register
+			closeIdx = block.Parent.LocalVars.LastIndex()
+		}
 		if label := block.BreakLabel; label != labelNoJump {
-			if block.RefUpvalue {
-				context.Code.AddABC(OP_CLOSE, block.Parent.LocalVars.LastIndex(), 0, 0, sline(stmt))
+			if closeIdx > -1 {
+				context.Code.AddABC(OP_CLOSE, closeIdx, 0, 0, sline(stmt))
 			}
 			context.Code.AddASbx(OP_JMP, 0, label, sline(stmt))
 			return
@@ -1281,7 +1312,16 @@ func compileExpr(context *funcContext, reg int, expr ast.Expr, ec *expcontext) i
 	case *ast.IdentExpr:
 		switch getIdentRefType(context, context, ex) {
 		case ecGlobal:
-			code.AddABx(OP_GETGLOBAL, sreg, context.ConstIndex(LString(ex.Value)), sline(ex))
+			// D3: a global reads a field of _ENV. With _ENV shadowed by
+			// a local, that is a plain keyed table read; otherwise the
+			// opcode reads the frame function's _ENV upvalue cell (the
+			// handler resolves it — same shape as the pre-5.2 env read).
+			if envlocal, _ := envAccess(context); envlocal > -1 {
+				cindex := context.ConstIndex(LString(ex.Value))
+				code.AddABC(OP_GETTABLEKS, sreg, envlocal, opRkAsk(cindex), sline(ex))
+			} else {
+				code.AddABx(OP_GETGLOBAL, sreg, context.ConstIndex(LString(ex.Value)), sline(ex))
+			}
 		case ecUpvalue:
 			code.AddABC(OP_GETUPVAL, sreg, context.Upvalues.RegisterUnique(ex.Value), 0, sline(ex))
 		case ecLocal:
@@ -1445,6 +1485,10 @@ func compileFunctionExpr(context *funcContext, funcexpr *ast.FunctionExpr, ec *e
 	context.Proto.DbgSourcePositions = context.Code.PosList()
 	context.Proto.DbgUpvalues = context.Upvalues.Names()
 	context.Proto.NumUpvalues = uint8(len(context.Proto.DbgUpvalues))
+	// D3: record where _ENV lives for OP_GETGLOBAL/OP_SETGLOBAL (the
+	// handlers read the upvalue cell); -1 = this function never touches
+	// globals
+	context.Proto.EnvUpvalueIndex = int8(context.Upvalues.Find(envUpvalueName))
 	for _, clv := range context.Proto.Constants {
 		sv := ""
 		if slv, ok := clv.(LString); ok {
@@ -1850,17 +1894,45 @@ func loadRk(context *funcContext, reg *int, expr ast.Expr, cnst LValue) int { //
 	}
 } // }}}
 
+// getIdentRefType classifies a name: a local of the compiling function
+// (ecLocal), a local of an enclosing function or a named upvalue visible
+// through the chain (ecUpvalue — the closure-capture loop wires the cell
+// at OP_CLOSURE), or ecGlobal. U1 (D3): globals resolve through _ENV, so
+// the upvalue pool itself is a resolution target — the main chunk's _ENV
+// lives there (Compile registers it at index 0), and that is also how a
+// nested function finds it before the chain falls off to ecGlobal.
 func getIdentRefType(context *funcContext, current *funcContext, expr *ast.IdentExpr) expContextType { // {{{
 	if current == nil {
 		return ecGlobal
-	} else if current.FindLocalVar(expr.Value) > -1 {
+	}
+	if current.FindLocalVar(expr.Value) > -1 {
 		if current == context {
 			return ecLocal
 		}
 		return ecUpvalue
 	}
+	if current.Upvalues.Find(expr.Value) > -1 {
+		return ecUpvalue
+	}
 	return getIdentRefType(context, current.Parent, expr)
 } // }}}
+
+// envUpvalueName is the upvalue globals resolve through (Lua 5.2's _ENV
+// scheme, upgrade plan D3).
+const envUpvalueName = "_ENV"
+
+// envAccess resolves how the function being compiled sees _ENV: either a
+// local (`local _ENV = t` shadows the upvalue and global accesses compile
+// as table reads on that register) or the _ENV upvalue (registered on
+// first use; for the main chunk Compile pre-registers it at index 0, for
+// any nested function RegisterUnique adds it and the OP_CLOSURE capture
+// loop wires the cell from the enclosing scope).
+func envAccess(context *funcContext) (localIdx, upvalIdx int) {
+	if idx := context.FindLocalVar(envUpvalueName); idx > -1 {
+		return idx, -1
+	}
+	return -1, context.Upvalues.RegisterUnique(envUpvalueName)
+}
 
 func getExprName(context *funcContext, expr ast.Expr) string { // {{{
 	switch ex := expr.(type) {
@@ -1972,6 +2044,11 @@ func Compile(chunk []ast.Stmt, name string) (proto *FunctionProto, err error) { 
 		funcexpr.SetLastLine(eline(chunk[len(chunk)-1]) + 1)
 	}
 	context := newFuncContext(name, nil)
+	// D3: the main chunk declares _ENV as upvalue 0 — the loader seeds
+	// the cell with the chunk's environment (load's env argument, the
+	// thread env by default); nested functions capture it through the
+	// normal OP_CLOSURE machinery.
+	context.Upvalues.Register(envUpvalueName)
 	compileFunctionExpr(context, funcexpr, ecnone(0))
 	proto = context.Proto
 	return

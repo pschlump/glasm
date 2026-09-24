@@ -1,6 +1,6 @@
 package testdiff
 
-// The wasm-backend engine (M4): compiles Lua through the gopher-lua
+// The wasm-backend engine (M4): compiles Lua through the golua55
 // frontend + luawasm backend and runs the emitted module against the C
 // runtime on wasmtime — the third differential engine. The harness shim
 // comes from the runtime module's install_shims (print→host event,
@@ -26,7 +26,7 @@ import (
 
 	wt "github.com/bytecodealliance/wasmtime-go/v48"
 
-	"github.com/pschlump/golua55"
+	lua "github.com/pschlump/golua55"
 	"github.com/pschlump/golua55/luawasm"
 	"github.com/pschlump/golua55/parse"
 	"github.com/pschlump/golua55/wasm"
@@ -232,7 +232,9 @@ func (e *WasmEngine) Run(c Case) (log []string) {
 	bin := e.Precompiled
 	if bin == nil {
 		var err error
-		bin, err = CompileSource(c.Source, c.Name)
+		// U1: '@'-sigil chunk names (parse.ChunkID renders the bare file
+		// name, matching the interp engine and the C drivers)
+		bin, err = CompileSource(c.Source, "@"+c.Name)
 		if err != nil {
 			if e.SkipUnsupported && strings.Contains(err.Error(), "backend v1") {
 				return []string{"SKIP-UNSUPPORTED\t" + err.Error()}

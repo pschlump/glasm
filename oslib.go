@@ -3,6 +3,7 @@ package lua
 import (
 	"os"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -77,6 +78,9 @@ func osDiffTime(L *LState) int {
 	return 1
 }
 
+// osExecute implements the 5.2 return contract: on success
+// (true, "exit", 0); on failure (nil, "exit"|"signal", status). (5.1
+// returned just the exit number; the nil becomes false in 5.3+.)
 func osExecute(L *LState) int {
 	var procAttr os.ProcAttr
 	procAttr.Files = []*os.File{os.Stdin, os.Stdout, os.Stderr}
@@ -84,17 +88,33 @@ func osExecute(L *LState) int {
 	args = append([]string{cmd}, args...)
 	process, err := os.StartProcess(cmd, args, &procAttr)
 	if err != nil {
+		L.Push(LNil)
+		L.Push(LString("exit"))
 		L.Push(LNumber(1))
-		return 1
+		return 3
 	}
 
 	ps, err := process.Wait()
 	if err != nil || !ps.Success() {
-		L.Push(LNumber(1))
-		return 1
+		reason := "exit"
+		code := 1
+		if err == nil {
+			if ws, ok := ps.Sys().(syscall.WaitStatus); ok && ws.Signaled() {
+				reason = "signal"
+				code = int(ws.Signal())
+			} else {
+				code = ps.ExitCode()
+			}
+		}
+		L.Push(LNil)
+		L.Push(LString(reason))
+		L.Push(LNumber(code))
+		return 3
 	}
+	L.Push(LTrue)
+	L.Push(LString("exit"))
 	L.Push(LNumber(0))
-	return 1
+	return 3
 }
 
 func osExit(L *LState) int {

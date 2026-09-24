@@ -1,0 +1,10 @@
+-- parser error shapes (stock texts, caught via load)
+local function perr(s) local f, m = load(s) print(m) end
+perr("returna")
+perr("x = ")
+perr("f(")
+perr("return {")
+perr("[===[unfinished")
+perr("--[[ unfinished comment")
+perr("x = $")
+perr("a = 1 +\n2 +\n(")

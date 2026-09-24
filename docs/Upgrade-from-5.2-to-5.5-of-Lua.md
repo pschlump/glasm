@@ -1,6 +1,6 @@
 # Upgrading from Lua 5.2 to Lua 5.5
 
-> **Status (2026-09-23): U0 COMPLETE — oracle groundwork landed; U1 next.**
+> **Status (2026-09-23): U1 COMPLETE — 5.2 language core in Go; U2 (integers + encoding cutover) next.**
 > Companion research artifacts are saved under `note/conv-from-5.2-to-5.5/` (source tarballs,
 > extracted manual sections, official 5.5 test suite). This document follows the conventions of
 > `Lua-Wasm-Design-and-Test-Plan.md`: design decisions are numbered **D1–D12**, milestones are
@@ -32,6 +32,38 @@
 > `files.lua` (the `/dev/full` block asserts io.flush fails with ENOSPC — no WASI host here
 > can express a write-failing device; `/dev/null` is served by an engine-provisioned empty
 > stand-in file, gitignored under the corpus). All 5.1 gates unchanged and green.
+>
+> **U1 record (2026-09-23).** The interpreter speaks the 5.2 language core, gated by the new
+> `_u1` corpus (`TestU1Gate`: 20 cases, interp ↔ clua55 byte-exact). What landed:
+> **_ENV (D3)** — every main proto declares `_ENV` as upvalue 0; the loader seeds the cell
+> (load's env argument / thread env); `OP_GETGLOBAL`/`OP_SETGLOBAL` keep their opcode but
+> read the frame function's `_ENV` cell, so `_ENV = t` swaps propagate to every closure
+> sharing the cell; `local _ENV` shadowing compiles as keyed table ops (GETTABLEKS/SETTABLEKS
+> on the local); nested functions capture `_ENV` through the normal OP_CLOSURE machinery
+> (`FunctionProto.EnvUpvalueIndex` records the slot). The wasm engines keep the old globals
+> lowering, with one rt extension: parentless captures (main runs cl=0) seed a closed
+> globals-table upvalue (ledger row 53); shadowing/env-swaps are interp-only until U6.
+> **Lexer/parse errors** — `\xXX`, `\z`, `\ddd ≤ 255`, unknown-escape errors, hex floats
+> (`0x1p-2`), greedy read_numeral scanning, and the whole error surface re-pinned to stock
+> 5.5 texts/shapes: `<chunkid>:<line>: <msg> near '<tok>'`, ChunkID (@/=//[string] sigils —
+> engine callers now pass `@case` names), "unexpected symbol"/"syntax error" split,
+> `near <eof>` (row 51). `tonumber`'s string path now uses parseNumber (hex floats, "3.").
+> **break mid-block** (stat-level TBreak; compileBreakStmt now CLOSEs the outermost crossed
+> scope with captured locals — the old code missed nested do/local scopes), **table `__len`**
+> (already honored by the VM's metaOp1-first shape), **5.2 libs** — xpcall arg pass-through,
+> table.pack/unpack, string.rep separator, `%f` frontier, `file:write` returns the file,
+> `*L` read option, os.execute 5.2 triple, package.searchers + searchpath, load/loadfile
+> mode+env — and the **D8 removals**: setfenv/getfenv/module/loadstring/base-unpack/newproxy
+> gone from the Lua surface (Go API keeps Fn.Env as the loader seed). **Plan correction: `%z`
+> stays** — 5.5.1 still implements the deprecated class; the oracle is the authority.
+> Re-triage: `_lua5.1-tests` interp legs pruned to sort/strings/files (rows 55, D11);
+> `_glua-tests` ported (getinfo nups/getupvalue slots shift by `_ENV`; loadstring→load;
+> both-shape os.execute asserts); the fuzzer no longer emits bare `unpack`. Deferred to
+> U2 with rulings: error-position attribution (row 52 — corpus discipline: no uncaught
+> position-bearing runtime errors in `_u1`; parse errors compare byte-exact), integral-float
+> printing ("3" vs "3.0" — cases assert equality instead). All 5.1-era gates green
+> (wasm matrices, error suite, glua, clua + clua55 conformance, selfdiffs, M5/M6, host,
+> `_cli-tests`); prod-blob pins bumped for the rt change (native ABI tests pass).
 
 ---
 

@@ -2,6 +2,7 @@ package lua
 
 import (
 	"bufio"
+	"errors"
 	"fmt"
 	"io"
 	"reflect"
@@ -140,41 +141,86 @@ func isArrayKey(v LNumber) bool {
 	return isInteger(v) && v < LNumber(int((^uint(0))>>1)) && v > LNumber(0) && v < LNumber(MaxArrayIndex)
 }
 
-// parseNumber: string → LNumber with stock Lua 5.1 semantics (the vendored
-// runtime's luaO_str2d/strtod, which the wasm engines run): leading zeros
-// stay DECIMAL. The old ParseInt(s, 0) read "0255" as octal 173 — the
-// fuzzer caught `-(0 .. 255)` printing -173 on interp vs -255 on wasm.
-// Hex integers keep working via the 0x prefix (sign allowed, matching
-// strtod); underscores are not digits (Go's base-0 syntax is not Lua's).
+// parseNumber: string → LNumber with stock Lua semantics (the vendored
+// runtime's luaO_str2d/strtod): leading zeros stay DECIMAL ("0777" is 777,
+// never octal — the old ParseInt(s, 0) read "0255" as 173; the fuzzer
+// caught `-(0 .. 255)` printing -173 on interp vs -255 on wasm), hex
+// floats ("0x1.8p3", and dot-bearing hex without a p-exponent, which C's
+// strtod accepts but Go's ParseFloat requires) and trailing-dot decimal
+// forms ("3.", "3.e5") normalize to Go syntax first. A leading sign is
+// accepted (string→number coercion; numeral literals never carry one).
+// Underscores are not digits (Go's base-0 syntax is not Lua's). The parse
+// package's numeralOK mirrors this acceptance for lex-time validation.
 func parseNumber(number string) (LNumber, error) {
-	var value LNumber
 	number = strings.Trim(number, " \t\n\v\f\r")
 	if strings.IndexByte(number, '_') >= 0 {
 		return LNumber(0), fmt.Errorf("invalid number: %s", number)
 	}
 	body := number
+	sign := ""
 	if len(body) > 0 && (body[0] == '-' || body[0] == '+') {
-		body = body[1:]
+		sign, body = body[:1], body[1:]
 	}
 	isHex := len(body) > 1 && body[0] == '0' && (body[1] == 'x' || body[1] == 'X')
 	if isHex {
-		// strtod parses hex integers and hex floats ("0x1.8p3"); Go's
-		// ParseFloat needs a p-exponent, so take hex ints here first
-		if v, err := strconv.ParseInt(number, 0, LNumberBit); err == nil {
-			return LNumber(v), nil
+		h := body[2:]
+		if strings.IndexAny(h, ".pP") >= 0 {
+			if v, err := strconv.ParseFloat(normalizeNumeral(number), LNumberBit); err == nil || errors.Is(err, strconv.ErrRange) {
+				return LNumber(v), nil
+			}
+		} else {
+			// plain hex integer: base-16 only, so Go's 0b/0o and
+			// leading-zero-octal base-0 quirks never apply
+			if v, err := strconv.ParseInt(sign+h, 16, LNumberBit); err == nil {
+				return LNumber(v), nil
+			}
+			if v, err := strconv.ParseUint(h, 16, LNumberBit); err == nil {
+				if sign == "-" {
+					return LNumber(-float64(v)), nil
+				}
+				return LNumber(float64(v)), nil
+			}
 		}
-		if v, err := strconv.ParseUint(number, 0, LNumberBit); err == nil {
-			return LNumber(v), nil
-		}
-	} else if v, err := strconv.ParseInt(number, 10, LNumberBit); err == nil {
-		return LNumber(v), nil
-	}
-	if v2, err2 := strconv.ParseFloat(number, LNumberBit); err2 == nil {
-		value = LNumber(v2)
+		// fall through: "0x" alone, trailing garbage, ...
 	} else {
-		return LNumber(0), err2
+		if v, err := strconv.ParseInt(number, 10, LNumberBit); err == nil {
+			return LNumber(v), nil
+		}
+		if v, err := strconv.ParseFloat(normalizeNumeral(number), LNumberBit); err == nil || errors.Is(err, strconv.ErrRange) {
+			return LNumber(v), nil
+		}
 	}
-	return value, nil
+	return LNumber(0), fmt.Errorf("invalid number: %s", number)
+}
+
+// normalizeNumeral adapts Lua numeral syntax to Go's ParseFloat: a digit
+// after a trailing '.' ("3." → "3.0", "3.e5" → "3.0e5") and, for
+// dot-bearing hex numerals without a p-exponent, an explicit "p0"
+// ("0x8.8" → "0x8.8p0" — C strtod accepts the bare form, Go requires the
+// exponent). parse/lexer.go carries the same helper for lex-time
+// validation.
+func normalizeNumeral(s string) string {
+	b := []byte(s)
+	for i := 0; i < len(b); i++ {
+		if b[i] == '.' && (i+1 == len(b) || !isHexNumeralDigit(b[i+1])) {
+			b = append(b, 0)
+			copy(b[i+2:], b[i+1:])
+			b[i+1] = '0'
+		}
+	}
+	t := string(b)
+	ht := t
+	if len(ht) > 0 && (ht[0] == '-' || ht[0] == '+') {
+		ht = ht[1:]
+	}
+	if len(ht) > 2 && ht[0] == '0' && (ht[1] == 'x' || ht[1] == 'X') && strings.IndexAny(ht, "pP") < 0 {
+		t += "p0"
+	}
+	return t
+}
+
+func isHexNumeralDigit(c byte) bool {
+	return '0' <= c && c <= '9' || 'a' <= c && c <= 'f' || 'A' <= c && c <= 'F'
 }
 
 func popenArgs(arg string) (string, []string) {

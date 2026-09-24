@@ -3,13 +3,17 @@ if string.find(os.getenv("OS") or "", "Windows") then
   osname = "windows"
 end
 
+-- 5.2 os.execute returns true|nil, "exit", code (5.1 returned a number) —
+-- accept both shapes
+local function execok(cmd)
+  local a = os.execute(cmd)
+  return a == true or a == 0
+end
 if osname == "linux" then
-  -- travis ci failed to start date command?
-  -- assert(os.execute("date") == 0)
-  assert(os.execute("date -a") == 1)
+  assert(not execok("date -a"))
 else
-  assert(os.execute("date /T") == 0)
-  assert(os.execute("md") == 1)
+  assert(execok("date /T"))
+  assert(not execok("md"))
 end
 
 assert(os.getenv("PATH") ~= "")

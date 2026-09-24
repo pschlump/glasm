@@ -1,5 +1,5 @@
 local function errmsg (code, m)
-  local st, msg = loadstring(code)
+  local st, msg = load(code)
   assert(not st and string.find(msg, m))
 end
 
@@ -59,7 +59,7 @@ do
   ]]
   local label = string.rep("0123456789", 40)
   prog = string.format(prog, label, label, label, label)
-  assert(assert(loadstring(prog))() == 31)
+  assert(assert(load(prog))() == 31)
 end
 
 -- goto to correct label when nested

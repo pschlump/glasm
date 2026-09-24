@@ -258,8 +258,15 @@ func init() {
 			A := int(inst>>18) & 0xff //GETA
 			RA := lbase + A
 			Bx := int(inst & 0x3ffff) //GETBX
-			//reg.Set(RA, L.getField(cf.Fn.Env, cf.Fn.Proto.Constants[Bx]))
-			v := L.getFieldString(cf.Fn.Env, cf.Fn.Proto.stringConstants[Bx])
+			// D3: the environment is the frame function's _ENV upvalue
+			// cell (SETUPVAL on _ENV changes global resolution for every
+			// closure sharing that cell); EnvUpvalueIndex < 0 covers
+			// functions compiled without globals
+			env := cf.Fn.Env
+			if idx := cf.Fn.Proto.EnvUpvalueIndex; idx >= 0 {
+				env, _ = cf.Fn.Upvalues[idx].Value().(*LTable)
+			}
+			v := L.getFieldString(env, cf.Fn.Proto.stringConstants[Bx])
 			// +inline-call reg.Set RA v
 			return 0
 		},
@@ -294,8 +301,12 @@ func init() {
 			A := int(inst>>18) & 0xff //GETA
 			RA := lbase + A
 			Bx := int(inst & 0x3ffff) //GETBX
-			//L.setField(cf.Fn.Env, cf.Fn.Proto.Constants[Bx], reg.Get(RA))
-			L.setFieldString(cf.Fn.Env, cf.Fn.Proto.stringConstants[Bx], reg.Get(RA))
+			// D3: see OP_GETGLOBAL — writes go through the _ENV cell
+			env := cf.Fn.Env
+			if idx := cf.Fn.Proto.EnvUpvalueIndex; idx >= 0 {
+				env, _ = cf.Fn.Upvalues[idx].Value().(*LTable)
+			}
+			L.setFieldString(env, cf.Fn.Proto.stringConstants[Bx], reg.Get(RA))
 			return 0
 		},
 		func(L *LState, inst uint32, baseframe *callFrame) int { //OP_SETUPVAL

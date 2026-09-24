@@ -1,0 +1,11 @@
+-- hex floats and literal syntax (5.2)
+print(0x1p-2 == 0.25, 0xA.8p0 == 10.5, 0x.8p2 == 2)
+print(0x10 == 16, 0xff == 255, 0xFF)
+print(0777 == 777, 0777)
+print(3. == 3, 3.e5 == 300000)
+print(10e500 == 10e400, -10e500 == -10e400, 10e500 > 1e308)  -- math.huge is row 38 (inf vs MaxFloat64) — avoided
+print(1e2, .5, 5.)
+print(0x.8 == 0.5, 0x8.8 == 8.5)
+print(tonumber("0x1p-2") == 0.25, tonumber(" 10 ") == 10)
+print(tonumber("0x10"), tonumber("10e2"), tonumber("3."))
+print(1e-2, 6.02e23)

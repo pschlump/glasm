@@ -392,11 +392,24 @@ func strMatch(L *LState) int {
 func strRep(L *LState) int {
 	str := L.CheckString(1)
 	n := L.CheckInt(2)
-	if n < 0 {
+	sep := L.OptString(3, "")
+	if n <= 0 {
 		L.Push(emptyLString)
-	} else {
-		L.Push(LString(strings.Repeat(str, n)))
+		return 1
 	}
+	if sep == "" {
+		L.Push(LString(strings.Repeat(str, n)))
+		return 1
+	}
+	// 5.2: separator between copies (s..sep..s..sep..s — n copies, n-1 seps)
+	buf := make([]byte, 0, len(str)*n+len(sep)*(n-1))
+	for i := 0; i < n; i++ {
+		if i > 0 {
+			buf = append(buf, sep...)
+		}
+		buf = append(buf, str...)
+	}
+	L.Push(LString(buf))
 	return 1
 }
 

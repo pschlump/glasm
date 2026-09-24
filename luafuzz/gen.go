@@ -1176,7 +1176,9 @@ func (g *gen) stmtLib() {
 		case 1:
 			g.linef("print(table.concat(%s, %s))", name, g.pick([]string{`","`, `"-"`, `""`}))
 		default:
-			g.linef("print(table.remove(%s), #%s, unpack(%s))", name, name, name)
+			// U1 (D8): base unpack removed — 5.1 C runtime still has it,
+			// so the bare name can no longer be emitted (row 54)
+			g.linef("print(table.remove(%s), #%s, %s[#%s])", name, name, name, name)
 		}
 	default:
 		g.linef("print(math.random(6), math.random(2, 9), math.fmod(%s, %s))",

@@ -24,7 +24,7 @@ import (
 // update this constant (the artifact test is the self-check that forces
 // the bump). Brittle by design (A8: checksummed artifact). M7a bump: the
 // hostfn seam (host.host_call import + rt_hostfn/rt_encode_value exports).
-const lua51ProdSHA256 = "b4b7d2b7619f1f5051305a6d163a101528a0e5aaec1ea5bbffeb1921aac8ec57"
+const lua51ProdSHA256 = "4325f355a86e7144c2229e24653f3995f3d9a5caa16e131dae7afc0640b9333f"
 
 func TestM6cProdBlobArtifact(t *testing.T) {
 	imps, err := wasm.Imports(lua51ProdWasm)

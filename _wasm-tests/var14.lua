@@ -1,2 +1,2 @@
-local function f(...) return unpack({...}) end
+local function f(...) return select('#', ...) end
 print(f('p', 'q'))

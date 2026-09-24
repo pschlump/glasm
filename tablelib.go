@@ -11,12 +11,50 @@ func OpenTable(L *LState) int {
 }
 
 var tableFuncs = map[string]LGFunction{
-	"getn":   tableGetN,
+	"getn": tableGetN, // deprecated in 5.2 (removed in 5.3 — U3)
+	"maxn": tableMaxN, // deprecated in 5.2 (removed in 5.3 — U3)
+	// 5.2 additions (U1)
+	"pack":   tablePack,
+	"unpack": tableUnpack,
 	"concat": tableConcat,
 	"insert": tableInsert,
-	"maxn":   tableMaxN,
 	"remove": tableRemove,
 	"sort":   tableSort,
+}
+
+// tablePack implements 5.2 table.pack(...): {n = select('#', ...), ...}.
+// The count is stored explicitly so trailing nils survive.
+func tablePack(L *LState) int {
+	n := L.GetTop()
+	t := L.NewTable()
+	for i := 1; i <= n; i++ {
+		t.RawSetInt(i, L.Get(i))
+	}
+	t.RawSetString("n", LNumber(n))
+	L.Push(t)
+	return 1
+}
+
+// tableUnpack implements 5.2 table.unpack(list [, i [, j]]) — the 5.2
+// replacement for base unpack (returns list[i..j], i default 1, j
+// default #list).
+func tableUnpack(L *LState) int {
+	tb := L.CheckTable(1)
+	i := L.OptInt(2, 1)
+	var end int
+	if L.GetTop() >= 3 {
+		end = L.CheckInt(3)
+	} else {
+		end = tb.Len()
+	}
+	n := end - i + 1
+	if n <= 0 {
+		return 0
+	}
+	for k := i; k <= end; k++ {
+		L.Push(tb.RawGetInt(k))
+	}
+	return n
 }
 
 func tableSort(L *LState) int {

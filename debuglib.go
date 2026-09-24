@@ -12,21 +12,14 @@ func OpenDebug(L *LState) int {
 }
 
 var debugFuncs = map[string]LGFunction{
-	"getfenv":      debugGetFEnv,
 	"getinfo":      debugGetInfo,
 	"getlocal":     debugGetLocal,
 	"getmetatable": debugGetMetatable,
 	"getupvalue":   debugGetUpvalue,
-	"setfenv":      debugSetFEnv,
 	"setlocal":     debugSetLocal,
 	"setmetatable": debugSetMetatable,
 	"setupvalue":   debugSetUpvalue,
 	"traceback":    debugTraceback,
-}
-
-func debugGetFEnv(L *LState) int {
-	L.Push(L.GetFEnv(L.CheckAny(1)))
-	return 1
 }
 
 func debugGetInfo(L *LState) int {
@@ -104,11 +97,6 @@ func debugGetUpvalue(L *LState) int {
 	}
 	L.Push(LNil)
 	return 1
-}
-
-func debugSetFEnv(L *LState) int {
-	L.SetFEnv(L.CheckAny(1), L.CheckAny(2))
-	return 0
 }
 
 func debugSetLocal(L *LState) int {

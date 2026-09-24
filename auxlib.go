@@ -386,11 +386,11 @@ func (ls *LState) LoadFile(path string) (*LFunction, error) {
 		}
 	}
 
-	return ls.Load(reader, path)
+	return ls.Load(reader, "@"+path)
 }
 
 func (ls *LState) LoadString(source string) (*LFunction, error) {
-	return ls.Load(strings.NewReader(source), "<string>")
+	return ls.Load(strings.NewReader(source), "=<string>")
 }
 
 func (ls *LState) DoFile(path string) error {

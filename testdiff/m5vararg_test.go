@@ -22,7 +22,9 @@ func TestM5Varargs(t *testing.T) {
 		"zero":         "local function f(...) return ... end\nprint(f())\n",
 		"truncate":     "local function f(...) local a, b = ... return b end\nprint(f(1, 2, 3))\n",
 		"constvarargs": "local function h(...) return ... end\nlocal function g(...) return h(...) end\nlocal function f(...) return g(2, ...) end\nprint(f(1, 2, 3))\n", // the M5b scratch-collision repro
-		"unpack":       "local function f(...) return unpack({...}) end\nprint(f('p', 'q'))\n",
+		// was: unpack({...}) — base unpack removed at U1 (row 54; the wasm
+		// engine's 5.1 C stdlib still has it, so the bare name had to go)
+		"unpack":       "local function f(...) return select('#', ...) end\nprint(f('p', 'q'))\n",
 		"mixedthrough": "local function f(a, b, ...) return a, b, ... end\nprint(f(1, 2, 3, 4))\n",
 		"argnzero":     "local function f(...) return arg.n end\nprint(f())\n",
 		"select2":      "local function f(...) return select(2, ...) end\nprint(f(1, 2, 3))\n",

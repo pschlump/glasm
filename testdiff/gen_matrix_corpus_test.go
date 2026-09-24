@@ -132,7 +132,9 @@ func TestGenMatrixCorpus(t *testing.T) {
 	// ---- calls & multret ----
 	add("cal00", "print(select('#', 1, 2, 3))\n")
 	add("cal01", "print(select(2, 'a', 'b', 'c'))\n")
-	add("cal02", "print(unpack({7, 8, 9}))\n")
+	// U1 (row 54): base unpack removed; the vararg-spread shape it
+	// exercised now uses a multret call through a helper
+	add("cal02", "local function u(t) return t[1], t[2], t[3] end\nprint(u({7, 8, 9}))\n")
 	add("cal03", "print(tostring(42), tonumber('13'), type(nil), type(1), type('s'), type({}))\n")
 	add("cal04", "print(pcall(function() end))\n") // function → SKIP (closure) — keep for the skip path
 	add("cal05", "print(tonumber('x') == nil)\n")
@@ -182,7 +184,7 @@ func TestGenMatrixCorpus(t *testing.T) {
 	add("var11", "local function f(...) return ... end\nprint(f())\n")                                                                                             // zero varargs
 	add("var12", "local function f(...) local a, b = ... return b end\nprint(f(1, 2, 3))\n")                                                                       // truncation
 	add("var13", "local function h(...) return ... end\nlocal function g(...) return h(...) end\nlocal function f(...) return g(2, ...) end\nprint(f(1, 2, 3))\n") // const+varargs, two levels (the M5b scratch-collision repro)
-	add("var14", "local function f(...) return unpack({...}) end\nprint(f('p', 'q'))\n")
+	add("var14", "local function f(...) return select('#', ...) end\nprint(f('p', 'q'))\n")
 	add("var15", "local function f(a, b, ...) return a, b, ... end\nprint(f(1, 2, 3, 4))\n") // mixed params + varargs through
 	add("var16", "local function f(...) return arg.n end\nprint(f())\n")                     // arg.n with zero varargs
 	add("var17", "local function f(...) return select(2, ...) end\nprint(f(1, 2, 3))\n")

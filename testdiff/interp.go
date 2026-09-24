@@ -13,10 +13,10 @@ import (
 	"strings"
 	"time"
 
-	"github.com/pschlump/golua55"
+	lua "github.com/pschlump/golua55"
 )
 
-// Interp is the gopher-lua interpreter oracle. Instances are named so two
+// Interp is the golua55 interpreter oracle. Instances are named so two
 // of them can be diffed against each other (the M1 self-diff gate).
 type Interp struct {
 	name string
@@ -76,7 +76,7 @@ func (e *Interp) Run(c Case) []string {
 		}
 	}()
 
-	fn, err := L.Load(strings.NewReader(string(c.Source)), c.Name)
+	fn, err := L.Load(strings.NewReader(string(c.Source)), "@"+c.Name)
 	if err != nil {
 		emit("ERROR", ValueRepr(lua.LString(err.Error()), 0, map[*lua.LTable]bool{}))
 		emit("GLOBALS", serializeGlobals(L))
@@ -182,7 +182,7 @@ func installShim(L *lua.LState, emit func(event, payload string), seed int64) {
 
 	// math.random/randomseed: deterministic, engine-owned RNG.
 	//
-	// gopher-lua's mathlib draws from Go's global math/rand, whose
+	// golua55's mathlib draws from Go's global math/rand, whose
 	// rand.Seed is a no-op on Go >= 1.24 (GODEBUG randseednop), so
 	// math.randomseed(42) does not make sequences reproducible — and the
 	// unseeded stream is process-random, unlike C Lua's deterministic

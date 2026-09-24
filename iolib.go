@@ -229,7 +229,7 @@ func fileToString(L *LState) int {
 	return 1
 }
 
-func fileWriteAux(L *LState, file *lFile, idx int) int {
+func fileWriteAux(L *LState, file *lFile, idx int, handle LValue) int {
 	if n := fileIsWritable(L, file); n != 0 {
 		return n
 	}
@@ -246,7 +246,8 @@ func fileWriteAux(L *LState, file *lFile, idx int) int {
 	}
 
 	file.AbandonReadBuffer()
-	L.Push(LTrue)
+	// 5.2: file:write returns the file itself (was true)
+	L.Push(handle)
 	return 1
 errreturn:
 
@@ -393,6 +394,18 @@ func fileReadAux(L *LState, file *lFile, idx int) int {
 						goto errreturn
 					}
 					L.Push(LString(string(buf)))
+				case 'L': // 5.2: like l, but keeps the trailing newline
+					var buf []byte
+					var iseof bool
+					buf, _, iseof, err = readLineKeep(file.reader)
+					if iseof {
+						L.Push(LNil)
+						goto normalreturn
+					}
+					if err != nil {
+						goto errreturn
+					}
+					L.Push(LString(string(buf)))
 				default:
 					L.ArgError(2, "invalid options:"+string(opt))
 				}
@@ -449,8 +462,23 @@ errreturn:
 	return 2
 }
 
+// readLineKeep reads one line keeping the trailing newline when present
+// (the 5.2 *L option). A final partial line without a newline is returned
+// as-is (stock does not synthesize one).
+func readLineKeep(reader *bufio.Reader) (line []byte, hadNL, iseof bool, err error) {
+	s, e := reader.ReadString('\n')
+	if len(s) > 0 {
+		return []byte(s), e == nil, false, nil
+	}
+	if e == io.EOF {
+		return nil, false, true, nil
+	}
+	return nil, false, false, e
+}
+
 func fileWrite(L *LState) int {
-	return fileWriteAux(L, checkFile(L), 2)
+	handle := L.CheckUserData(1)
+	return fileWriteAux(L, checkFile(L), 2, handle)
 }
 
 func fileClose(L *LState) int {
@@ -742,7 +770,8 @@ func ioOutput(L *LState) int {
 }
 
 func ioWrite(L *LState) int {
-	return fileWriteAux(L, fileDefOut(L).Value.(*lFile), 1)
+	// 5.2: io.write returns the default output file
+	return fileWriteAux(L, fileDefOut(L).Value.(*lFile), 1, fileDefOut(L))
 }
 
 //

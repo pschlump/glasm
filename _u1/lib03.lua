@@ -1,0 +1,8 @@
+-- string.rep separator (5.2)
+print(string.rep("ab", 3, "-"))
+print(string.rep("ab", 1, "-"))
+print(string.rep("ab", 0, "-"))
+print(string.rep("ab", -1, "-"))
+print(string.rep("x", 4, "--"))
+print(("ab"):rep(3, "."))
+print(string.rep("", 3, "+") == "")

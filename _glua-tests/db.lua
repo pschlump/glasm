@@ -3,20 +3,21 @@
 
 local function f1()
 end
-local env = {}
 local mt = {}
-debug.setfenv(f1, env)
-assert(debug.getfenv(f1) == env)
+-- (5.2 removed debug.setfenv/getfenv — keep the line count stable; the
+-- getinfo asserts below are position-sensitive)
+--
+--
 debug.setmetatable(f1, mt)
 assert(debug.getmetatable(f1) == mt)
 
 local function f2()
   local info = debug.getinfo(1, "Slunf")
-  assert(info.currentline == 14)
-  assert(info.linedefined == 13)
+  assert(info.currentline == 15)
+  assert(info.linedefined == 14)
   assert(info.func == f2)
-  assert(info.lastlinedefined == 25)
-  assert(info.nups == 1)
+  assert(info.lastlinedefined == 26)
+  assert(info.nups == 2) -- +_ENV (5.2 globals resolve through the _ENV upvalue)
   assert(info.name == "f2")
   assert(info.what == "Lua")
   if string.find(_VERSION, "GopherLua") then
@@ -29,10 +30,10 @@ local function f3()
 end
 local info = debug.getinfo(f3)
 assert(info.currentline == -1)
-assert(info.linedefined == 28)
+assert(info.linedefined == 29)
 assert(info.func == f3)
-assert(info.lastlinedefined == 29)
-assert(info.nups == 0)
+assert(info.lastlinedefined == 30)
+assert(info.nups == 0) -- f3 references no globals, so no _ENV capture either
 assert(info.name == nil)
 assert(info.what == "Lua")
 if string.find(_VERSION, "GopherLua") then
@@ -61,9 +62,11 @@ local function f4()
   f5()
   local name, value = debug.getupvalue(f5, 1)
   assert(debug.getupvalue(f5, 10) == nil)
+  assert(name == "_ENV") -- 5.2: globals give f5 an _ENV upvalue at slot 1
+  name, value = debug.getupvalue(f5, 2)
   assert(name == "a")
   assert(value == 1)
-  name = debug.setupvalue(f5, 1, 11)
+  name = debug.setupvalue(f5, 2, 11)
   assert(debug.setupvalue(f5, 10, 11) == nil)
   assert(name == "a")
   assert(a == 11)

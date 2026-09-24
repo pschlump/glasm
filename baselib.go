@@ -28,11 +28,9 @@ var baseFuncs = map[string]LGFunction{
 	"collectgarbage": baseCollectGarbage,
 	"dofile":         baseDoFile,
 	"error":          baseError,
-	"getfenv":        baseGetFEnv,
 	"getmetatable":   baseGetMetatable,
 	"load":           baseLoad,
 	"loadfile":       baseLoadFile,
-	"loadstring":     baseLoadString,
 	"next":           baseNext,
 	"pcall":          basePCall,
 	"print":          basePrint,
@@ -41,18 +39,16 @@ var baseFuncs = map[string]LGFunction{
 	"rawset":         baseRawSet,
 	"select":         baseSelect,
 	"_printregs":     base_PrintRegs,
-	"setfenv":        baseSetFEnv,
 	"setmetatable":   baseSetMetatable,
 	"tonumber":       baseToNumber,
 	"tostring":       baseToString,
 	"type":           baseType,
-	"unpack":         baseUnpack,
 	"xpcall":         baseXPCall,
 	// loadlib
-	"module":  loModule,
 	"require": loRequire,
-	// hidden features
-	"newproxy": baseNewProxy,
+	// U1 (D8 hard cut): setfenv, getfenv, module, loadstring, unpack and
+	// the hidden newproxy are gone — environments are _ENV (D3) and
+	// unpack moved to table.unpack.
 }
 
 func baseAssert(L *LState) int {
@@ -88,45 +84,6 @@ func baseError(L *LState) int {
 	return 0
 }
 
-func baseGetFEnv(L *LState) int {
-	var value LValue
-	if L.GetTop() == 0 {
-		value = LNumber(1)
-	} else {
-		value = L.Get(1)
-	}
-
-	if fn, ok := value.(*LFunction); ok {
-		if !fn.IsG {
-			L.Push(fn.Env)
-		} else {
-			L.Push(L.G.Global)
-		}
-		return 1
-	}
-
-	if number, ok := value.(LNumber); ok {
-		level := int(float64(number))
-		if level <= 0 {
-			L.Push(L.Env)
-		} else {
-			cf := L.currentFrame
-			for i := 0; i < level && cf != nil; i++ {
-				cf = cf.Parent
-			}
-			if cf == nil || cf.Fn.IsG {
-				L.Push(L.G.Global)
-			} else {
-				L.Push(cf.Fn.Env)
-			}
-		}
-		return 1
-	}
-
-	L.Push(L.G.Global)
-	return 1
-}
-
 func baseGetMetatable(L *LState) int {
 	L.Push(L.GetMetatable(L.CheckAny(1)))
 	return 1
@@ -156,8 +113,11 @@ func baseIpairs(L *LState) int {
 	return 3
 }
 
-func loadaux(L *LState, reader io.Reader, chunkname string) int {
-	if fn, err := L.Load(reader, chunkname); err != nil {
+// loadaux is the shared tail of load/loadfile: parse+compile with the
+// given environment and normalize the error shape to (nil, message).
+// U1 (D3): env seeds the chunk's _ENV upvalue; nil means the thread env.
+func loadaux(L *LState, reader io.Reader, chunkname string, env *LTable) int {
+	if fn, err := L.LoadEnv(reader, chunkname, env); err != nil {
 		L.Push(LNil)
 		L.Push(LString(err.Error()))
 		return 2
@@ -167,56 +127,105 @@ func loadaux(L *LState, reader io.Reader, chunkname string) int {
 	}
 }
 
-func baseLoad(L *LState) int {
-	fn := L.CheckFunction(1)
-	chunkname := L.OptString(2, "?")
-	top := L.GetTop()
-	buf := []string{}
-	for {
-		L.SetTop(top)
-		L.Push(fn)
-		L.Call(0, 1)
-		ret := L.reg.Pop()
-		if ret == LNil {
-			break
-		} else if LVCanConvToString(ret) {
-			str := ret.String()
-			if len(str) > 0 {
-				buf = append(buf, string(str))
-			} else {
-				break
-			}
-		} else {
-			L.Push(LNil)
-			L.Push(LString("reader function must return a string"))
-			return 2
-		}
+// checkLoadMode validates the 5.2 mode argument ("b", "t", "bt"; default
+// "bt"). The fork has no binary-chunk loader (undump is not implemented),
+// so mode "b" rejects every chunk with stock's text-chunk error — the
+// exact behavior a text chunk sees under stock — and "t"/"bt" accept text.
+func checkLoadMode(L *LState, idx int, chunkname string) bool {
+	mode := L.OptString(idx, "bt")
+	if !strings.Contains(mode, "t") {
+		L.Push(LNil)
+		// stock's text (lbaselib loadaux): no position prefix
+		L.Push(LString(fmt.Sprintf("attempt to load a text chunk (mode is '%s')", mode)))
+		return false
 	}
-	return loadaux(L, strings.NewReader(strings.Join(buf, "")), chunkname)
+	return true
 }
 
+// loadEnvArg validates load/loadfile's env argument (nil or table) and
+// returns it (nil → thread default).
+func loadEnvArg(L *LState, idx int) *LTable {
+	v := L.Get(idx)
+	if v == LNil {
+		return nil
+	}
+	if tb, ok := v.(*LTable); ok {
+		return tb
+	}
+	L.ArgError(idx, fmt.Sprintf("table expected, got %s", v.Type().String()))
+	return nil
+}
+
+// baseLoad implements 5.2 load: load(chunk [, chunkname [, mode [, env]]]).
+// chunk is a string or a reader function; a string chunk's default
+// chunkname is the chunk text itself ([string "..."] rendering), a
+// function chunk's is "=(load)" (stock lbaselib).
+func baseLoad(L *LState) int {
+	var reader io.Reader
+	var chunkname string
+	switch lv := L.Get(1).(type) {
+	case LString:
+		reader = strings.NewReader(string(lv))
+		chunkname = L.OptString(2, string(lv))
+	case *LFunction:
+		fn := lv
+		chunkname = L.OptString(2, "=(load)")
+		top := L.GetTop()
+		buf := []string{}
+		for {
+			L.SetTop(top)
+			L.Push(fn)
+			L.Call(0, 1)
+			ret := L.reg.Pop()
+			if ret == LNil {
+				break
+			} else if LVCanConvToString(ret) {
+				str := ret.String()
+				if len(str) > 0 {
+					buf = append(buf, string(str))
+				} else {
+					break
+				}
+			} else {
+				L.Push(LNil)
+				L.Push(LString("reader function must return a string"))
+				return 2
+			}
+		}
+		reader = strings.NewReader(strings.Join(buf, ""))
+	default:
+		L.ArgError(1, "string or function expected")
+		return 0
+	}
+	if !checkLoadMode(L, 3, chunkname) {
+		return 2
+	}
+	return loadaux(L, reader, chunkname, loadEnvArg(L, 4))
+}
+
+// baseLoadFile implements 5.2 loadfile([filename [, mode [, env]]]).
 func baseLoadFile(L *LState) int {
 	var reader io.Reader
 	var chunkname string
 	var err error
-	if L.GetTop() < 1 {
+	if L.GetTop() < 1 || L.Get(1) == LNil {
 		reader = os.Stdin
-		chunkname = "<stdin>"
+		chunkname = "=stdin"
 	} else {
 		chunkname = L.CheckString(1)
 		reader, err = os.Open(chunkname)
 		if err != nil {
+			// stock 5.5 loadfile: "cannot open <file>: <strerror>"
 			L.Push(LNil)
-			L.Push(LString(fmt.Sprintf("can not open file: %v", chunkname)))
+			L.Push(LString(fmt.Sprintf("cannot open %s: No such file or directory", chunkname)))
 			return 2
 		}
 		defer reader.(*os.File).Close()
 	}
-	return loadaux(L, reader, chunkname)
-}
-
-func baseLoadString(L *LState) int {
-	return loadaux(L, strings.NewReader(L.CheckString(1)), L.OptString(2, "<string>"))
+	if !checkLoadMode(L, 2, chunkname) {
+		return 2
+	}
+	return loadaux(L, reader, "@"+chunkname, loadEnvArg(L, 3))
 }
 
 func baseNext(L *LState) int {
@@ -341,49 +350,6 @@ func baseSelect(L *LState) int {
 	return 0
 }
 
-func baseSetFEnv(L *LState) int {
-	var value LValue
-	if L.GetTop() == 0 {
-		value = LNumber(1)
-	} else {
-		value = L.Get(1)
-	}
-	env := L.CheckTable(2)
-
-	if fn, ok := value.(*LFunction); ok {
-		if fn.IsG {
-			L.RaiseError("cannot change the environment of given object")
-		} else {
-			fn.Env = env
-			L.Push(fn)
-			return 1
-		}
-	}
-
-	if number, ok := value.(LNumber); ok {
-		level := int(float64(number))
-		if level <= 0 {
-			L.Env = env
-			return 0
-		}
-
-		cf := L.currentFrame
-		for i := 0; i < level && cf != nil; i++ {
-			cf = cf.Parent
-		}
-		if cf == nil || cf.Fn.IsG {
-			L.RaiseError("cannot change the environment of given object")
-		} else {
-			cf.Fn.Env = env
-			L.Push(cf.Fn)
-			return 1
-		}
-	}
-
-	L.RaiseError("cannot change the environment of given object")
-	return 0
-}
-
 func baseSetMetatable(L *LState) int {
 	L.CheckTypes(2, LTNil, LTTable)
 	obj := L.Get(1)
@@ -410,6 +376,17 @@ func baseToNumber(L *LState) int {
 		L.Push(lv)
 	case LString:
 		str := strings.Trim(string(lv), " \n\t")
+		if noBase {
+			// no base: full numeral grammar via parseNumber (hex floats
+			// like "0x1p-2" and trailing-dot forms like "3." are valid —
+			// the old integer-only paths returned nil for them)
+			if v, err := parseNumber(str); err == nil {
+				L.Push(v)
+			} else {
+				L.Push(LNil)
+			}
+			return 1
+		}
 		if strings.Index(str, ".") > -1 {
 			if v, err := strconv.ParseFloat(str, LNumberBit); err != nil {
 				L.Push(LNil)
@@ -417,9 +394,6 @@ func baseToNumber(L *LState) int {
 				L.Push(LNumber(v))
 			}
 		} else {
-			if noBase && strings.HasPrefix(strings.ToLower(str), "0x") {
-				base, str = 16, str[2:] // Hex number
-			}
 			if v, err := strconv.ParseInt(str, base, LNumberBit); err != nil {
 				L.Push(LNil)
 			} else {
@@ -443,27 +417,21 @@ func baseType(L *LState) int {
 	return 1
 }
 
-func baseUnpack(L *LState) int {
-	tb := L.CheckTable(1)
-	start := L.OptInt(2, 1)
-	end := L.OptInt(3, tb.Len())
-	for i := start; i <= end; i++ {
-		L.Push(tb.RawGetInt(i))
-	}
-	ret := end - start + 1
-	if ret < 0 {
-		return 0
-	}
-	return ret
-}
-
+// baseXPCall implements 5.2 xpcall(f, msgh [, ...]): the extra arguments
+// are passed through to f (5.1 dropped them).
 func baseXPCall(L *LState) int {
 	fn := L.CheckFunction(1)
 	errfunc := L.CheckFunction(2)
+	nargs := L.GetTop() - 2
 
-	top := L.GetTop()
+	// call a copy of fn with copies of the args (the originals, plus the
+	// handler between them, stay below untouched)
 	L.Push(fn)
-	if err := L.PCall(0, MultRet, errfunc); err != nil {
+	for i := 0; i < nargs; i++ {
+		L.Push(L.Get(3 + i))
+	}
+	if err := L.PCall(nargs, MultRet, errfunc); err != nil {
+		L.SetTop(2)
 		L.Push(LFalse)
 		if aerr, ok := err.(*ApiError); ok {
 			L.Push(aerr.Object)
@@ -471,55 +439,20 @@ func baseXPCall(L *LState) int {
 			L.Push(LString(err.Error()))
 		}
 		return 2
-	} else {
-		L.Insert(LTrue, top+1)
-		return L.GetTop() - top
 	}
+	// [fn errf a1..aN | results...] -> [true | results...]
+	nres := L.GetTop() - (2 + nargs)
+	L.Insert(LTrue, 2+nargs+1)
+	for i := 0; i < nres+1; i++ {
+		L.Replace(1+i, L.Get(2+nargs+1+i))
+	}
+	L.SetTop(nres + 1)
+	return nres + 1
 }
 
 /* }}} */
 
 /* load lib {{{ */
-
-func loModule(L *LState) int {
-	name := L.CheckString(1)
-	loaded := L.GetField(L.Get(RegistryIndex), "_LOADED")
-	tb := L.GetField(loaded, name)
-	if _, ok := tb.(*LTable); !ok {
-		tb = L.FindTable(L.Get(GlobalsIndex).(*LTable), name, 1)
-		if tb == LNil {
-			L.RaiseError("name conflict for module: %v", name)
-		}
-		L.SetField(loaded, name, tb)
-	}
-	if L.GetField(tb, "_NAME") == LNil {
-		L.SetField(tb, "_M", tb)
-		L.SetField(tb, "_NAME", LString(name))
-		names := strings.Split(name, ".")
-		pname := ""
-		if len(names) > 1 {
-			pname = strings.Join(names[:len(names)-1], ".") + "."
-		}
-		L.SetField(tb, "_PACKAGE", LString(pname))
-	}
-
-	caller := L.currentFrame.Parent
-	if caller == nil {
-		L.RaiseError("no calling stack.")
-	} else if caller.Fn.IsG {
-		L.RaiseError("module() can not be called from GFunctions.")
-	}
-	L.SetFEnv(caller.Fn, tb)
-
-	top := L.GetTop()
-	for i := 2; i <= top; i++ {
-		L.Push(L.Get(i))
-		L.Push(tb)
-		L.Call(1, 0)
-	}
-	L.Push(tb)
-	return 1
-}
 
 var loopdetection = &LUserData{}
 
@@ -579,18 +512,6 @@ loopbreak:
 /* }}} */
 
 /* hidden features {{{ */
-
-func baseNewProxy(L *LState) int {
-	ud := L.NewUserData()
-	L.SetTop(1)
-	if L.Get(1) == LTrue {
-		L.SetMetatable(ud, L.NewTable())
-	} else if d, ok := L.Get(1).(*LUserData); ok {
-		L.SetMetatable(ud, L.GetMetatable(d))
-	}
-	L.Push(ud)
-	return 1
-}
 
 /* }}} */
 

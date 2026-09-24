@@ -128,7 +128,8 @@ func (e *WazeroEngine) Run(c Case) (log []string) {
 	bin := e.Precompiled
 	if bin == nil {
 		var err error
-		bin, err = CompileSource(c.Source, c.Name)
+		// U1: '@'-sigil chunk names (see wasmengine.go)
+		bin, err = CompileSource(c.Source, "@"+c.Name)
 		if err != nil {
 			if e.SkipUnsupported && strings.Contains(err.Error(), "backend v1") {
 				return []string{"SKIP-UNSUPPORTED\t" + err.Error()}

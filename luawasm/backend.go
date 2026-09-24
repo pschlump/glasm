@@ -1,5 +1,5 @@
 // Package luawasm is the Lua→wasm backend (design doc §4, milestones M4–M5):
-// FunctionProto trees from the gopher-lua frontend become wasm modules
+// FunctionProto trees from the golua55 frontend become wasm modules
 // that share linear memory with the C runtime and call down through the
 // frozen rt_* ABI (runtime/rt_abi.h).
 //
@@ -21,8 +21,9 @@ package luawasm
 
 import (
 	"fmt"
+	"strings"
 
-	"github.com/pschlump/golua55"
+	lua "github.com/pschlump/golua55"
 	"github.com/pschlump/golua55/wasm"
 )
 
@@ -43,7 +44,10 @@ type protoInfo struct {
 func Compile(main *lua.FunctionProto, chunkName string) ([]byte, error) {
 	protos := collectProtos(main)
 
-	b := &backend{m: wasm.NewModule(), main: main, chunkName: chunkName}
+	// the C runtime renders the chunk name verbatim in error positions
+	// (ldebug reads the proto source raw), so strip the '@' sigil the Go
+	// callers now carry (U1 ChunkID convention) before registering it
+	b := &backend{m: wasm.NewModule(), main: main, chunkName: strings.TrimPrefix(chunkName, "@")}
 	b.layoutProtos(protos)
 	b.declareImports()
 	b.emitInit()
