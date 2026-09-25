@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this repo is
 
-A fork of yuin/golua55-lua (Lua VM + compiler in Go, moved to the **5.2 language core as of U1** — `_ENV`, 5.2 escapes/numerals/libs, D8 removals; the full 5.2→5.5 program is `docs/Upgrade-from-5.2-to-5.5-of-Lua.md`) extended with a **Lua → WebAssembly compiler**. The end goal is running untrusted client scripts inside a **pure-Go Redis clone** (no cgo, no C in the daemon repo): the daemon consumes only a Go host package plus prebuilt, embedded wasm blobs.
+A fork of yuin/golua55-lua (Lua VM + compiler in Go, moved to the **5.2 language core as of U1** and the **stock 5.5.1 instruction encoding as of U2c** — `_ENV`, 5.2 escapes/numerals/libs, D8 removals, 85-opcode format; the full 5.2→5.5 program is `docs/Upgrade-from-5.2-to-5.5-of-Lua.md`) extended with a **Lua → WebAssembly compiler**. The end goal is running untrusted client scripts inside a **pure-Go Redis clone** (no cgo, no C in the daemon repo): the daemon consumes only a Go host package plus prebuilt, embedded wasm blobs.
 
 Development is milestone-driven (M0–M8). The authoritative docs:
 
@@ -31,7 +31,9 @@ go test ./testdiff/ -run TestWasmFullMatrix -v   # run a single differential gat
 #             TestCLua55Conformance (_lua5.5-tests, 5.5 oracle), TestU1Gate (_u1: interp <-> clua55 byte-exact, the 5.2-core gate)
 
 # CLI differential runner (exit 1 on any diff). wasm = wasmtime oracle
-# host; wazero = the pure-Go production engine (same blob — ledger row 32)
+# host; wazero = the pure-Go production engine (same blob — ledger row 32).
+# U2c window: the wasm/wazero backend legs are retired until U2e (row 59) —
+# every `wasm`/`wazero` engine leg fails fast at compile; interp/clua legs live.
 go run ./cmd/testdiff -corpus _wasm-tests -engines interp,wasm
 go run ./cmd/testdiff -corpus _wasm-err-tests -engines interp,wasm
 go run ./cmd/testdiff -corpus _glua-tests -engines interp,clua
@@ -54,7 +56,7 @@ runtime/build55.sh          # rebuild lua55_sjlj.wasm (5.5.1 oracle, U0) → cop
 runtime/tests/run.sh        # native rt_* ABI unit tests: plain + ASan + UBSan
 
 # CLI black-box tests (wc-clone in Lua, interp vs wasm paths)
-cd _cli-tests && make                 # default: wasm legs on wasmtime
+cd _cli-tests && make                 # default: wasm legs on wasmtime (row-59 skip until U2e)
 cd _cli-tests && make test WAZERO=1   # M6b: wasm legs on the wazero production engine
 ```
 
@@ -62,12 +64,12 @@ After rebuilding the runtime blob, run `go clean -testcache` — go-test caching
 
 ## Architecture
 
-Three code-producing pieces plus a test harness, sharing the golua55-lua frontend (`parse/`, `ast/`, `compile.go` → `FunctionProto`, 41 opcodes — all reused untouched):
+Three code-producing pieces plus a test harness, sharing the golua55-lua frontend (`parse/`, `ast/`, `compile.go` → `FunctionProto` — reused; `compile.go` was rewritten onto the 5.5.1 encoding at U2c):
 
 - **`wasm/`** — standalone pure-Go wasm binary emitter (sections, LEB128, instruction encoders).
-- **`luawasm/`** — the backend: `FunctionProto` tree → wasm module. One wasm function per proto with common signature `(frame, cl, nargs, want) → nret`; registers are TValue cells at `frame+16*k`; control flow is flattened (`loop` + `br_table` over basic blocks). `backend.go` (module skeleton/init/dispatch), `emit.go` (function emitter), `ops.go` (opcode lowering).
+- **`luawasm/`** — the backend: `FunctionProto` tree → wasm module. **Retired at U2c (ledger row 59): the Go frontend now emits the stock 5.5.1 encoding; the backend still spoke the fork's 42-opcode format and is a fail-fast stub until the U2e rewrite** (against the exported `lua.OpGet*`/`OpCreate*` decoders and ABI v4). The M4–M6 implementation lives in git history before the U2c commit. When live it was: one wasm function per proto with common signature `(frame, cl, nargs, want) → nret`; registers as TValue cells at `frame+16*k`; flattened control flow (`loop` + `br_table`).
 - **`runtime/`** — vendored stock C Lua 5.1.5 (`runtime/lua51/`) + glue (`luawasm.c`, `rt_abi.c`) compiled to freestanding wasm32. Exports the frozen `rt_*` ABI the backend calls; hosts C functions and metamethod/coercion slow paths. The SJLJ/EH blob (`lua51_sjlj.wasm`) runs on wasmtime only — **wazero (pure Go) is the production engine**; an EH-free blob flavor is the tracked M6 item. `runtime/lua55/` (U0) vendors stock C Lua 5.5.1 with **zero patches** — driven by `luawasm55.c` (public C API only; determinism pinned by `build55.sh` flags) into `lua55_sjlj.wasm`, the new-oracle blob.
-- **`testdiff/`** — differential harness. `Engine` interface with three engines: `interp` (the golua55-lua interpreter, primary oracle), `clua` (stock C Lua 5.1 in wasm on wasmtime, semantic authority), `wasm` (the luawasm backend on wasmtime). Engines produce normalized event logs (`PRINT`/`ERROR`/`STDOUT`/`GLOBALS` lines, `normalize.go`) that are diffed byte-for-byte; GLOBALS lines and interp traceback tails are excluded by contract. U0 adds `clua55`/`clua55-wazero` (stock C Lua 5.5.1 on both hosts — the semantic authority for the 5.2→5.5 upgrade per plan decision D6) and the `_lua5.5-tests` corpus (official suite, `TestCLua55Conformance`).
+- **`testdiff/`** — differential harness. `Engine` interface with the engines: `interp` (the golua55-lua interpreter, primary oracle), `clua` (stock C Lua 5.1 in wasm on wasmtime), `clua55`/`clua55-wazero` (stock C Lua 5.5.1 — the semantic authority for the 5.2→5.5 upgrade, U0/D6), and `wasm`/`wazero` (the luawasm backend — **stubbed out until U2e, row 59**). Engines produce normalized event logs (`PRINT`/`ERROR`/`STDOUT`/`GLOBALS` lines, `normalize.go`) that are diffed byte-for-byte; GLOBALS lines and interp traceback tails are excluded by contract. U0 adds `clua55`/`clua55-wazero` (stock C Lua 5.5.1 on both hosts — the semantic authority for the 5.2→5.5 upgrade per plan decision D6) and the `_lua5.5-tests` corpus (official suite, `TestCLua55Conformance`).
 
 Corpora (all `_`-prefixed so the Go tooling ignores them): `_glua-tests`, `_lua5.1-tests` (conformance), `_wasm-tests` (~510 generated opcode-matrix cases), `_wasm-err-tests` (~93 byte-exact error cases), `_cli-tests` (CLI black-box), `_lua5.5-tests` (official 5.5.1 suite), `_u1` (U1's 5.2-core cases, interp↔clua55).
 
@@ -77,8 +79,9 @@ Key invariants:
 - **Reentrancy law:** any `rt_*` body that `luaD_call`s can re-enter compiled code through the precall adapter — argument statics read after the call must live on the C stack.
 - **Error dialect:** the wasm engine sets `rt_set_dialect(1)` so runtime error messages use golua55-lua wording (byte-exact vs the interp oracle); the clua oracle keeps stock C 5.1 texts.
 - **GC is stopped per run in v1** (register cells are not GC roots); the M6 arena lifecycle is the durable fix.
-- Upvalue capture info is NOT in `FunctionProto` — it lives in pseudo-instructions after `OP_CLOSURE`; the rt-owned upvalue registry must never touch `L->openupval`.
-- **`_ENV` (U1/D3):** every main proto declares `_ENV` as upvalue 0 (`FunctionProto.EnvUpvalueIndex` records the slot); `OP_GETGLOBAL`/`OP_SETGLOBAL` read/write fields of the frame function's `_ENV` upvalue CELL (so `_ENV = t` swaps propagate through shared cells), and `local _ENV` shadowing lowers to GETTABLEKS/SETTABLEKS on the local. The wasm backend keeps the old rt-globals lowering; parentless captures (main runs cl=0) seed the globals table (ledger row 53) — env shadowing/swaps are interp-only until U6.
+- Upvalue capture info lives in `FunctionProto.Upvalues []Upvaldesc{InStack, Idx, Name}` (U2c — stock's shape; the fork's old pseudo-instructions after OP_CLOSURE are gone); the rt-owned upvalue registry must never touch `L->openupval`.
+- **The instruction set is stock 5.5.1 (U2c/D2): 85 opcodes**, 7-bit opcode field, A/B/C 8 bits + 1-bit `k`, `Bx` 17, `iAx`/`isJ` 25, `ivABC` (vB 6 + vC 10) for NEWTABLE/SETLIST — `opcode.go` mirrors the vendored `runtime/lua55/src/lopcodes.h` exactly; every arith op carries an MMBIN* fallback slot; exported `OpGet*`/`OpCreate*` are the decode API for the U2e backend.
+- **`_ENV` (U1/D3, U2c shape):** every main proto declares `_ENV` as upvalue 0 (`FunctionProto.EnvUpvalueIndex` records the slot for the loader seeding); globals read/write as fields of the frame function's `_ENV` upvalue CELL via GETTABUP/SETTABUP (so `_ENV = t` swaps propagate through shared cells), and `local _ENV` shadowing lowers to GETFIELD/SETFIELD on the local. On the wasm side, parentless captures (main runs cl=0) seed the globals table (ledger row 53) — real 5.2 environments land with the U2e/U6 rt work.
 
 ## Conventions
 

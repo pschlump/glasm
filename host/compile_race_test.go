@@ -9,6 +9,9 @@ import (
 // under concurrency: VM binding (ErrScriptBound) is by pointer, so two
 // pointers for one SHA would wedge consumer-side per-script VM pools.
 func TestCompileConcurrentPointerIdentity(t *testing.T) {
+	// U2c moved the frontend to the 5.5.1 encoding; luawasm is retired
+	// until its U2e rewrite (ledger row 59) — this gate returns with it.
+	t.Skip("wasm compile path retired at the U2c encoding cutover until U2e — ledger row 59")
 	e := mustEngine(t)
 	const src = `return redis.call('incr','ctr')`
 	const workers = 16

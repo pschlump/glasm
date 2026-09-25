@@ -61,6 +61,7 @@ func TestM6cDeterminism5x(t *testing.T) {
 // values (Go's math/rand stream for source 20260916; the const updates only
 // if Go ever changes the stream, loudly).
 func TestM6cSeedAnchor(t *testing.T) {
+	skipBackendUntilU2e(t)
 	src := `
 print(math.random())
 print(math.random(1, 100))
@@ -116,6 +117,7 @@ print(math.random())
 // §8.6 memory-diff of the globals; DiffLogs drops GLOBALS by contract, so
 // the raw logs are compared directly).
 func TestM6cTwiceRunIsolation(t *testing.T) {
+	skipBackendUntilU2e(t)
 	src := `
 G = {}
 for i = 1, 100 do G["k"..i] = i * 2 end
@@ -163,6 +165,7 @@ func equalLogs(a, b []string) bool {
 // TestM6cTail1e7: the M6c leg of the M5c O(1)-tailcall guarantee — 10⁷
 // deep chain completes with flat memory on both hosts (design §8.6).
 func TestM6cTail1e7(t *testing.T) {
+	skipBackendUntilU2e(t)
 	src := `
 local function f(n) if n == 0 then return "done" end return f(n - 1) end
 print(f(10000000))

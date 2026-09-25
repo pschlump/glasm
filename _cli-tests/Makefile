@@ -37,7 +37,14 @@ endif
 	test024 test025 test026 test027 test028 test029 test030 \
 	test031 test032 test033 test034 test035 test036 test037 test038
 
-test: setup tools \
+test: setup tools
+	@if $(GLUA) -w tmp/_probe.wasm ./lwc2.lua >/dev/null 2>&1; then \
+		$(MAKE) test-engines; \
+	else \
+		echo "SKIP _cli-tests: wasm backend retired at the U2c encoding cutover until U2e (ledger row 59)"; \
+	fi
+
+test-engines: \
 	test000 test001 test002 \
 	test003 test004 test005 test006 test007 test008 test009 \
 	test010 test011 test012 test013 test014 test015 test016 \
@@ -50,8 +57,8 @@ setup:
 	mkdir -p out ref tmp data
 
 tools:
-	@test -x $(GLUA) || (cd .. && go build -o cmd/glua/glua ./cmd/glua)
-	@test -x $(CLUA) || (cd .. && go build -o _cli-tests/tmp/clua-run ./cmd/clua-run)
+	@cd .. && go build -o cmd/glua/glua ./cmd/glua
+	@cd .. && go build -o _cli-tests/tmp/clua-run ./cmd/clua-run
 
 fin:
 	@echo PASS

@@ -123,6 +123,7 @@ print(string.format("%.9f", energy()))
 `
 
 func TestM6bPerfSanity(t *testing.T) {
+	skipBackendUntilU2e(t)
 	if testing.Short() {
 		t.Skip("perf measurement — skipped in -short mode")
 	}

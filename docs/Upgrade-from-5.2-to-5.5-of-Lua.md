@@ -1,6 +1,6 @@
 # Upgrading from Lua 5.2 to Lua 5.5
 
-> **Status (2026-09-23): U1 COMPLETE — 5.2 language core in Go; U2 (integers + encoding cutover) next.**
+> **Status (2026-09-25): U2 in progress — U2a/U2b/U2c landed (integer value model; 5.3 operators + arithmetic semantics; the 5.5.1 encoding cutover in Go). Next: U2d (ABI v4 rt port tranche on runtime/lua55/). The wasm backend is retired until its U2e rewrite (ledger row 59).**
 > Companion research artifacts are saved under `note/conv-from-5.2-to-5.5/` (source tarballs,
 > extracted manual sections, official 5.5 test suite). This document follows the conventions of
 > `Lua-Wasm-Design-and-Test-Plan.md`: design decisions are numbered **D1–D12**, milestones are

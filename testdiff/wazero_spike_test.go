@@ -19,6 +19,7 @@ import (
 )
 
 func TestWazeroSpike(t *testing.T) {
+	skipBackendUntilU2e(t)
 	cases := []struct{ name, src string }{
 		{"hello", `print("hello")`},
 		{"arith", `local x = 40

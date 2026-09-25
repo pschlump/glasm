@@ -344,3 +344,57 @@ U5).
   %-by-zero forms. **Gates**: `TestU2Gate` 10/10 byte-exact (`_u2` +bit01/ari02/for01/esc03),
   `go test ./...` exit=0 (testdiff full ~6.5 min), `_cli-tests` PASS. Ledger rows 56–58.
   **Next: U2c** (encoding cutover in Go).
+- **2026-09-25 (U2c)** — **implemented and gated: the encoding cutover
+  (D2) in Go.** `opcode.go` is a full rewrite to the 85-opcode 5.5.1 set
+  and format, verified against the vendored `lopcodes.h`/`lopcodes.c`
+  (opcode numbers 0..84 exactly; iABC op7/A8/k1/B8/C8, ivABC vB6/vC10
+  for NEWTABLE/SETLIST, iABx/iAsBx 17-bit, iAx/isJ 25-bit with the
+  excess-K offsets; sC immediates via int2sC; the arith TM numbers for
+  the MMBIN C operand; exported `OpGet*`/`OpCreate*` wrappers so U2e's
+  backend never re-implements the decode). `compile.go` now emits the
+  stock families end-to-end: LOADI/LOADF (stock luaK_int/luaK_float
+  selection incl. the LOADKX overflow path), LFALSESKIP/LOADTRUE,
+  GETTABUP/SETTABUP for globals (the U1 _ENV lowering folded into the
+  standard shape; `local _ENV` shadowing lowers to GETFIELD/SETFIELD),
+  GETI/GETFIELD/SETI/SETFIELD keyed access, ADDI + ADDK..BXORK with
+  MMBIN/MMBINI/MMBINK fallback slots (flip/negate-immediate forms per
+  lcode.c), SHLI/SHRI, the EQ/LT/LE + EQK/EQI/LTI/LEI/GTI/GEI family,
+  TEST/TESTSET k-polarity, RETURN0/RETURN1, the count-based
+  FORPREP/FORLOOP flow (row 57's saturation edge closed — the counter
+  now holds iterations−1 and never wraps), the TFORPREP/TFORCALL/
+  TFORLOOP split with the four-slot closing-variable layout, NEWTABLE/
+  SETLIST vB/vC/k + EXTRAARG (the old >25,550-element constructor
+  encoding bug dies here), CONCAT A/B, VARARG A/B/C, VARARGPREP as the
+  marker-first-instruction of vararg protos, and upvalue captures moved
+  into `FunctionProto.Upvalues []Upvaldesc` (the pseudo-instruction
+  producer and all its consumers deleted; `block.RefUpvalue` marking
+  preserved). Fork extras OP_MOVEN/OP_GETTABLEKS/OP_SETTABLEKS/OP_NOP
+  die; jump patching keeps the label-id backpatch and resolves through
+  an immutable snapshot (the chain-follow used to read payloads of
+  already-patched jumps); "too long to jump." re-pins to stock's
+  "control structure too long". `_vm.go` re-decodes all 85 handlers
+  against lvm.c (docondjump semantics, MMBIN fallbacks calling the
+  existing objectArith slow path, stock forprep/floatforloop, TFORCALL
+  staging, CLOSURE from descriptors); `rkValue`/`rkString` die.
+  **Window triage (row 59):** `luawasm/` still spoke the fork encoding
+  and is now a fail-fast stub until the U2e rewrite (the M4–M6
+  implementation lives in git history); every wasm/wazero-compiling
+  gate skips with the row (M5/M6 families, wasm matrix/error/glua
+  suites, trap/spike, host compile paths, fuzz wasm leg) and
+  `_cli-tests` fast-skips (its interp legs were smoke-verified against
+  the goldens: mandel byte-exact, fib/life/primes/tsort correct).
+  VARARGPREP is a no-op marker over the call-time frame shuffle, the
+  TFORPREP to-be-closed registration and TBC/GETVARG/ERRNNIL are U5
+  stubs (row 59 carries them). EQK compares raw per stock
+  (luaV_rawequalobj — no `__eq` against constants), where the old RK
+  encoding dispatched `__eq`; toward stock, unobservable in corpora.
+  **Gate:** `go test ./...` green; **TestU1Gate + TestU2Gate byte-exact
+  interp↔clua55** (behavior preservation); root TestGlua/TestLua green;
+  new `opcode_test.go` (layout/round-trips/opcode-numbering/TM-mapping
+  checks). Four compiler bugs found and fixed during gating: a dropped
+  `opSetArgA` in opCreateAsBx, an inverted old→new TEST/TESTSET k
+  mapping (both are k=oldC, not the complement), off-by-one landing
+  offsets in both for-loop emitters, and operand-materialization
+  register collisions in the compare/arith constant paths (large
+  constants must re-enter the pool, not LOADI). **Next: U2d** (ABI v4
+  rt port tranche on `runtime/lua55/`).

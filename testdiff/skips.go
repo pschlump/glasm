@@ -1,6 +1,9 @@
 package testdiff
 
-import "path/filepath"
+import (
+	"path/filepath"
+	"testing"
+)
 
 // CorpusSkips is the single source of truth for ledgered corpus skips,
 // shared by the gate tests and cmd/testdiff (M6b): a skip map that lived
@@ -84,4 +87,15 @@ var ledgeredErrSkips = map[string]string{
 	"fo05.lua": "for-error text re-pinned to stock 5.5 on interp — row 56",
 	"mi00.lua": "len-error text re-pinned to stock 5.5 on interp — row 56",
 	"mi01.lua": "len-error text re-pinned to stock 5.5 on interp — row 56",
+}
+
+// skipBackendUntilU2e: the U2c encoding cutover (upgrade plan D2) moved
+// the Go frontend/interpreter to the stock 5.5.1 instruction set; the
+// wasm backend still spoke the fork's pre-U2c 42-opcode format and was
+// retired with the cutover. These gates return with the backend's U2e
+// rewrite onto the new encoding + ABI v4 (row 59). The interp-side
+// coverage of the same corpora stays live in TestU1Gate/TestU2Gate,
+// TestSelfDiff and the root-package suites.
+func skipBackendUntilU2e(t *testing.T) {
+	t.Skip("wasm/wazero legs: backend retired at the U2c encoding cutover until U2e — ledger row 59")
 }

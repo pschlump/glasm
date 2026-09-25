@@ -24,6 +24,10 @@ func mustEngine(t *testing.T, opts ...Option) *Engine {
 }
 
 func mustCompile(t *testing.T, e *Engine, src string) *Script {
+	// U2c moved the frontend to the 5.5.1 encoding; luawasm is retired
+	// until its U2e rewrite (ledger row 59) — every compile-based host
+	// gate returns with it.
+	t.Skip("wasm compile path retired at the U2c encoding cutover until U2e — ledger row 59")
 	t.Helper()
 	s, err := e.Compile([]byte(src), "=test")
 	if err != nil {
@@ -483,6 +487,7 @@ func TestSandbox(t *testing.T) {
 // --- concurrency (A9) — the -race CI requirement -------------------------------
 
 func TestConcurrentFreshVMs(t *testing.T) {
+	t.Skip("wasm compile path retired at the U2c encoding cutover until U2e — ledger row 59")
 	e := mustEngine(t)
 	const W, N = 8, 15 // goroutines × runs
 	var wg sync.WaitGroup

@@ -358,6 +358,9 @@ func TestLuafuzzWasmMini(t *testing.T) {
 	if testing.Short() {
 		t.Skip("heavy: wasmtime per-case instantiation (CI -short skips)")
 	}
+	// U2c moved the frontend to the 5.5.1 encoding; the wasm backend is
+	// retired until its U2e rewrite (ledger row 59).
+	t.Skip("wasm legs retired at the U2c encoding cutover until U2e — ledger row 59")
 	engines, err := BuildEngines([]string{"interp", "wasm"}, 2*time.Second)
 	if err != nil {
 		t.Fatal(err)

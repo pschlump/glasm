@@ -22,6 +22,17 @@ type DbgCall struct {
 	Pc   int
 }
 
+// Upvaldesc is a compiled upvalue-capture descriptor (U2c, stock
+// lobject.h Upvaldesc minus the kind field — <const> attributes arrive
+// with U5): InStack captures the parent's register Idx, otherwise the
+// parent's upvalue Idx. These replace the fork's old pseudo-instructions
+// after OP_CLOSURE.
+type Upvaldesc struct {
+	InStack bool
+	Idx     uint8
+	Name    string
+}
+
 type FunctionProto struct {
 	SourceName         string
 	LineDefined        int
@@ -33,12 +44,13 @@ type FunctionProto struct {
 	Code               []uint32
 	Constants          []LValue
 	FunctionPrototypes []*FunctionProto
+	Upvalues           []Upvaldesc
 
 	// EnvUpvalueIndex: the upvalue slot holding _ENV, the table global
 	// accesses resolve through (5.2 scheme, upgrade plan D3). -1 when the
-	// function references no globals. Used by OP_GETGLOBAL/OP_SETGLOBAL
-	// to read the current environment cell. Go-side only — the wasm
-	// backend keeps its own globals lowering.
+	// function references no globals. Used by the loader to seed the
+	// main chunk's _ENV cell (GETTABUP/SETTABUP address the cell by the
+	// B operand directly).
 	EnvUpvalueIndex int8
 
 	DbgSourcePositions []int
@@ -107,6 +119,7 @@ func newFunctionProto(name string) *FunctionProto {
 		Code:               make([]uint32, 0, 128),
 		Constants:          make([]LValue, 0, 32),
 		FunctionPrototypes: make([]*FunctionProto, 0, 16),
+		Upvalues:           make([]Upvaldesc, 0, 8),
 
 		DbgSourcePositions: make([]int, 0, 128),
 		DbgLocals:          make([]*DbgLocalInfo, 0, 16),

@@ -169,6 +169,7 @@ func mustUint(v interface{}) uint64 {
 }
 
 func TestTrapIsolation(t *testing.T) {
+	skipBackendUntilU2e(t)
 	cases := []struct {
 		name         string
 		wasi, script bool

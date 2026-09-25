@@ -826,25 +826,6 @@ func (ls *LState) currentEnv() *LTable {
 	*/
 }
 
-func (ls *LState) rkValue(idx int) LValue {
-	/*
-		if OpIsK(idx) {
-			return ls.currentFrame.Fn.Proto.Constants[opIndexK(idx)]
-		}
-		return ls.reg.Get(ls.currentFrame.LocalBase + idx)
-	*/
-	if (idx & opBitRk) != 0 {
-		return ls.currentFrame.Fn.Proto.Constants[idx & ^opBitRk]
-	}
-	return ls.reg.array[ls.currentFrame.LocalBase+idx]
-}
-
-func (ls *LState) rkString(idx int) string {
-	if (idx & opBitRk) != 0 {
-		return ls.currentFrame.Fn.Proto.stringConstants[idx & ^opBitRk]
-	}
-	return string(ls.reg.array[ls.currentFrame.LocalBase+idx].(LString))
-}
 
 func (ls *LState) closeUpvalues(idx int) { // +inline-start
 	if ls.uvcache != nil {

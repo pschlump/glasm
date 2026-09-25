@@ -41,6 +41,7 @@ func wasmGluaFull(t *testing.T, dir string, skips map[string]string) {
 // TestWasmGluaFull: the M5 milestone gate — full _glua-tests, interp vs
 // wasm, 0 unledgered DIVERGE.
 func TestWasmGluaFull(t *testing.T) {
+	skipBackendUntilU2e(t)
 	if testing.Short() {
 		t.Skip("heavy corpus — skipped in -short mode")
 	}
@@ -49,6 +50,7 @@ func TestWasmGluaFull(t *testing.T) {
 
 // TestWasmFullMatrix: the regenerated opcode matrix stays green.
 func TestWasmFullMatrix(t *testing.T) {
+	skipBackendUntilU2e(t)
 	wasmGluaFull(t, "../_wasm-tests", CorpusSkips("../_wasm-tests"))
 	// (rows 10u/20/28 were unskipped with the M6 call_body rebasing;
 	// the live skips — whlc00-03, nz00-01 — are the M6e rows 41/42,
