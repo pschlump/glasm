@@ -1,8 +1,18 @@
-# GopherLua: VM and compiler for Lua in Go.
+# Glasm: VM and compiler for Lua in Go.
+
+This is originally based on 
+[![Gopher-Lua](https://github.com/yuin/gopher-lua)](https://github.com/yuin/gopher-lua)
+a highly capable Lua interpreter in Go.   At last check this implemented Lua 5.1.
+This is a Lua to WASM compiler implementing Lua 5.5.1.   The WASM compiler pre-compiles
+to machine language for supported architectures, Arm64 and A86.   In some use cases this
+gives a huge performance advantage.   In other use cases this is a big disadvantage.
+This performance comparison is detailed in the performance comparison section below.
+
 
 [![PkgGoDev](https://pkg.go.dev/badge/github.com/yuin/gopher-lua.svg)](https://pkg.go.dev/github.com/yuin/gopher-lua) [![test](https://github.com/yuin/gopher-lua/workflows/test/badge.svg?branch=master&event=push)](https://github.com/yuin/gopher-lua/actions?query=workflow:test) [![Coverage Status](https://coveralls.io/repos/github/yuin/gopher-lua/badge.svg?branch=master)](https://coveralls.io/github/yuin/gopher-lua)
 
-GopherLua is a Lua5.1(+ `goto` statement in Lua5.2) VM and compiler written in Go. GopherLua has a same goal
+
+Glasm is a Lua5.5.1 VM and compiler written in Go. Glasm has a same goal
 with Lua: **Be a scripting language with extensible semantics** . It provides
 Go APIs that allow you to easily embed a scripting language to your Go host
 programs.
@@ -13,10 +23,10 @@ programs.
 - [How about performance?](#how-about-performance)
 - [Installation](#installation)
 - [Usage](#usage)
-- [Differences between Lua and GopherLua](#differences-between-lua-and-gopherlua)
+- [Differences between Lua and Glasm](#differences-between-lua-and-gopherlua)
 - [Standalone interpreter](#standalone-interpreter)
 - [How to Contribute](#how-to-contribute)
-- [Libraries for GopherLua](#libraries-for-gopherlua)
+- [Libraries for Glasm](#libraries-for-gopherlua)
 - [Donation](#donation)
 - [License](#license)
 - [Author](#author)
@@ -26,16 +36,16 @@ programs.
 - Be a scripting language with extensible semantics.
 - User-friendly Go API
     - The stack based API like the one used in the original Lua
-      implementation will cause a performance improvements in GopherLua
+      implementation will cause a performance improvements in Glasm
       (It will reduce memory allocations and concrete type <-> interface conversions).
-      GopherLua API is **not** the stack based API.
-      GopherLua give preference to the user-friendliness over the performance.
+      Glasm API is **not** the stack based API.
+      Glasm give preference to the user-friendliness over the performance.
 
 ## How about performance?
 
-GopherLua is not fast but not too slow, I think.
+Glasm is not fast but not too slow, I think.
 
-GopherLua has almost equivalent ( or little bit better ) performance as Python3 on micro benchmarks.
+Glasm has almost equivalent ( or little bit better ) performance as Python3 on micro benchmarks.
 
 There are some benchmarks on the [wiki page](https://github.com/yuin/gopher-lua/wiki/Benchmarks) .
 
@@ -47,10 +57,10 @@ $ go get github.com/yuin/gopher-lua
 
 ## Usage
 
-GopherLua APIs perform in much the same way as Lua, **but the stack is used only
+Glasm APIs perform in much the same way as Lua, **but the stack is used only
 for passing arguments and receiving returned values.**
 
-GopherLua supports channel operations. See **"Goroutines"** section.
+Glasm supports channel operations. See **"Goroutines"** section.
 
 Import a package.
 
@@ -78,13 +88,13 @@ if err := L.DoFile("hello.lua"); err != nil {
 }
 ```
 
-Refer to [Lua Reference Manual](http://www.lua.org/manual/5.1/) and [Go doc](http://godoc.org/github.com/yuin/gopher-lua) for further information.
+Refer to [Lua Reference Manual](http://www.lua.org/manual/5.5/) and [Go doc](http://godoc.org/github.com/yuin/gopher-lua) for further information.
 
-Note that elements that are not commented in [Go doc](http://godoc.org/github.com/yuin/gopher-lua) equivalent to [Lua Reference Manual](http://www.lua.org/manual/5.1/) , except GopherLua uses objects instead of Lua stack indices.
+Note that elements that are not commented in [Go doc](http://godoc.org/github.com/yuin/gopher-lua) equivalent to [Lua Reference Manual](http://www.lua.org/manual/5.1/) , except Glasm uses objects instead of Lua stack indices.
 
 ### Data model
 
-All data in a GopherLua program is an `LValue` . `LValue` is an interface
+All data in a Glasm program is an `LValue` . `LValue` is an interface
 type that has following methods.
 
 - `String() string`
@@ -207,11 +217,11 @@ An `LState` object that has been created by `*LState#NewThread()` inherits the c
 ### Miscellaneous lua.NewState options
 
 - **Options.SkipOpenLibs bool(default false)**
-    - By default, GopherLua opens all built-in libraries when new LState is created.
+    - By default, Glasm opens all built-in libraries when new LState is created.
     - You can skip this behaviour by setting this to `true` .
     - Using the various `OpenXXX(L *LState) int` functions you can open only those libraries that you require, for an example see below.
 - **Options.IncludeGoStackTrace bool(default false)**
-    - By default, GopherLua does not show Go stack traces when panics occur.
+    - By default, Glasm does not show Go stack traces when panics occur.
     - You can get Go stack traces by setting this to `true` .
 
 ### API
@@ -238,7 +248,7 @@ func main() {
 print(double(20)) -- > "40"
 ```
 
-Any function registered with GopherLua is a `lua.LGFunction`, defined in `value.go`
+Any function registered with Glasm is a `lua.LGFunction`, defined in `value.go`
 
 ```go
 type LGFunction func(*LState) int
@@ -378,11 +388,11 @@ ret := L.Get(-1) // returned value
 L.Pop(1)  // remove received value
 ```
 
-If `Protect` is false, GopherLua will panic instead of returning an `error` value.
+If `Protect` is false, Glasm will panic instead of returning an `error` value.
 
 #### User-Defined types
 
-You can extend GopherLua with new types written in Go.
+You can extend Glasm with new types written in Go.
 `LUserData` is provided for this purpose.
 
 ```go
@@ -454,7 +464,7 @@ func main() {
 
 #### Terminating a running LState
 
-GopherLua supports the [Go Concurrency Patterns: Context](https://blog.golang.org/context) .
+Glasm supports the [Go Concurrency Patterns: Context](https://blog.golang.org/context) .
 
 ```go
 L := lua.NewState()
@@ -570,7 +580,7 @@ func Example() {
 
 The `LState` is not goroutine-safe. It is recommended to use one LState per goroutine and communicate between goroutines by using channels.
 
-Channels are represented by `channel` objects in GopherLua. And a `channel` table provides functions for performing channel operations.
+Channels are represented by `channel` objects in Glasm. And a `channel` table provides functions for performing channel operations.
 
 Some objects can not be sent over channels due to having non-goroutine-safe objects inside itself.
 
@@ -754,12 +764,12 @@ func main() {
 }
 ```
 
-## Differences between Lua and GopherLua
+## Differences between Lua and Glasm
 
 ### Goroutines
 
-- GopherLua supports channel operations.
-    - GopherLua has a type named `channel`.
+- Glasm supports channel operations.
+    - Glasm has a type named `channel`.
     - The `channel` table provides functions for performing channel operations.
 
 ### Unsupported functions
@@ -775,13 +785,13 @@ func main() {
 - `collectgarbage` does not take any arguments and runs the garbage collector for the entire Go program.
 - `file:setvbuf` does not support a line buffering.
 - Daylight saving time is not supported.
-- GopherLua has a function to set an environment variable : `os.setenv(name, value)`
-- GopherLua support `goto` and `::label::` statement in Lua5.2.
+- Glasm has a function to set an environment variable : `os.setenv(name, value)`
+- Glasm support `goto` and `::label::` statement in Lua5.2.
     - `goto` is a keyword and not a valid variable name.
 
 ## Standalone interpreter
 
-Lua has an interpreter called `lua` . GopherLua has an interpreter called `glua` .
+Lua has an interpreter called `lua` . Glasm has an interpreter called `glua` .
 
 ```bash
 go get github.com/yuin/gopher-lua/cmd/glua
@@ -793,7 +803,7 @@ go get github.com/yuin/gopher-lua/cmd/glua
 
 See [Guidelines for contributors](https://github.com/yuin/gopher-lua/tree/master/.github/CONTRIBUTING.md) .
 
-## Libraries for GopherLua
+## Libraries for Glasm
 
 - [gopher-luar](https://github.com/layeh/gopher-luar) : Simplifies data passing to and from gopher-lua
 - [gluamapper](https://github.com/yuin/gluamapper) : Mapping a Lua table to a Go struct
@@ -808,24 +818,22 @@ See [Guidelines for contributors](https://github.com/yuin/gopher-lua/tree/master
 - [gmoonscript](https://github.com/rucuriousyet/gmoonscript) : Moonscript Compiler for the Gopher Lua VM
 - [loguago](https://github.com/rucuriousyet/loguago) : Zerolog wrapper for Gopher-Lua
 - [gluabit32](https://github.com/PeerDB-io/gluabit32) : [Port of Lua 5.2 bit32](https://www.lua.org/manual/5.2/manual.html#6.7)
-- [gluacrypto](https://github.com/tengattack/gluacrypto) : A native Go implementation of crypto library for the GopherLua VM.
-- [gluasql](https://github.com/tengattack/gluasql) : A native Go implementation of SQL client for the GopherLua VM.
+- [gluacrypto](https://github.com/tengattack/gluacrypto) : A native Go implementation of crypto library for the Glasm VM.
+- [gluasql](https://github.com/tengattack/gluasql) : A native Go implementation of SQL client for the Glasm VM.
 - [purr](https://github.com/leyafo/purr) : A http mock testing tool.
-- [vadv/gopher-lua-libs](https://github.com/vadv/gopher-lua-libs) : Some usefull libraries for GopherLua VM.
-- [gluasocket](https://gitlab.com/megalithic-llc/gluasocket) : A native Go implementation of LuaSocket for the GopherLua VM.
+- [vadv/gopher-lua-libs](https://github.com/vadv/gopher-lua-libs) : Some usefull libraries for Glasm VM.
+- [gluasocket](https://gitlab.com/megalithic-llc/gluasocket) : A native Go implementation of LuaSocket for the Glasm VM.
 - [glua-async](https://github.com/CuberL/glua-async) : An async/await implement for gopher-lua.
 - [gopherlua-debugger](https://github.com/edolphin-ydf/gopherlua-debugger) : A debugger for gopher-lua
 - [gluamahonia](https://github.com/super1207/gluamahonia) : An encoding converter for gopher-lua
-- [awesome-gopher-lua](https://github.com/Root-lee/awesome-gopher-lua) : Collections of awesome libraries for GopherLua.
-
-## Donation
-
-BTC: 1NEDSyUmo4SMTDP83JJQSWi1MvQUGGNMZB
+- [awesome-gopher-lua](https://github.com/Root-lee/awesome-gopher-lua) : Collections of awesome libraries for Glasm.
 
 ## License
 
 MIT
 
-## Author
+## Authors
 
-Yusuke Inuzuka
+Yusuke Inuzuka (original Gopher-Lua)
+
+Philip Schlump
