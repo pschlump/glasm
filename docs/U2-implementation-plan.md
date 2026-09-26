@@ -78,7 +78,7 @@ principle, applied inside U2):
 | U2a | Integer value model | D1 leaf, boxing, `parseNumber` subtype, table-key normalization, mixed compare/equality, `tonumber`/`tostring` | new `_u2` corpus slice A, `interp`↔`clua55` byte-exact; **all existing gates stay green** |
 | U2b | Operators + 5.3 arithmetic semantics | lexer/grammar/AST for `// & \| ~ << >>` + `\u{}`, 7 new opcodes (old encoding), int arith/shift/idiv-mod errors, integer `for`, subtype const-fold, VM-level string coercion (5.3 model), `global`-statement *parse acceptance* | `_u2` corpus complete; ported official `literals.lua`/`math.lua` (int parts)/`bitwise.lua` sections; old-gate triage with ledger rows |
 | U2c | Encoding cutover in Go | 5.5 format in `opcode.go`/`compile.go`/`_vm.go` (+`function.go` dump), upvalue descriptors into `FunctionProto`, drop fork extras | behavior-preserving: every green corpus stays green on `interp`; new opcode unit tests |
-| U2d | rt port tranche 1: ABI v4 on `lua55/` | `rt_abi55.c` core families (arith/compare/concat/tables/globals/upvalues/calls/forprep) on the **stock, zero-patch** 5.5 tree; `LUA_RT_ABI=4`; 5.5 cell tags | `runtime/tests` native ABI harness extended + green |
+| U2d | rt port tranche 1: ABI v4 on `lua55/` | `rt_abi55.c` core families (arith/compare/concat/tables/globals/upvalues/calls/forprep) on the **stock, zero-patch** 5.5 tree; `LUA_RT_ABI=4`; 5.5 cell tags; the CClosure dispatch seam | `runtime/tests` native ABI harness extended + green; blob builds byte-deterministically |
 | U2e | wasm backend on the new encoding | `luawasm/` rewrite: 5.5 decode (via exported `lua` accessors), int64 cells + int fast paths, new op families, `rt_abi55` call table, error texts 5.5 | `_wasm-tests` (regenerated int/float/bitwise matrix) green on `interp`/`clua55`/`wasm`/`wazero`; M5/M6 gates |
 | U2f | Corpora + D7 re-pin + closeout | `_wasm-err-tests` regenerated from clua55 output, dialect retirement on the 5.1 blob path, ledger rows for every intentional break, docs | full U2 gate (§6 below), milestone records |
 
@@ -398,3 +398,48 @@ U5).
   register collisions in the compare/arith constant paths (large
   constants must re-enter the pool, not LOADI). **Next: U2d** (ABI v4
   rt port tranche on `runtime/lua55/`).
+- **2026-09-25 (U2d)** — **implemented and gated: ABI v4 on the stock
+  5.5 tree (rt port tranche 1).** New `runtime/rt_abi55.{c,h}`
+  (`LUA_RT_ABI=4`) — the v3 surface's core families ported onto
+  `runtime/lua55/` with zero patches: cells are native variant-tag
+  TValues (`RT_VNUMINT`=3/`RT_VNUMFLT`=0x13 pinned by static asserts
+  against lobject.h; **rt_mkinteger** is new), arith is 5.5's own
+  `luaO_arith` over the LUA_OP* codes (= RT_OP_*, = the MMBIN TM
+  numbers — stock semantics, stock texts, string-metatable coercion
+  included), compare/concat/len via `luaV_equalobj`/`lessthan`/
+  `lessequal`/`luaV_concat` (which now adjusts top itself)/
+  `luaV_objlen`, tables/globals via the public API under `rt_run`'s
+  protect, `rt_call` on `luaD_callnoyield` with the row-31 savestack
+  discipline — re-pinned to **5.5's return convention** (results move
+  down onto the func slot: k-th result at func+k, top=func+nres —
+  OP_RETURN1's fast path and moveresults both target ci->func), and
+  `rt_forprep` as a verbatim port of lvm.c's `forprep`+`forlimit`
+  (tristate: enter / RT_FORPREP_SKIP / staged error; integer loops
+  rewrite to (count, step, init) exactly like the U2c Go side). The
+  **precall seam**: compiled protos register as CClosures over
+  `rt_wasm_trampoline` (idx + rt-owned closure record in upvalue 0,
+  light userdata; `rt_clidx`/`rt_getupval`/`rt_tail_*` speak the record)
+  — no ldo.c patch; the trampoline rawrunprotects the dispatch, runs
+  the M5c tail-restage loop C-side, copies results to the stack top,
+  and re-raises staged errors by pushing the exact value, CLEARING the
+  staging, then throwing (the zero-patch replacement for v3's
+  `rt_pcall_caught` hook — a C-level pcall catch finds the runtime
+  clean; the native test pins it). The rt-owned upvalue registry ports
+  unchanged (UpVals via `luaC_newobj`, never linked into
+  `L->openupval`). `build55.sh` grows the **lua55_rt.wasm** flavor
+  (driver + rt exports, same determinism pins; the oracle blob rebuilds
+  byte-identical). **Ledger row 60** rules the seam's observable
+  consequences (C-closure identity, error()-level positions, "C stack
+  overflow" wording for interleaved recursion, stock number formatting,
+  the U6-dropped v3 surfaces). **Gate:** `runtime/tests/run.sh` →
+  RT-NATIVE55 PASS × {plain, ASan, UBSan} (v3 legs still green) with
+  the integer-fidelity matrix (wrap, 2^53 compare edges, huge-int
+  concat/round-trip, floor // and %, logical shifts, forprep tristate +
+  full-range saturation, table-key normalization, stock texts
+  byte-checked), the upvalue registry, and the trampoline end-to-end
+  through real Lua (pcall-catch, nested reentrancy, tailcall restage,
+  depth guard); `TestRT55BlobSmoke` instantiates the blob on wazero
+  (production engine) — ABI 4, rt_* exports, a full driver run with
+  integer semantics; both blobs byte-deterministic across rebuilds
+  (cmp); `go test ./...` exit=0. **Next: U2e** (the wasm backend
+  rewrite against the exported decoders + this ABI).
