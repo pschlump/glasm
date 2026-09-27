@@ -443,3 +443,43 @@ U5).
   integer semantics; both blobs byte-deterministic across rebuilds
   (cmp); `go test ./...` exit=0. **Next: U2e** (the wasm backend
   rewrite against the exported decoders + this ABI).
+- **2026-09-26 (U2e)** — **implemented and gated: the wasm backend
+  rewrite on the stock 5.5.1 encoding + ABI v4 (ledger row 61).**
+  `luawasm/` is rewritten against the exported `lua.OpGet*` decoders
+  (backend.go module orchestration, emit.go the function emitter +
+  new block-partition leader rules — JMP sJ, compare+JMP partners,
+  count-based FORPREP skip / FORLOOP back-edge, the fused
+  TFORCALL+TFORLOOP pair, LOADKX/SETLIST+EXTRAARG skip slots, MMBIN*
+  pseudo slots — and ops.go: int64 fast paths with every miss folding
+  into the MMBIN slot's rt_arith, both inline for-loop flavors,
+  compares through rt_eq/lt/le with v4 boolean TAGS (truth lives in
+  tt, value_.b reads 0 — the first debugging find), the OP_SELF
+  object-save-before-method order (A aliases B), and the
+  callee-save/arg-shift call convention over the CClosure seam).
+  Engines run lua55_rt.wasm (ABI 4, dialect/sandbox/memlimit/deadline
+  v3 surfaces refused loudly until U6) with the D5 host-RNG shim on
+  the rt flavor only (the oracle blob keeps stock math.random —
+  LUA_RT_FLAVOR). **Two runtime finds fixed en route:** (1) 5.5's
+  luaL_pushresult force-steps the GC after box-backed buffers even
+  under a user stop (gcstp=0 in the STEP option) — a sweep killed
+  every pool/frame-held string (string.rep(x,65536) twice corrupts
+  constant strings); rt_set_state now sets GCSTPGC so lua_gc refuses
+  everything (row 61; the U6 arena retires the freeze), plus
+  chunkname-prefix detection in stage_error so already-prefixed
+  messages stop gaining a prefix per rt_run level; (2) the interp's
+  LOADKX/NEWTABLE/SETLIST decoded EXTRAARG from the instruction's
+  own word — fixed to the following word like stock, with covering
+  >1023-item constructor tests. **Gate:** `go test ./...` green —
+  TestWasmFullMatrix 523/523 + wazero twin, both error suites,
+  GluaFull, TestM5{Closures,Varargs,Tailcalls}, M6 seams
+  (SeedAnchor/Determinism/TwiceRun/Tail1e7/TrapIsolation/WazeroSpike/
+  bPerf), fuzz wasm leg, host (run path → U6), RT-NATIVE55 ×3,
+  TestCLua55Conformance + U1/U2 gates untouched; `_cli-tests make` +
+  WAZERO=1 PASS (36 targets; ledgered xfails: life1 + tsort1 — row
+  61's open GETTABLE-into-arg-window bug (follow-up) and the row-10
+  comparator family; kvdb/calc1 — the row-60 error-position seam now
+  also covering error(msg,0); err1.w golden regenerated to stock
+  texts); row-56 ar*/fo*/mi* skips UN-skipped (v4 speaks the stock
+  texts), the never-re-pinned wording families skip until U2f.
+  Blobs byte-deterministic. **Next: U2f** (corpus regeneration +
+  D7 re-pin + closeout).

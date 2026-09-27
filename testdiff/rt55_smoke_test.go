@@ -53,6 +53,10 @@ func TestRT55BlobSmoke(t *testing.T) {
 			return 0xFFFFFFFD // RTW_REFUSED (-3): no script module here
 		}).
 		Export("wasm_dispatch").
+		// U2e: the D5 host-RNG shim imports (math.random determinism)
+		NewFunctionBuilder().WithFunc(func() float64 { return 0.5 }).Export("random01").
+		NewFunctionBuilder().WithFunc(func(lo, hi uint32) uint32 { return lo }).Export("randomint").
+		NewFunctionBuilder().WithFunc(func(seed int64) {}).Export("randomseed").
 		Instantiate(ctx)
 	if err != nil {
 		t.Fatalf("host module: %v", err)

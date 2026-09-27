@@ -113,6 +113,7 @@ RT_EXPORTS="$EXPORTS \
   -D'luai_makeseed()=0u' \
   -D'lua_tmpnam(b,e)={e=1;}' \
   $RT_EXPORTS \
+  -DLUA_RT_FLAVOR \
   -o lua55_rt.wasm luawasm55.c rt_abi55.c $SRC
 
 cp lua55_rt.wasm ../testdiff/lua55_rt.wasm

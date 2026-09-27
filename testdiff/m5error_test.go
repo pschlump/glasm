@@ -14,7 +14,6 @@ import (
 // ledgeredErrSkips lives in skips.go (shared with cmd/testdiff).
 
 func TestWasmErrorSuite(t *testing.T) {
-	skipBackendUntilU2e(t)
 	dir := "../_wasm-err-tests"
 	entries, err := os.ReadDir(dir)
 	if err != nil {

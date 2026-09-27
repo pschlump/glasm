@@ -6,6 +6,15 @@ package testdiff
 
 import "testing"
 
+// U2e (row 60): the compat `arg` table is a 5.1-ism the ABI v4 blob does
+// not carry (rt_compat_arg dropped until U6) — the interp's CompatVarArg
+// itself dies at U5's vararg rework. Cases reading `arg` in a function
+// skip with the ruling.
+var m5VarargArgSkips = map[string]bool{
+	"argcontents": true,
+	"argnzero":    true,
+}
+
 func TestM5Varargs(t *testing.T) {
 	cases := map[string]string{
 		"passthrough":  "local function f(...) return ... end\nprint(f(1, 2, 3))\n",
@@ -33,6 +42,10 @@ func TestM5Varargs(t *testing.T) {
 		"argnil":       "local function f(...) local x = ... return arg == nil end\nprint(f(1, 2))\n", // compile.go:1188 clears NeedsArg on `...` use
 	}
 	for name, src := range cases {
+		if m5VarargArgSkips[name] {
+			t.Logf("SKIP %s.lua: compat arg table not on the v4 blob until U6 — ledger row 60", name)
+			continue
+		}
 		diffCase(t, name+".lua", src)
 	}
 }

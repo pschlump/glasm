@@ -1,0 +1,839 @@
+package luawasm
+
+// The function emitter: lowers one FunctionProto's bytecode to a wasm
+// function with flattened control flow (design doc §4.3/§4.4). Registers
+// are TValue cells at frame+16*k; the frame is allocated and arg-filled
+// by the CClosure trampoline (rt_wasm_push_frame) — params at R(0..np-1),
+// varargs above the register window at frame+16*framecells.
+//
+// Signature (ABI v4): (frame, cl, nargs, want) -> nret — the common
+// convention every protoFn and lua_dispatch share. nret >= 0: that many
+// results staged at frame+0..; -1: error, exact TValue staged in the
+// runtime; -2: tailcall sentinel (M5c). `want` is honored C-side: the
+// trampoline copies nret results to the stack top and luaD_poscall
+// trims to the CallInfo's nresults, so emitted code returns everything.
+//
+// All decode goes through the exported lua.OpGet* accessors (U2c's
+// decode API); nothing re-implements the 5.5 bit layout here.
+
+import (
+	"fmt"
+	"sort"
+
+	lua "github.com/pschlump/golua55"
+	"github.com/pschlump/golua55/wasm"
+)
+
+// scInt decodes an sC immediate (opcode.go keeps int2sC/sC2int
+// unexported; the bias is the stable stock encoding OFFSET_sC = 127).
+func scInt(v int) int { return v - 127 }
+
+type funcEmitter struct {
+	b      *backend
+	f      *wasm.Function
+	proto  *lua.FunctionProto
+	pi     protoInfo
+	nregs  int
+	np     int
+	isMain bool
+	code   []uint32
+
+	// local indices (params 0..3 = frame, cl, nargs, want)
+	lTop, lBlk, lSt, lT0, lT1 uint32 // i32
+	lVlo, lVhi, lV2           uint32 // i64 (copy + shift temporaries)
+	lF0                       uint32 // f64
+
+	blocks  map[int]int  // pc -> block id
+	blockPC []int        // block id -> start pc
+	pseudo  map[int]bool // pc is an MMBIN*/EXTRAARG skip slot (never real code)
+}
+
+func (b *backend) newFuncEmitter(p *lua.FunctionProto) *funcEmitter {
+	f := b.m.NewFunction([]wasm.ValueType{wasm.I32, wasm.I32, wasm.I32, wasm.I32}, []wasm.ValueType{wasm.I32})
+	f.Local(wasm.I32).Local(wasm.I32).Local(wasm.I32).Local(wasm.I32).Local(wasm.I32) // 4..8
+	f.Local(wasm.I64).Local(wasm.I64).Local(wasm.I64)                                 // 9,10,11
+	f.Local(wasm.F64)                                                                 // 12
+	return &funcEmitter{
+		b: b, f: f, proto: p,
+		pi:     b.protoInfoOf(p),
+		nregs:  int(p.NumUsedRegisters),
+		np:     int(p.NumParameters),
+		isMain: p == b.main,
+		code:   p.Code,
+		lTop:   4, lBlk: 5, lSt: 6, lT0: 7, lT1: 8,
+		lVlo: 9, lVhi: 10, lV2: 11, lF0: 12,
+	}
+}
+
+/* ---------- small emission helpers ---------- */
+
+func (b *backend) protoInfoOf(p *lua.FunctionProto) protoInfo {
+	for _, pi := range b.protos {
+		if pi.proto == p {
+			return pi
+		}
+	}
+	panic("luawasm: proto not in layout")
+}
+
+func (fe *funcEmitter) cellAddr(k int) *wasm.Function {
+	return fe.f.LocalGet(0).I32Const(int32(cellSize * k)).I32Add()
+}
+
+// static scratch cell k (k=0,1): frame+16*(nregs+2+k) — per-instruction
+// lowering temporaries (compare results, materialized immediates, env
+// cells, SETLIST keys). Safe because every such use lives entirely
+// within one instruction's lowering, and the only writes that can reach
+// past nregs come from OTHER instructions' dynamic multret forms.
+func (fe *funcEmitter) scratchAddr(k int) *wasm.Function {
+	return fe.f.LocalGet(0).I32Const(int32(cellSize * (fe.nregs + 2 + k))).I32Add()
+}
+
+// dynamic scratch cell 0 — the trampoline's spare cell ABOVE the vararg
+// staging area. Dynamic for vararg protos: multret VARARG destinations
+// reach R(A+nv-1) with A up to nregs-1, so any static position can
+// collide (M5b bug: `g(2, ...)` saved its callee over the third vararg).
+// frame+16*(framecells+nv) is provably above both the register window
+// and every vararg copy; rt_wasm_push_frame's need covers exactly one.
+func (fe *funcEmitter) scratchDyn0() *wasm.Function {
+	f := fe.f
+	base := f.LocalGet(0).I32Const(int32(cellSize * frameCells(fe.nregs))).I32Add()
+	if fe.proto.IsVarArg&lua.VarArgIsVarArg == 0 {
+		return base
+	}
+	// + 16 * max(0, nargs - np) — Select keeps live locals untouched
+	f.LocalGet(2).I32Const(int32(fe.np)).I32Sub().I32Const(16).I32Mul()
+	f.I32Const(0)
+	f.LocalGet(2).I32Const(int32(fe.np)).I32Sub().I32Const(0).I32GtS()
+	f.Select()
+	return f.I32Add()
+}
+
+// constant cell: i in Constants (the single global pool)
+func (fe *funcEmitter) kcell(i int) *wasm.Function {
+	return fe.f.GlobalGet(fe.b.gKCells).I32Const(int32(cellSize * (fe.pi.koff + i))).I32Add()
+}
+
+// copyCell: 16-byte TValue copy (dst, src are address emitters)
+func (fe *funcEmitter) copyCell(dst, src func() *wasm.Function) {
+	f := fe.f
+	src()
+	f.I64Load(0).LocalSet(fe.lVlo)
+	src()
+	f.I64Load(8).LocalSet(fe.lVhi)
+	dst()
+	f.LocalGet(fe.lVlo).I64Store(0)
+	dst()
+	f.LocalGet(fe.lVhi).I64Store(8)
+}
+
+// dynamic cell copy: base register + 16*t (t in lT1)
+func (fe *funcEmitter) dynCellAddr(baseReg int) *wasm.Function {
+	return fe.f.LocalGet(0).I32Const(int32(cellSize * baseReg)).I32Add().
+		LocalGet(fe.lT1).I32Const(16).I32Mul().I32Add()
+}
+
+// like dynCellAddr but indexed by lSt — for copy loops where lT0/lT1
+// hold live values (nargs/want)
+func (fe *funcEmitter) dynCellAddrSt(baseReg int) *wasm.Function {
+	return fe.f.LocalGet(0).I32Const(int32(cellSize * baseReg)).I32Add().
+		LocalGet(fe.lSt).I32Const(16).I32Mul().I32Add()
+}
+
+func (fe *funcEmitter) frameDynCell() *wasm.Function {
+	return fe.f.LocalGet(0).LocalGet(fe.lT1).I32Const(16).I32Mul().I32Add()
+}
+
+// vararg cells live above the register window (rt_wasm_push_frame's
+// split): varargBase = frame + 16*framecells
+func (fe *funcEmitter) varargCell(j int) *wasm.Function {
+	return fe.f.LocalGet(0).I32Const(int32(cellSize * (frameCells(fe.nregs) + j))).I32Add()
+}
+
+// vararg cell indexed by lT1 (dynamic copy loops)
+func (fe *funcEmitter) varargCellDyn() *wasm.Function {
+	return fe.f.LocalGet(0).I32Const(int32(cellSize * frameCells(fe.nregs))).I32Add().
+		LocalGet(fe.lT1).I32Const(16).I32Mul().I32Add()
+}
+
+// bumpTop: if top < n { top = n } (interpreter registry semantics)
+func (fe *funcEmitter) bumpTop(n int) {
+	f := fe.f
+	f.LocalGet(fe.lTop).I32Const(int32(n)).I32LtS().
+		If(wasm.Void).
+		I32Const(int32(n)).LocalSet(fe.lTop).
+		End()
+}
+
+// truth: leaves 1/0 on the stack — Lua truthiness of register k. v4
+// variant tags: falsy iff tt==VNIL(0) or tt==VFALSE(1) — distinct tags,
+// unlike v3's shared TBOOLEAN.
+func (fe *funcEmitter) truth(reg int) {
+	f := fe.f
+	fe.cellAddr(reg)
+	f.I32Load(8)
+	f.I32Const(rtTagNil)
+	f.I32Ne()
+	fe.cellAddr(reg)
+	f.I32Load(8)
+	f.I32Const(rtTagFalse)
+	f.I32Ne()
+	f.I32And()
+}
+
+// setBoolCellA: R(A) := boolean; cond is an address-less emitter leaving
+// the 0/1 i32 on the stack. Value word 0/1 and tt 1/17 (VFALSE/VTRUE),
+// both full-width stores (row 45: recycled-cell tag garbage).
+func (fe *funcEmitter) setBoolCellA(a int, cond func()) {
+	f := fe.f
+	cond()
+	f.LocalSet(fe.lT0)
+	fe.cellAddr(a)
+	f.LocalGet(fe.lT0)
+	f.I32Store(0)
+	fe.cellAddr(a)
+	f.LocalGet(fe.lT0).I32Const(16).I32Mul().I32Const(rtTagFalse).I32Add().I32Store(8)
+}
+
+// setIntCell: R(r) := int64 (value + VNUMINT tag, full 4-byte tag store)
+func (fe *funcEmitter) setIntCell(r int, val func()) {
+	f := fe.f
+	val()
+	f.LocalSet(fe.lV2)
+	fe.cellAddr(r)
+	f.LocalGet(fe.lV2).I64Store(0)
+	fe.cellAddr(r)
+	f.I32Const(rtTagInt).I32Store(8)
+}
+
+// checkStatus: st := <status on stack>; if st == RT_ERR return -1 (the
+// ABI v4 error convention — -1 is unambiguous with "1 result")
+func (fe *funcEmitter) checkStatus() {
+	f := fe.f
+	f.LocalSet(fe.lSt)
+	f.LocalGet(fe.lSt).I32Const(1).I32Eq().
+		If(wasm.Void).
+		I32Const(-1).Return().
+		End()
+}
+
+func (fe *funcEmitter) setBlk(id int) {
+	fe.f.I32Const(int32(id)).LocalSet(fe.lBlk)
+}
+
+func (fe *funcEmitter) line(pc int) int32 {
+	return int32(fe.proto.DbgSourcePositions[pc])
+}
+
+/* ---------- body ---------- */
+
+func (fe *funcEmitter) emitBody() {
+	f := fe.f
+
+	// gFrameCells (main proto only): the TOTAL cell count the host must
+	// allocate for lua_main's frame — the registered window plus the one
+	// dynamic spare above it (main is vararg with nargs=0, so the spare
+	// sits directly at framecells).
+	if fe.isMain {
+		fe.b.m.ExportGlobal("gFrameCells", fe.b.m.GlobalI32(int32(frameCells(fe.nregs)+1), false))
+	}
+
+	// prologue: nil-fill R(min(nargs,np) .. nregs). The trampoline copied
+	// actual params into R(0..np-1) (and dropped extras for non-vararg
+	// protos, like stock luaD_precall), so the fill starts at min(nargs,
+	// np) — covering missing params and unused registers alike.
+	f.LocalGet(2).I32Const(int32(fe.np)).I32LtS().If(wasm.Void)
+	f.LocalGet(2).LocalSet(fe.lT0)
+	f.Else()
+	f.I32Const(int32(fe.np)).LocalSet(fe.lT0)
+	f.End()
+	f.Block(wasm.Void)
+	f.Loop(wasm.Void)
+	f.LocalGet(fe.lT0).I32Const(int32(fe.nregs)).I32GeS().BrIf(1)
+	f.LocalGet(0).LocalGet(fe.lT0).I32Const(16).I32Mul().I32Add().
+		I32Const(0).I32Store(8) // tag = nil (full 4 bytes — row 45)
+	f.LocalGet(fe.lT0).I32Const(1).I32Add().LocalSet(fe.lT0)
+	f.Br(0)
+	f.End()
+	f.End()
+
+	f.I32Const(int32(fe.nregs)).LocalSet(fe.lTop)
+
+	fe.partitionBlocks()
+
+	// flattened dispatch. N+1 blocks: the innermost is a dummy so EVERY
+	// body is enclosed by a dispatch block — copy-loops inside a body exit
+	// with BrIf(1) to "the rest of this body", which must never resolve to
+	// the dispatch LOOP itself (that would re-dispatch with a stale lBlk
+	// and loop forever — the {1,2,3} constructor OOM).
+	f.Loop(wasm.Void)
+	for i := 0; i <= len(fe.blockPC); i++ {
+		f.Block(wasm.Void)
+	}
+	depths := make([]uint32, len(fe.blockPC))
+	for i := range depths {
+		depths[i] = uint32(i)
+	}
+	f.LocalGet(fe.lBlk).BrTable(depths, uint32(len(fe.blockPC)-1))
+	for k := 0; k < len(fe.blockPC); k++ {
+		f.End() // close the dummy (k=0) / dispatch block N-1-k (k>0)
+		start := fe.blockPC[k]
+		end := len(fe.code)
+		if k+1 < len(fe.blockPC) {
+			end = fe.blockPC[k+1]
+		}
+		fe.emitBlockBody(start, end)
+		f.Br(uint32(len(fe.blockPC) - k)) // → the dispatch loop (past B0..B(N-1-k))
+	}
+	f.End() // close B0
+	f.End() // close loop
+	f.I32Const(0)
+	f.End() // unreachable; wasm requires a result
+}
+
+// arithOps: the opcode families whose emissions pair with an MMBIN*
+// fallback slot (compile.go emits one after every binary arith op;
+// UNM/BNOT/NOT/LEN are self-contained).
+var arithOps = map[int]bool{
+	lua.OP_ADDI: true, lua.OP_ADDK: true, lua.OP_SUBK: true, lua.OP_MULK: true,
+	lua.OP_MODK: true, lua.OP_POWK: true, lua.OP_DIVK: true, lua.OP_IDIVK: true,
+	lua.OP_BANDK: true, lua.OP_BORK: true, lua.OP_BXORK: true,
+	lua.OP_SHLI: true, lua.OP_SHRI: true,
+	lua.OP_ADD: true, lua.OP_SUB: true, lua.OP_MUL: true, lua.OP_MOD: true,
+	lua.OP_POW: true, lua.OP_DIV: true, lua.OP_IDIV: true, lua.OP_BAND: true,
+	lua.OP_BOR: true, lua.OP_BXOR: true, lua.OP_SHL: true, lua.OP_SHR: true,
+}
+
+func isMMBIN(op int) bool {
+	return op == lua.OP_MMBIN || op == lua.OP_MMBINI || op == lua.OP_MMBINK
+}
+
+// compareTests: the condJump family — each conditionally skips the JMP
+// word that follows it (compile.go guarantees the partner).
+func isCompareTest(op int) bool {
+	switch op {
+	case lua.OP_EQ, lua.OP_LT, lua.OP_LE, lua.OP_EQK, lua.OP_EQI,
+		lua.OP_LTI, lua.OP_LEI, lua.OP_GTI, lua.OP_GEI,
+		lua.OP_TEST, lua.OP_TESTSET:
+		return true
+	}
+	return false
+}
+
+func (fe *funcEmitter) partitionBlocks() {
+	fe.markPseudos()
+	leaders := map[int]bool{0: true}
+	code := fe.code
+	for pc := 0; pc < len(code); pc++ {
+		inst := code[pc]
+		op := lua.OpGetOpCode(inst)
+		switch op {
+		case lua.OP_JMP:
+			leaders[fe.realPc(fe.jumpTarget(pc))] = true
+			leaders[fe.realPc(pc+1)] = true
+		case lua.OP_FORLOOP:
+			// unsigned Bx back-edge to the loop body
+			leaders[fe.realPc(fe.forloopTarget(pc))] = true
+			leaders[fe.realPc(pc+1)] = true
+		case lua.OP_FORPREP:
+			leaders[fe.realPc(fe.forprepSkipTarget(pc))] = true // never runs: one past FORLOOP
+			leaders[fe.realPc(pc+1)] = true                     // body entry
+		case lua.OP_TFORPREP:
+			leaders[fe.realPc(fe.tforprepTarget(pc))] = true // the TFORCALL (always jumps)
+			leaders[fe.realPc(pc+1)] = true                  // body entry (TFORLOOP's back target)
+		case lua.OP_TFORLOOP:
+			// TFORCALL+TFORLOOP lower as one fused unit (the emitter walks
+			// the pair at the TFORCALL) — the TFORLOOP word itself is never
+			// a leader. Its back target is the body; its fall-through the
+			// loop exit.
+			leaders[fe.realPc(pc+1)] = true
+			leaders[fe.realPc(fe.forloopTarget(pc))] = true
+		case lua.OP_TAILCALL:
+			// NOT terminal: the RETURN B=0 sentinel that follows is the
+			// continuation for declined tailcalls (C functions, __call
+			// objects) — it stages the results
+			leaders[fe.realPc(pc+1)] = true
+		case lua.OP_RETURN, lua.OP_RETURN0, lua.OP_RETURN1:
+			leaders[fe.realPc(pc+1)] = true
+		default:
+			if isCompareTest(op) || op == lua.OP_LFALSESKIP {
+				// conditionally skips the JMP partner word at pc+1
+				leaders[fe.realPc(pc+2)] = true
+				if pc+1 < len(code) && lua.OpGetOpCode(code[pc+1]) == lua.OP_JMP {
+					leaders[fe.realPc(fe.jumpTarget(pc+1))] = true
+				}
+			}
+		}
+	}
+	ids := []int{}
+	for pc := range leaders {
+		if pc < len(code) {
+			ids = append(ids, pc)
+		}
+	}
+	sort.Ints(ids)
+	fe.blocks = make(map[int]int, len(ids))
+	fe.blockPC = ids
+	for id, pc := range ids {
+		fe.blocks[pc] = id
+	}
+}
+
+// markPseudos: flag the skip-slot instructions — the MMBIN* fallback
+// slot after every binary arith op and the EXTRAARG word after
+// LOADKX/NEWTABLE(k)/SETLIST(k). They are never emitted as real code
+// and never branch targets (the compiler pairs them atomically with
+// their primary; defensive realPc still advances past stale targets).
+func (fe *funcEmitter) markPseudos() {
+	fe.pseudo = make(map[int]bool)
+	code := fe.code
+	for pc := 0; pc < len(code); pc++ {
+		op := lua.OpGetOpCode(code[pc])
+		skip := 0
+		if arithOps[op] {
+			skip = 1
+		} else if op == lua.OP_LOADKX || op == lua.OP_NEWTABLE ||
+			(op == lua.OP_SETLIST && lua.OpGetArgk(code[pc]) != 0) {
+			skip = 1
+		}
+		for k := 1; k <= skip && pc+k < len(code); k++ {
+			fe.pseudo[pc+k] = true
+		}
+	}
+}
+
+// jump targets. The VM post-increments Pc before applying the offset:
+// JMP sJ → pc+1+sJ; FORLOOP/TFORLOOP back-edges → pc+1−Bx; FORPREP's
+// skip → pc+Bx+2 (one past the FORLOOP); TFORPREP → pc+1+Bx (the
+// TFORCALL).
+func (fe *funcEmitter) jumpTarget(pc int) int {
+	return pc + 1 + lua.OpGetArgsJ(fe.code[pc])
+}
+
+func (fe *funcEmitter) forloopTarget(pc int) int {
+	return pc + 1 - lua.OpGetArgBx(fe.code[pc])
+}
+
+func (fe *funcEmitter) forprepSkipTarget(pc int) int {
+	return pc + lua.OpGetArgBx(fe.code[pc]) + 2
+}
+
+func (fe *funcEmitter) tforprepTarget(pc int) int {
+	return pc + 1 + lua.OpGetArgBx(fe.code[pc])
+}
+
+// realPc: advance a pc that may sit on a skip slot to the next real
+// instruction. Unreachable-but-present jump targets can land there.
+func (fe *funcEmitter) realPc(pc int) int {
+	for fe.pseudo[pc] && pc < len(fe.code) {
+		pc++
+	}
+	return pc
+}
+
+func (fe *funcEmitter) blockOf(pc int) int {
+	if id, ok := fe.blocks[pc]; ok {
+		return id
+	}
+	if id, ok := fe.blocks[fe.realPc(pc)]; ok {
+		return id
+	}
+	return len(fe.blockPC) - 1
+}
+
+// branchPartner: the successor when a compare/TEST's condition takes
+// its JMP partner — the JMP's target, or pc+2 when the partner word is
+// not a JMP (defensive; the compiler always pairs one).
+func (fe *funcEmitter) branchPartner(pc int) int {
+	if pc+1 < len(fe.code) && lua.OpGetOpCode(fe.code[pc+1]) == lua.OP_JMP {
+		return fe.blockOf(fe.jumpTarget(pc + 1))
+	}
+	return fe.blockOf(pc + 2)
+}
+
+func (fe *funcEmitter) emitBlockBody(start, end int) {
+	code := fe.code
+	terminal := false
+	pc := start
+	for pc < end {
+		inst := code[pc]
+		op := lua.OpGetOpCode(inst)
+		A := lua.OpGetArgA(inst)
+		B := lua.OpGetArgB(inst)
+		C := lua.OpGetArgC(inst)
+		Bx := lua.OpGetArgBx(inst)
+		k := lua.OpGetArgk(inst)
+		switch op {
+		case lua.OP_MOVE:
+			fe.copyCell(fe.cell(A), fe.cell(B))
+			fe.bumpTop(A + 1)
+		case lua.OP_LOADI:
+			fe.setIntCell(A, func() { fe.f.I64Const(int64(lua.OpGetArgSbx(inst))) })
+			fe.bumpTop(A + 1)
+		case lua.OP_LOADF:
+			f := fe.f
+			fe.cellAddr(A)
+			f.F64Const(float64(lua.OpGetArgSbx(inst)))
+			f.F64Store(0)
+			fe.cellAddr(A)
+			f.I32Const(rtTagFloat).I32Store(8)
+			fe.bumpTop(A + 1)
+		case lua.OP_LOADK:
+			fe.copyCell(fe.cell(A), fe.kcellFn(Bx))
+			fe.bumpTop(A + 1)
+		case lua.OP_LOADKX:
+			// the k index rides the following EXTRAARG word (stock lvm.c)
+			kidx := lua.OpGetArgAx(code[pc+1])
+			fe.copyCell(fe.cell(A), fe.kcellFn(kidx))
+			fe.bumpTop(A + 1)
+		case lua.OP_LOADFALSE:
+			fe.setBoolCellA(A, func() { fe.f.I32Const(0) })
+			fe.bumpTop(A + 1)
+		case lua.OP_LFALSESKIP:
+			fe.setBoolCellA(A, func() { fe.f.I32Const(0) })
+			fe.bumpTop(A + 1)
+			fe.setBlk(fe.blockOf(pc + 2))
+			terminal = true
+		case lua.OP_LOADTRUE:
+			fe.setBoolCellA(A, func() { fe.f.I32Const(1) })
+			fe.bumpTop(A + 1)
+		case lua.OP_LOADNIL:
+			for r := A; r <= A+B; r++ {
+				fe.cellAddr(r)
+				fe.f.I32Const(0).I32Store(8)
+			}
+			fe.bumpTop(A + B + 1)
+		case lua.OP_GETUPVAL:
+			if fe.isMain {
+				panic("luawasm: GETUPVAL on the main proto (cl=0) is unsupported until U6 — ledger row 53")
+			}
+			fe.f.LocalGet(1).I32Const(int32(B))
+			fe.cellAddr(A)
+			fe.f.Call(fe.b.imp("rt_getupval"))
+			fe.bumpTop(A + 1)
+		case lua.OP_SETUPVAL:
+			if fe.isMain {
+				panic("luawasm: SETUPVAL on the main proto (cl=0) is unsupported until U6 — ledger row 53")
+			}
+			fe.f.LocalGet(1).I32Const(int32(B))
+			fe.cellAddr(A)
+			fe.f.Call(fe.b.imp("rt_setupval"))
+		case lua.OP_GETTABUP:
+			if fe.isMain {
+				// main runs cl=0: its _ENV upvalue IS the globals table
+				// (row 53) — lower to the registry read
+				fe.cellAddr(A)
+				fe.kcell(C)
+				fe.f.I32Const(fe.line(pc))
+				fe.f.Call(fe.b.imp("rt_getglobal"))
+				fe.checkStatus()
+			} else {
+				fe.f.LocalGet(1).I32Const(int32(B))
+				fe.scratchAddr(0)
+				fe.f.Call(fe.b.imp("rt_getupval"))
+				fe.scratchAddr(0)
+				fe.kcell(C)
+				fe.cellAddr(A)
+				fe.f.I32Const(fe.line(pc))
+				fe.f.Call(fe.b.imp("rt_gettable"))
+				fe.checkStatus()
+			}
+			fe.bumpTop(A + 1)
+		case lua.OP_SETTABUP:
+			if fe.isMain {
+				fe.kcell(B)
+				fe.vcCell(C, k)
+				fe.f.I32Const(fe.line(pc))
+				fe.f.Call(fe.b.imp("rt_setglobal"))
+				fe.checkStatus()
+			} else {
+				fe.f.LocalGet(1).I32Const(int32(A))
+				fe.scratchAddr(0)
+				fe.f.Call(fe.b.imp("rt_getupval"))
+				fe.scratchAddr(0)
+				fe.kcell(B)
+				fe.vcCell(C, k)
+				fe.f.I32Const(fe.line(pc))
+				fe.f.Call(fe.b.imp("rt_settable"))
+				fe.checkStatus()
+			}
+		case lua.OP_GETTABLE:
+			fe.cellAddr(B)
+			fe.cellAddr(C)
+			fe.cellAddr(A)
+			fe.f.I32Const(fe.line(pc))
+			fe.f.Call(fe.b.imp("rt_gettable"))
+			fe.checkStatus()
+			fe.bumpTop(A + 1)
+		case lua.OP_GETI:
+			fe.mkIntScratch(1, int64(C))
+			fe.cellAddr(B)
+			fe.scratchAddr(1)
+			fe.cellAddr(A)
+			fe.f.I32Const(fe.line(pc))
+			fe.f.Call(fe.b.imp("rt_gettable"))
+			fe.checkStatus()
+			fe.bumpTop(A + 1)
+		case lua.OP_GETFIELD:
+			fe.cellAddr(B)
+			fe.kcell(C)
+			fe.cellAddr(A)
+			fe.f.I32Const(fe.line(pc))
+			fe.f.Call(fe.b.imp("rt_gettable"))
+			fe.checkStatus()
+			fe.bumpTop(A + 1)
+		case lua.OP_SETTABLE:
+			fe.cellAddr(A)
+			fe.cellAddr(B)
+			fe.vcCell(C, k)
+			fe.f.I32Const(fe.line(pc))
+			fe.f.Call(fe.b.imp("rt_settable"))
+			fe.checkStatus()
+		case lua.OP_SETI:
+			fe.mkIntScratch(1, int64(B))
+			fe.cellAddr(A)
+			fe.scratchAddr(1)
+			fe.vcCell(C, k)
+			fe.f.I32Const(fe.line(pc))
+			fe.f.Call(fe.b.imp("rt_settable"))
+			fe.checkStatus()
+		case lua.OP_SETFIELD:
+			fe.cellAddr(A)
+			fe.kcell(B)
+			fe.vcCell(C, k)
+			fe.f.I32Const(fe.line(pc))
+			fe.f.Call(fe.b.imp("rt_settable"))
+			fe.checkStatus()
+		case lua.OP_NEWTABLE:
+			narr := lua.OpGetArgvC(inst)
+			if k != 0 {
+				narr += lua.OpGetArgAx(code[pc+1]) * 1024
+			}
+			nrec := 0
+			if vB := lua.OpGetArgvB(inst); vB > 0 {
+				nrec = 1 << uint(vB-1)
+			}
+			fe.cellAddr(A)
+			fe.f.I32Const(int32(narr)).I32Const(int32(nrec))
+			fe.f.Call(fe.b.imp("rt_newtable"))
+			fe.checkStatus()
+			fe.bumpTop(A + 1)
+		case lua.OP_SELF:
+			// the interp's order (_vm.go OP_SELF): save the object first
+			// (A aliases B in the common s:method() shape — writing the
+			// method first would clobber it), then R[A] := R[B][K[C]:
+			// string] (an __index metamethod observes both R[A] and R[A+1]
+			// stale, as on the interp), then R[A+1] := the saved object
+			fe.copyCell(fe.scratchAddrCell(0), fe.cell(B))
+			fe.cellAddr(B)
+			fe.kcell(C)
+			fe.cellAddr(A)
+			fe.f.I32Const(fe.line(pc))
+			fe.f.Call(fe.b.imp("rt_gettable"))
+			fe.checkStatus()
+			fe.copyCell(fe.cell(A+1), fe.scratchAddrCell(0))
+			fe.bumpTop(A + 2)
+		case lua.OP_ADDI:
+			fe.emitArithI(A, B, C, pc)
+		case lua.OP_ADDK, lua.OP_SUBK, lua.OP_MULK, lua.OP_MODK, lua.OP_POWK,
+			lua.OP_DIVK, lua.OP_IDIVK, lua.OP_BANDK, lua.OP_BORK, lua.OP_BXORK:
+			fe.emitArithK(op, A, B, C, pc)
+		case lua.OP_SHLI, lua.OP_SHRI:
+			fe.emitShiftI(op, A, B, C, pc)
+		case lua.OP_ADD, lua.OP_SUB, lua.OP_MUL, lua.OP_MOD, lua.OP_POW,
+			lua.OP_DIV, lua.OP_IDIV, lua.OP_BAND, lua.OP_BOR, lua.OP_BXOR,
+			lua.OP_SHL, lua.OP_SHR:
+			fe.emitArithReg(op, A, B, C, pc)
+		case lua.OP_MMBIN, lua.OP_MMBINI, lua.OP_MMBINK:
+			// the arith lowering consumed this slot as its fallback
+			panic("luawasm: MMBIN* slot reached as real code (arith pairing bug)")
+		case lua.OP_UNM:
+			fe.emitUnm(A, B, pc)
+		case lua.OP_BNOT:
+			fe.emitBnot(A, B, pc)
+		case lua.OP_NOT:
+			fe.setBoolCellA(A, func() {
+				fe.f.I32Const(1)
+				fe.truth(B)
+				fe.f.I32Sub()
+			})
+			fe.bumpTop(A + 1)
+		case lua.OP_LEN:
+			fe.cellAddr(B)
+			fe.cellAddr(A)
+			fe.f.I32Const(fe.line(pc))
+			fe.f.Call(fe.b.imp("rt_len"))
+			fe.checkStatus()
+			fe.bumpTop(A + 1)
+		case lua.OP_CONCAT:
+			// R[A] := R[A] .. ... .. R[A+B-1] — cells base R(A), count B
+			fe.cellAddr(A)
+			fe.f.I32Const(int32(B))
+			fe.cellAddr(A)
+			fe.f.I32Const(fe.line(pc))
+			fe.f.Call(fe.b.imp("rt_concat"))
+			fe.checkStatus()
+			fe.bumpTop(A + 1)
+		case lua.OP_CLOSE:
+			fe.f.LocalGet(0).I32Const(int32(cellSize * A)).I32Add()
+			fe.f.Call(fe.b.imp("rt_close_upvals"))
+		case lua.OP_JMP:
+			fe.setBlk(fe.blockOf(fe.jumpTarget(pc)))
+			terminal = true
+		case lua.OP_EQ, lua.OP_LT, lua.OP_LE, lua.OP_EQK, lua.OP_EQI,
+			lua.OP_LTI, lua.OP_LEI, lua.OP_GTI, lua.OP_GEI:
+			fe.emitCompare(op, A, B, C, k, pc)
+			terminal = true
+		case lua.OP_TEST:
+			// cond = truthy(R[A]); cond == k → take the partner JMP,
+			// else skip it (pc+2)
+			fe.truth(A)
+			fe.f.LocalSet(fe.lT0)
+			fe.f.LocalGet(fe.lT0).I32Const(int32(k)).I32Eq().If(wasm.Void)
+			fe.setBlk(fe.branchPartner(pc))
+			fe.f.Else()
+			fe.setBlk(fe.blockOf(pc + 2))
+			fe.f.End()
+			terminal = true
+		case lua.OP_TESTSET:
+			// falsy(R[B]) != k → R[A] := R[B] and take the partner JMP;
+			// else skip it (pc+2)
+			fe.truth(B)
+			fe.f.LocalSet(fe.lT0)
+			fe.f.I32Const(1)
+			fe.f.LocalGet(fe.lT0)
+			fe.f.I32Sub() // falsity
+			fe.f.I32Const(int32(k)).I32Ne().If(wasm.Void)
+			fe.copyCell(fe.cell(A), fe.cell(B))
+			fe.bumpTop(A + 1)
+			fe.setBlk(fe.branchPartner(pc))
+			fe.f.Else()
+			fe.setBlk(fe.blockOf(pc + 2))
+			fe.f.End()
+			terminal = true
+		case lua.OP_CALL:
+			fe.emitCall(A, B, C, pc, false)
+		case lua.OP_TAILCALL:
+			// NOT terminal: the RETURN B=0 sentinel at pc+1 stages the
+			// results when the tailcall declines staging (C functions,
+			// __call objects — parity with the interpreter's pushed-frame
+			// tailcall whose RETURN continuation runs after)
+			fe.emitCall(A, B, 0, pc, true)
+		case lua.OP_RETURN:
+			fe.emitReturn(A, B)
+			terminal = true
+		case lua.OP_RETURN0:
+			fe.emitReturn(0, 1)
+			terminal = true
+		case lua.OP_RETURN1:
+			fe.emitReturn(A, 2)
+			terminal = true
+		case lua.OP_FORLOOP:
+			fe.emitForloop(A, Bx, pc)
+			terminal = true
+		case lua.OP_FORPREP:
+			fe.emitForprep(A, Bx, pc)
+			terminal = true
+		case lua.OP_TFORPREP:
+			// swap the control (R[A+3]) and closing (R[A+2]) cells; the
+			// to-be-closed registration is U5 (the compiler passes only
+			// nil closings until then) — then jump to the TFORCALL
+			fe.swapCells(A+2, A+3)
+			fe.setBlk(fe.blockOf(fe.tforprepTarget(pc)))
+			terminal = true
+		case lua.OP_TFORCALL:
+			// fused with the TFORLOOP at pc+1 (they always pair; the
+			// interp dispatches them back-to-back the same way)
+			fe.emitTForcall(A, C, pc)
+			terminal = true
+		case lua.OP_TFORLOOP:
+			// consumed by the fused TFORCALL lowering — unreachable as a
+			// block head (its targets are leaders, so it never starts a
+			// block); a lone TFORLOOP means a pairing bug
+			panic("luawasm: TFORLOOP reached without its TFORCALL")
+		case lua.OP_SETLIST:
+			fe.emitSetlist(inst, A, pc)
+		case lua.OP_CLOSURE:
+			child := fe.proto.FunctionPrototypes[Bx]
+			fe.cellAddr(A)
+			fe.f.I32Const(int32(fe.b.protoIdx[child]))
+			fe.f.LocalGet(1) // cl — this closure is the parent
+			fe.f.LocalGet(0) // frame — capture addresses are frame+16*k
+			fe.f.I32Const(fe.line(pc))
+			fe.f.Call(fe.b.imp("rt_newclosure"))
+			fe.checkStatus()
+			fe.bumpTop(A + 1)
+		case lua.OP_VARARG:
+			fe.emitVararg(A, C)
+		case lua.OP_VARARGPREP:
+			// thin marker over the trampoline's call-time arg split —
+			// nothing to lower (the 5.4+ vararg model is U5)
+		case lua.OP_EXTRAARG:
+			// consumed by its primary (LOADKX/NEWTABLE/SETLIST)
+			panic("luawasm: EXTRAARG reached as real code (pairing bug)")
+		case lua.OP_TBC, lua.OP_GETVARG, lua.OP_ERRNNIL:
+			panic(fmt.Sprintf("luawasm: opcode %d never compiles until U5", op))
+		default:
+			panic(fmt.Sprintf("luawasm: unhandled opcode %d", op))
+		}
+		pc++
+		// skip-slot instructions (MMBIN* fallbacks, EXTRAARG words) are
+		// never real code — the arith lowering already folded the
+		// fallback into its miss path; the primaries consumed their
+		// EXTRAARG words inline
+		for pc < len(fe.code) && fe.pseudo[pc] {
+			pc++
+		}
+		if terminal {
+			// the instruction routed all successors itself (jumps,
+			// branches, returns) — emitting anything after it would
+			// overwrite lBlk at runtime
+			break
+		}
+	}
+	if !terminal {
+		fe.setBlk(fe.blockOf(end))
+	}
+}
+
+// vcCell: the C operand of a SET-family op — a K cell when k is set
+// (the value was a folded constant), the register otherwise
+func (fe *funcEmitter) vcCell(C, k int) *wasm.Function {
+	if k != 0 {
+		return fe.kcell(C)
+	}
+	return fe.cellAddr(C)
+}
+
+// mkIntScratch: materialize an integer immediate into static scratch k
+func (fe *funcEmitter) mkIntScratch(k int, v int64) {
+	fe.scratchAddr(k)
+	fe.f.I64Const(v)
+	fe.f.Call(fe.b.imp("rt_mkinteger"))
+}
+
+// mkFloatScratch: materialize a float immediate into static scratch k
+func (fe *funcEmitter) mkFloatScratch(k int, v float64) {
+	fe.scratchAddr(k)
+	fe.f.F64Const(v)
+	fe.f.Call(fe.b.imp("rt_mknumber"))
+}
+
+// swapCells: exchange two whole TValue cells (one i64 temp per word)
+func (fe *funcEmitter) swapCells(x, y int) {
+	f := fe.f
+	fe.cellAddr(x)
+	f.I64Load(0).LocalSet(fe.lVlo)
+	fe.cellAddr(x)
+	fe.cellAddr(y).I64Load(0)
+	f.I64Store(0)
+	fe.cellAddr(y)
+	f.LocalGet(fe.lVlo).I64Store(0)
+	fe.cellAddr(x)
+	f.I64Load(8).LocalSet(fe.lVlo)
+	fe.cellAddr(x)
+	fe.cellAddr(y).I64Load(8)
+	f.I64Store(8)
+	fe.cellAddr(y)
+	f.LocalGet(fe.lVlo).I64Store(8)
+}

@@ -19,7 +19,6 @@ import (
 )
 
 func TestWazeroSpike(t *testing.T) {
-	skipBackendUntilU2e(t)
 	cases := []struct{ name, src string }{
 		{"hello", `print("hello")`},
 		{"arith", `local x = 40
@@ -57,6 +56,13 @@ io.write("line two\n")`},
 	for _, tc := range cases {
 		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
+			if tc.name == "pcall_core_raise" {
+				// U2e: the interp's index-error wording is still gopher
+				// dialect; the v4 blob speaks stock 5.5 ("attempt to
+				// index a nil value") — the wording re-pins with the
+				// corpora at U2f (row 56)
+				t.Skip("index error text is gopher dialect on interp — row 56 (re-pin at U2f)")
+			}
 			c := Case{Name: tc.name + ".lua", Dir: ".", Source: []byte(tc.src)}
 			wazero := (&WazeroEngine{name: "wazero", SkipUnsupported: true}).Run(c)
 			if tc.name == "iowrite" {

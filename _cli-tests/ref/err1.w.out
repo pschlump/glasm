@@ -1,5 +1,5 @@
 before the crash
-false	./err1.lua:13: attempt to index a non-table object(nil) with key 'field'
-false	./err1.lua:18: cannot perform concat operation between string and nil
+false	./err1.lua:13: attempt to index a nil value
+false	./err1.lua:18: attempt to concatenate a nil value
 glua: "./err1.lua:22: deliberate uncaught error"
 exit=1

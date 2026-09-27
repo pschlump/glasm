@@ -11,7 +11,6 @@ import (
 )
 
 func TestM5Tailcalls(t *testing.T) {
-	skipBackendUntilU2e(t)
 	cases := map[string]string{
 		"flat":        "local function f(n) if n == 0 then return 'done' end return f(n-1) end\nprint(f(1000000))\n", // the 10⁶ gate
 		"mutual":      "local odd\nlocal function even(n) if n == 0 then return true end return odd(n-1) end\nfunction odd(n) if n == 0 then return false end return even(n-1) end\nprint(even(100001), odd(100001))\n",
@@ -32,7 +31,6 @@ func TestM5Tailcalls(t *testing.T) {
 // The staged trampoline must be O(1): a 10⁶-deep tail recursion stays
 // inside one adapter level (no wasm-stack growth, no depth-guard trip).
 func TestM5TailO1(t *testing.T) {
-	skipBackendUntilU2e(t)
 	src := "local function f(n) if n == 0 then return 'ok' end return f(n-1) end\nreturn f(1000000)\n"
 	log := (&WasmEngine{name: "wasm"}).Run(Case{Name: "o1.lua", Dir: ".", Source: []byte(src)})
 	for _, l := range log {

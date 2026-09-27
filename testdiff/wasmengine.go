@@ -5,12 +5,14 @@ package testdiff
 // runtime on wasmtime — the third differential engine. The harness shim
 // comes from the runtime module's install_shims (print→host event,
 // deterministic os.*, host RNG for math.random), matching the interp
-// and clua engines' contract. lua51SjljWasm (embedded in clua.go) is
-// the runtime blob.
+// and clua engines' contract. Since U2e the runtime blob is the ABI v4
+// rt flavor on the stock 5.5 tree (lua55_rt.wasm, embedded below —
+// rebuilt by runtime/build55.sh; the 5.1 blob stays the clua oracle's).
 
 import (
 	"bytes"
 	"context"
+	_ "embed"
 	"fmt"
 	"math"
 	"math/rand"
@@ -20,7 +22,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 	"unsafe"
 
@@ -31,6 +32,9 @@ import (
 	"github.com/pschlump/golua55/parse"
 	"github.com/pschlump/golua55/wasm"
 )
+
+//go:embed lua55_rt.wasm
+var lua55RtWasm []byte
 
 // gcStop runs collectgarbage('stop') in the runtime state via the M2
 // driver's ldostring (v1 mitigation — see the Run comment).
@@ -139,28 +143,43 @@ func toI32(v interface{}) int32 {
 // interp's ValueRepr shape for the deterministic tags. Matches PrintArg /
 // ValueRepr: nil, boolean, number (NumRepr); collectables render as bare
 // markers (addresses are engine-local — the suite avoids them).
+// renderErrValue: a non-string staged error TValue, v4 variant tags
+// (rt_abi55.h RT_V*; U2e — the old 5.1 tags read VNUMINT cells as f64,
+// rendering 42 as a denormal). Strings never land here (the bytes path
+// handled them); table/function values carry addresses and stay outside
+// the byte-exact suite by corpus discipline.
 func renderErrValue(raw []byte) string {
 	tag := raw[8]
-	switch tag {
-	case 0:
-		return "nil"
-	case 1: // boolean: value.b at offset 0
-		if raw[0] != 0 {
-			return "true"
-		}
-		return "false"
-	case 3: // number: f64 at offset 0
+	u64 := func() uint64 {
 		bits := uint64(0)
 		for i := 7; i >= 0; i-- {
 			bits = bits<<8 | uint64(raw[i])
 		}
-		return NumRepr(math.Float64frombits(bits))
-	case 4:
-		return "" // strings go through the bytes path
-	case 5:
+		return bits
+	}
+	switch tag {
+	case 0: // VNIL
+		return "nil"
+	case 1: // VFALSE
+		return "false"
+	case 17: // VTRUE
+		return "true"
+	case 3: // VNUMINT: i64 at offset 0
+		return strconv.FormatInt(int64(u64()), 10)
+	case 19: // VNUMFLT: f64 at offset 0
+		return NumRepr(math.Float64frombits(u64()))
+	case 4, 20: // VSHRSTR / VLNGSTR — the bytes path handles these
+		return ""
+	case 5: // VTABLE
 		return "<table>"
-	case 6:
+	case 6, 22, 38: // VLCL / VLCF / VCCL (a wasm function is a C closure)
 		return "<function>"
+	case 2: // VLIGHTUSERDATA
+		return "<userdata>"
+	case 7: // VUSERDATA
+		return "<userdata>"
+	case 8: // VTHREAD
+		return "<thread>"
 	}
 	return "<value>"
 }
@@ -286,9 +305,10 @@ func (e *WasmEngine) Run(c Case) (log []string) {
 	rng := rand.New(rand.NewSource(42))
 	linker := wt.NewLinker(engine)
 
-	// M6c: blob selection + WASI wiring driven by the blob's own imports
-	// (prod blob = zero wasi imports; a leak fails instantiation loudly).
-	rtBin := lua51SjljWasm
+	// U2e: blob selection — the default is the ABI v4 rt blob (the stock
+	// 5.5 tree's rt_abi55), wired by the same host contract as v3.
+	// WASI wiring driven by the blob's own imports.
+	rtBin := lua55RtWasm
 	if e.RtBin != nil {
 		rtBin = e.RtBin
 	}
@@ -420,11 +440,11 @@ func (e *WasmEngine) Run(c Case) (log []string) {
 	}
 
 	// M6d (D3): the per-VM allocation cap — before lnewstate, so the
-	// state, stdlib, shims, constant pool and script all count.
+	// state, stdlib, shims, constant pool and script all count. The
+	// memlimit block is v3-only until U6 (row 60); refusing keeps a
+	// silent no-op from masquerading as protection.
 	if e.MaxMem > 0 {
-		if _, err := call(rtInst, "rt_set_memlimit", int(e.MaxMem)); err != nil {
-			return []string{"ENGINE-ERROR\trt_set_memlimit: " + err.Error()}
-		}
+		return []string{"ENGINE-ERROR\tmemlimit is not on the ABI v4 blob until U6 (row 60)"}
 	}
 
 	scriptMod, err := wt.NewModule(engine, bin)
@@ -452,13 +472,10 @@ func (e *WasmEngine) Run(c Case) (log []string) {
 	if _, err := call(rtInst, "rt_set_state", L); err != nil {
 		return []string{"ENGINE-ERROR\trt_set_state: " + err.Error()}
 	}
-	// M6c: the sandbox globals lockdown (ledger row 33) — nils io, os,
-	// package, require, module, dofile, loadfile, load, loadstring, debug
-	// out of _G on either blob.
+	// M6c: the sandbox globals lockdown (ledger row 33) — rt_sandbox is
+	// v3-only until U6 (row 60); refuse rather than run unsandboxed.
 	if e.Sandbox {
-		if _, err := call(rtInst, "rt_sandbox", 1); err != nil {
-			return []string{"ENGINE-ERROR\trt_sandbox: " + err.Error()}
-		}
+		return []string{"ENGINE-ERROR\tsandbox is not on the ABI v4 blob until U6 (row 60)"}
 	}
 	// v1 GC stop: register cells are not GC roots (the M3 ABI obligation —
 	// a full GC-rooted frame arrives with the M6 arena lifecycle); any
@@ -473,17 +490,15 @@ func (e *WasmEngine) Run(c Case) (log []string) {
 	if err := e.setArgGlobal(store, rtInst, call, L, c.Name, c.Args); err != nil {
 		return []string{"ENGINE-ERROR\targ setup: " + err.Error()}
 	}
-	// M5d: the gopher message dialect — the wasm engine pins interp ≡
-	// wasm byte-for-byte; the clua oracle keeps the stock C 5.1 texts.
-	if _, err := call(rtInst, "rt_set_dialect", 1); err != nil {
-		return []string{"ENGINE-ERROR\tdialect: " + err.Error()}
-	}
+	// U2e: no dialect layer on the v4 blob — the 5.5 tree speaks stock
+	// texts natively, which is what the interp oracle was re-pinned to
+	// (row 56); the M5d gnumfmt machinery stays 5.1-blob-only.
 	av, err := call(rtInst, "rt_abi_version")
 	if err != nil {
 		return []string{"ENGINE-ERROR\tABI version: " + err.Error()}
 	}
-	if avv, ok := av.(int32); !ok || avv != 3 {
-		return []string{fmt.Sprintf("ENGINE-ERROR\tABI version %v (need 3)", av)}
+	if avv, ok := av.(int32); !ok || avv != 4 {
+		return []string{fmt.Sprintf("ENGINE-ERROR\tABI version %v (need 4)", av)}
 	}
 	initStep := int32(2)
 	if v := os.Getenv("INITSTEP"); v != "" {
@@ -499,44 +514,16 @@ func (e *WasmEngine) Run(c Case) (log []string) {
 		return []string{"ENGINE-ERROR\tframe: " + err.Error()}
 	}
 
-	// M6d (D4): the deadline watchdog. wasmtime Stores are !Sync — the
-	// only safe off-thread crossing is a bare aligned word store into the
-	// linear memory: the blob declares a memory max, so wasmtime maps it
-	// statically (the base never moves) and the slice captured here on the
-	// main goroutine stays valid. The guest's back-edge polls read the
-	// flag and raise rt_deadline's ordinary (pcall-catchable) error.
-	//
-	// Teardown race (found by the M6e soak, ~4k cases in): a callback
-	// firing in the same instant the run returns used to write into the
-	// mapping AFTER the store was dropped — SIGTRAP, whole process down.
-	// The done flag + runtime.KeepAlive close the window: once the main
-	// call returns, new firings skip the write, and the mapping stays
-	// alive until Run itself returns.
-	var watchdogDone int32
-	var timer *time.Timer
+	// U2e: the deadline watchdog is v3-only until U6 (row 60) — the v4
+	// blob has no rt_ctrl_addr/rt_deadline block. Deadlines on the v4
+	// blob arrive with the U6 hardening pass.
 	if e.Deadline > 0 {
-		if a, err := call(rtInst, "rt_ctrl_addr"); err == nil {
-			flagAddr := uint32(toI32(a))
-			memBase := guestMem.UnsafeData(store)
-			timer = time.AfterFunc(e.Deadline, func() {
-				// 4-byte little-endian 1 — one aligned store
-				if atomic.LoadInt32(&watchdogDone) != 0 {
-					return
-				}
-				b := memBase[flagAddr : flagAddr+4 : flagAddr+4]
-				b[0], b[1], b[2], b[3] = 1, 0, 0, 0
-			})
-			defer timer.Stop()
-		}
+		return []string{"ENGINE-ERROR\tdeadline is not on the ABI v4 blob until U6 (row 60)"}
 	}
 
 	status, err := call(scriptInst, "lua_main", frame)
-	// disarm the watchdog before any teardown path (the SIGTRAP race);
-	// KeepAlive holds the mapping live until Run itself returns
-	atomic.StoreInt32(&watchdogDone, 1)
-	if timer != nil {
-		timer.Stop()
-	}
+	// KeepAlive holds the mapping live until Run itself returns (the
+	// M6e teardown race; the v4 watchdog returns at U6)
 	runtime.KeepAlive(store)
 	runtime.KeepAlive(engine)
 	if err != nil {

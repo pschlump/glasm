@@ -24,10 +24,12 @@ func mustEngine(t *testing.T, opts ...Option) *Engine {
 }
 
 func mustCompile(t *testing.T, e *Engine, src string) *Script {
-	// U2c moved the frontend to the 5.5.1 encoding; luawasm is retired
-	// until its U2e rewrite (ledger row 59) — every compile-based host
-	// gate returns with it.
-	t.Skip("wasm compile path retired at the U2c encoding cutover until U2e — ledger row 59")
+	// U2e brought the backend back: luawasm.Compile emits ABI v4
+	// modules again, but the host still pins the 5.1 prod blob (v3) —
+	// a v4 module cannot instantiate against it, and the host result
+	// seam (rt_encode_value/rt_hostfn) is U6 surface. Every
+	// compile-based host gate returns with the U6 prod-blob cutover.
+	t.Skip("host run path awaits the U6 prod-blob cutover (v4 module over the 5.1 blob) — ledger row 60")
 	t.Helper()
 	s, err := e.Compile([]byte(src), "=test")
 	if err != nil {
@@ -487,7 +489,7 @@ func TestSandbox(t *testing.T) {
 // --- concurrency (A9) — the -race CI requirement -------------------------------
 
 func TestConcurrentFreshVMs(t *testing.T) {
-	t.Skip("wasm compile path retired at the U2c encoding cutover until U2e — ledger row 59")
+	t.Skip("host run path awaits the U6 prod-blob cutover (v4 module over the 5.1 blob) — ledger row 60")
 	e := mustEngine(t)
 	const W, N = 8, 15 // goroutines × runs
 	var wg sync.WaitGroup

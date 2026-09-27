@@ -28,7 +28,6 @@ import (
 	"runtime/debug"
 	"strconv"
 	"strings"
-	"sync/atomic"
 	"time"
 
 	"github.com/pschlump/golua55/wasm"
@@ -37,10 +36,6 @@ import (
 	"github.com/tetratelabs/wazero/experimental"
 	"github.com/tetratelabs/wazero/imports/wasi_snapshot_preview1"
 )
-
-// deadlineFlagLE is the watchdog's single store: 1 as 4 little-endian
-// bytes (M6d D4 — see rt_abi.c's control-block contract).
-var deadlineFlagLE = []byte{1, 0, 0, 0}
 
 func u32[T int32 | int | uint32](v T) uint64 { return uint64(uint32(v)) }
 
@@ -144,11 +139,10 @@ func (e *WazeroEngine) Run(c Case) (log []string) {
 	r := wazero.NewRuntimeWithConfig(ctx, rc)
 	defer r.Close(ctx)
 
-	// M6c: WASI is wired only when the blob actually imports it. The prod
-	// blob (lua51_prod.wasm) has zero wasi imports — if one ever leaks back
-	// in, instantiation below fails loudly on the unknown import (the
-	// Go-side artifact gate catches it even earlier).
-	rtBin := lua51SjljWasm
+	// U2e: the default blob is the ABI v4 rt flavor on the stock 5.5 tree
+	// (lua55_rt.wasm); WASI is wired only when the blob actually imports
+	// it. The prod flavor is 5.1-v3 until U6.
+	rtBin := lua55RtWasm
 	if e.RtBin != nil {
 		rtBin = e.RtBin
 	}
@@ -241,12 +235,10 @@ func (e *WazeroEngine) Run(c Case) (log []string) {
 		return f.Call(ctx, args...)
 	}
 
-	// M6d (D3): the per-VM allocation cap — before lnewstate, so the
-	// whole VM lifetime counts (state, stdlib, pool, script).
+	// M6d (D3): the memlimit block is v3-only until U6 (row 60); refuse
+	// rather than run uncapped.
 	if e.MaxMem > 0 {
-		if _, err := call(rtInst, "rt_set_memlimit", u32(int32(e.MaxMem))); err != nil {
-			return []string{"ENGINE-ERROR\trt_set_memlimit: " + err.Error()}
-		}
+		return []string{"ENGINE-ERROR\tmemlimit is not on the ABI v4 blob until U6 (row 60)"}
 	}
 
 	L, err := call(rtInst, "lnewstate")
@@ -281,14 +273,10 @@ func (e *WazeroEngine) Run(c Case) (log []string) {
 	if _, err := call(rtInst, "rt_set_state", u32(Lv)); err != nil {
 		return []string{"ENGINE-ERROR\trt_set_state: " + err.Error()}
 	}
-	// M6c: the sandbox globals lockdown (ledger row 33) — nils io, os,
-	// package, require, module, dofile, loadfile, load, loadstring, debug
-	// out of _G on either blob (dev: runtime removal; prod: they never
-	// existed, the call is belt-and-suspenders and returns 0).
+	// M6c: rt_sandbox is v3-only until U6 (row 60); refuse rather than
+	// run unsandboxed.
 	if e.Sandbox {
-		if _, err := call(rtInst, "rt_sandbox", 1); err != nil {
-			return []string{"ENGINE-ERROR\trt_sandbox: " + err.Error()}
-		}
+		return []string{"ENGINE-ERROR\tsandbox is not on the ABI v4 blob until U6 (row 60)"}
 	}
 	// v1 GC stop: register cells are not GC roots (the M3 ABI obligation);
 	// the M6 cap+fresh-VM posture (ledger row 11) replaces arena lifecycle
@@ -304,16 +292,14 @@ func (e *WazeroEngine) Run(c Case) (log []string) {
 	if err := ldostring(argSetup, "=arg", 0); err != nil {
 		return []string{"ENGINE-ERROR\targ setup: " + err.Error()}
 	}
-	// M5d: the gopher message dialect — byte-exact vs the interp oracle
-	if _, err := call(rtInst, "rt_set_dialect", 1); err != nil {
-		return []string{"ENGINE-ERROR\tdialect: " + err.Error()}
-	}
+	// U2e: no dialect layer on the v4 blob — stock 5.5 texts, which is
+	// what the interp oracle was re-pinned to (row 56)
 	av, err := call(rtInst, "rt_abi_version")
 	if err != nil {
 		return []string{"ENGINE-ERROR\tABI version: " + err.Error()}
 	}
-	if int32(av[0]) != 3 {
-		return []string{fmt.Sprintf("ENGINE-ERROR\tABI version %d (need 3)", int32(av[0]))}
+	if int32(av[0]) != 4 {
+		return []string{fmt.Sprintf("ENGINE-ERROR\tABI version %d (need 4)", int32(av[0]))}
 	}
 	if _, err := call(scriptInst, "luawasm_init", 2); err != nil {
 		return append(log, "ENGINE-ERROR\tinit: "+err.Error())
@@ -324,23 +310,10 @@ func (e *WazeroEngine) Run(c Case) (log []string) {
 		return []string{"ENGINE-ERROR\tframe: " + err.Error()}
 	}
 
-	// M6d (D4): the deadline watchdog — a bare 4-byte store into the
-	// linear memory at the control-block flag (wazero's Memory.Write is a
-	// plain buffer copy; no engine state touched, safe off-thread). The
-	// guest's back-edge polls raise rt_deadline's ordinary error.
-	var watchdogDone int32
+	// U2e: the deadline watchdog is v3-only until U6 (row 60) — the v4
+	// blob has no rt_ctrl_addr/rt_deadline block.
 	if e.Deadline > 0 {
-		if a, err := call(rtInst, "rt_ctrl_addr"); err == nil {
-			flagAddr := uint32(a[0])
-			timer := time.AfterFunc(e.Deadline, func() {
-				// teardown race: skip once the run has returned (M6e soak)
-				if atomic.LoadInt32(&watchdogDone) != 0 {
-					return
-				}
-				_ = mem.Write(flagAddr, deadlineFlagLE)
-			})
-			defer timer.Stop()
-		}
+		return []string{"ENGINE-ERROR\tdeadline is not on the ABI v4 blob until U6 (row 60)"}
 	}
 
 	status, err := call(scriptInst, "lua_main", frame[0])

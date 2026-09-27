@@ -46,14 +46,12 @@ func wazeroCorpus(t *testing.T, dir string, skips map[string]string) {
 
 // TestWazeroFullMatrix: the opcode matrix green on the production engine.
 func TestWazeroFullMatrix(t *testing.T) {
-	skipBackendUntilU2e(t)
 	wazeroCorpus(t, "../_wasm-tests", CorpusSkips("../_wasm-tests"))
 }
 
 // TestWazeroGluaFull: the fork conformance suite on the production engine
 // (same ledgered skip map as the wasmtime leg).
 func TestWazeroGluaFull(t *testing.T) {
-	skipBackendUntilU2e(t)
 	if testing.Short() {
 		t.Skip("heavy corpus — skipped in -short mode")
 	}
@@ -63,7 +61,6 @@ func TestWazeroGluaFull(t *testing.T) {
 // TestWazeroErrorSuite: the byte-exact error suite on the production
 // engine (same shape as TestWasmErrorSuite).
 func TestWazeroErrorSuite(t *testing.T) {
-	skipBackendUntilU2e(t)
 	dir := "../_wasm-err-tests"
 	entries, err := os.ReadDir(dir)
 	if err != nil {

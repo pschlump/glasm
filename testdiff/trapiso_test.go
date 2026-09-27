@@ -71,7 +71,9 @@ func trapEnvNamedBin(t *testing.T, wasi, script bool, chunkName string, binOverr
 		store.SetWasi(wt.NewWasiConfig())
 	}
 
-	rtMod, err := wt.NewModule(engine, lua51SjljWasm)
+	// U2e: the script module speaks ABI v4 — trap isolation runs against
+	// the v4 rt blob
+	rtMod, err := wt.NewModule(engine, lua55RtWasm)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -169,7 +171,6 @@ func mustUint(v interface{}) uint64 {
 }
 
 func TestTrapIsolation(t *testing.T) {
-	skipBackendUntilU2e(t)
 	cases := []struct {
 		name         string
 		wasi, script bool

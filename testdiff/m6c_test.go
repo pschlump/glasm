@@ -97,7 +97,7 @@ func sandboxCase(t *testing.T, e Engine, src string) []string {
 }
 
 func TestM6cSandboxSurface(t *testing.T) {
-	skipBackendUntilU2e(t)
+	skipRtSurfacesUntilU6(t)
 	// The frozen surface (m6 plan §4.3, ledger row 33): everything the
 	// sandbox kills, then everything it keeps. The same script must pass
 	// on the prod blob (compile-time removal) and the dev blob
@@ -162,7 +162,7 @@ print(type(string.format("%d", 7)))
 // sandbox — the frozen allowlist (any change to the sandbox surface or the
 // kept libraries is a ledger-row-33 change and must update this constant).
 func TestM6cSandboxGlobalsFrozen(t *testing.T) {
-	skipBackendUntilU2e(t)
+	skipRtSurfacesUntilU6(t)
 	src := `
 local t = {}
 for k in pairs(_G) do t[#t+1] = k end
@@ -190,7 +190,7 @@ print(table.concat(t, ","))
 // (GLOBALS lines are dropped by DiffLogs by contract; no corpus case uses
 // the removed surface outside dead code — see the ledger row 33 notes).
 func TestM6cSandboxMatrix(t *testing.T) {
-	skipBackendUntilU2e(t)
+	skipRtSurfacesUntilU6(t)
 	cases, err := LoadCorpus("../_wasm-tests")
 	if err != nil {
 		t.Fatalf("load corpus: %v", err)

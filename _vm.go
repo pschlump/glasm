@@ -216,7 +216,10 @@ func init() {
 			lbase := cf.LocalBase
 			A := int(inst>>7) & 0xff //GETA
 			RA := lbase + A
-			Ax := int(inst>>7) & 0x1ffffff //GETAX
+			// the Ax index lives in the FOLLOWING EXTRAARG word (stock
+			// lvm.c reads GETARG_Ax(*pc)); the compiler emits LOADKX with
+			// a zeroed Bx field
+			Ax := int(cf.Fn.Proto.Code[cf.Pc]>>7) & 0x1ffffff //GETAX (EXTRAARG)
 			v := cf.Fn.Proto.Constants[Ax]
 			cf.Pc++ // skip EXTRAARG
 			// +inline-call reg.Set RA v
@@ -417,7 +420,9 @@ func init() {
 			k := int(inst>>15) & 1     //GETK
 			asize := vC
 			if k != 0 {
-				Ax := int(inst>>7) & 0x1ffffff //GETAX (EXTRAARG)
+				// the array-size high word lives in the FOLLOWING EXTRAARG
+				// word (stock lvm.c: c += GETARG_Ax(*pc) * (MAXARG_vC+1))
+				Ax := int(cf.Fn.Proto.Code[cf.Pc]>>7) & 0x1ffffff //GETAX (EXTRAARG)
 				asize += Ax * (opMaxArgsvC + 1)
 			}
 			cf.Pc++ // skip EXTRAARG
@@ -900,7 +905,9 @@ func init() {
 			k := int(inst>>15) & 1      //GETK
 			last := vC
 			if k != 0 {
-				Ax := int(inst>>7) & 0x1ffffff //GETAX (EXTRAARG)
+				// the base-index high word lives in the FOLLOWING EXTRAARG
+				// word (stock lvm.c: last += GETARG_Ax(*pc) * (MAXARG_vC+1))
+				Ax := int(cf.Fn.Proto.Code[cf.Pc]>>7) & 0x1ffffff //GETAX (EXTRAARG)
 				last += Ax * (opMaxArgsvC + 1)
 				cf.Pc++
 			}

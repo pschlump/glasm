@@ -68,10 +68,10 @@ func (f *Function) End() *Function {
 	return f.op(0x0B)
 }
 
-func (f *Function) Br(label uint32) *Function     { return f.opU32(0x0C, label) }
-func (f *Function) BrIf(label uint32) *Function   { return f.opU32(0x0D, label) }
-func (f *Function) Return() *Function             { return f.op(0x0F) }
-func (f *Function) Call(fnIdx uint32) *Function   { return f.opU32(0x10, fnIdx) }
+func (f *Function) Br(label uint32) *Function   { return f.opU32(0x0C, label) }
+func (f *Function) BrIf(label uint32) *Function { return f.opU32(0x0D, label) }
+func (f *Function) Return() *Function           { return f.op(0x0F) }
+func (f *Function) Call(fnIdx uint32) *Function { return f.opU32(0x10, fnIdx) }
 
 // CallIndirect emits call_indirect on table 0 with the given type index.
 // Stack order: function arguments, then the table index.
@@ -103,11 +103,11 @@ func (f *Function) Select() *Function { return f.op(0x1B) }
 
 /* variables */
 
-func (f *Function) LocalGet(i uint32) *Function   { return f.opU32(0x20, i) }
-func (f *Function) LocalSet(i uint32) *Function   { return f.opU32(0x21, i) }
-func (f *Function) LocalTee(i uint32) *Function   { return f.opU32(0x22, i) }
-func (f *Function) GlobalGet(i uint32) *Function  { return f.opU32(0x23, i) }
-func (f *Function) GlobalSet(i uint32) *Function  { return f.opU32(0x24, i) }
+func (f *Function) LocalGet(i uint32) *Function  { return f.opU32(0x20, i) }
+func (f *Function) LocalSet(i uint32) *Function  { return f.opU32(0x21, i) }
+func (f *Function) LocalTee(i uint32) *Function  { return f.opU32(0x22, i) }
+func (f *Function) GlobalGet(i uint32) *Function { return f.opU32(0x23, i) }
+func (f *Function) GlobalSet(i uint32) *Function { return f.opU32(0x24, i) }
 
 /* memory */
 
@@ -195,29 +195,41 @@ func (f *Function) I32ShrU() *Function { return f.op(0x76) }
 
 /* i64 */
 
-func (f *Function) I64Eq() *Function  { return f.op(0x51) }
-func (f *Function) I64Ne() *Function  { return f.op(0x52) }
-func (f *Function) I64Add() *Function { return f.op(0x7C) }
-func (f *Function) I64Sub() *Function { return f.op(0x7D) }
-func (f *Function) I64Mul() *Function { return f.op(0x7E) }
+func (f *Function) I64Eqz() *Function  { return f.op(0x50) }
+func (f *Function) I64Eq() *Function   { return f.op(0x51) }
+func (f *Function) I64Ne() *Function   { return f.op(0x52) }
+func (f *Function) I64LtS() *Function  { return f.op(0x53) }
+func (f *Function) I64GtS() *Function  { return f.op(0x55) }
+func (f *Function) I64LeS() *Function  { return f.op(0x57) }
+func (f *Function) I64GeS() *Function  { return f.op(0x59) }
+func (f *Function) I64LtU() *Function  { return f.op(0x54) }
+func (f *Function) I64GeU() *Function  { return f.op(0x5A) }
+func (f *Function) I64Add() *Function  { return f.op(0x7C) }
+func (f *Function) I64Sub() *Function  { return f.op(0x7D) }
+func (f *Function) I64Mul() *Function  { return f.op(0x7E) }
+func (f *Function) I64And() *Function  { return f.op(0x83) }
+func (f *Function) I64Or() *Function   { return f.op(0x84) }
+func (f *Function) I64Xor() *Function  { return f.op(0x85) }
+func (f *Function) I64Shl() *Function  { return f.op(0x86) }
+func (f *Function) I64ShrU() *Function { return f.op(0x88) }
 
 /* f64 */
 
-func (f *Function) F64Eq() *Function    { return f.op(0x61) }
-func (f *Function) F64Ne() *Function    { return f.op(0x62) }
-func (f *Function) F64Lt() *Function    { return f.op(0x63) }
-func (f *Function) F64Gt() *Function    { return f.op(0x64) }
-func (f *Function) F64Le() *Function    { return f.op(0x65) }
-func (f *Function) F64Ge() *Function    { return f.op(0x66) }
-func (f *Function) F64Abs() *Function   { return f.op(0x99) }
-func (f *Function) F64Neg() *Function   { return f.op(0x9A) }
-func (f *Function) F64Sqrt() *Function  { return f.op(0x9F) }
-func (f *Function) F64Add() *Function   { return f.op(0xA0) }
-func (f *Function) F64Sub() *Function   { return f.op(0xA1) }
-func (f *Function) F64Mul() *Function   { return f.op(0xA2) }
-func (f *Function) F64Div() *Function   { return f.op(0xA3) }
-func (f *Function) F64Min() *Function   { return f.op(0xA4) }
-func (f *Function) F64Max() *Function   { return f.op(0xA5) }
+func (f *Function) F64Eq() *Function   { return f.op(0x61) }
+func (f *Function) F64Ne() *Function   { return f.op(0x62) }
+func (f *Function) F64Lt() *Function   { return f.op(0x63) }
+func (f *Function) F64Gt() *Function   { return f.op(0x64) }
+func (f *Function) F64Le() *Function   { return f.op(0x65) }
+func (f *Function) F64Ge() *Function   { return f.op(0x66) }
+func (f *Function) F64Abs() *Function  { return f.op(0x99) }
+func (f *Function) F64Neg() *Function  { return f.op(0x9A) }
+func (f *Function) F64Sqrt() *Function { return f.op(0x9F) }
+func (f *Function) F64Add() *Function  { return f.op(0xA0) }
+func (f *Function) F64Sub() *Function  { return f.op(0xA1) }
+func (f *Function) F64Mul() *Function  { return f.op(0xA2) }
+func (f *Function) F64Div() *Function  { return f.op(0xA3) }
+func (f *Function) F64Min() *Function  { return f.op(0xA4) }
+func (f *Function) F64Max() *Function  { return f.op(0xA5) }
 
 /* conversions */
 

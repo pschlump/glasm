@@ -121,6 +121,15 @@ static void stage_error(void) {
     memcpy(err_buf, s, n);
     err_buf[n] = '\0';
     err_buf_len = (int)n;
+    /* U2e (row 60's error-position seam): a message that already carries
+       this chunk's position prefix — error() built it, or a nested
+       rt_run re-raise staged it — must not gain another prefix at every
+       level (stock never re-prefixes; v3 needed the dialect line-stack
+       for this, the zero-patch tree detects the prefix instead). */
+    if (chunk_name_len > 0 && err_buf_len > chunk_name_len &&
+        memcmp(err_buf, chunk_name, (size_t)chunk_name_len) == 0 &&
+        err_buf[chunk_name_len] == ':')
+      err_prefixed = 1;
   } else {
     err_prefixed = 1; /* non-string: the engine renders the value */
   }
@@ -249,6 +258,20 @@ void rt_set_state(rt_addr p) {
   err_line_set = 0;
   setnilvalue(&err_value);
   rt_wasm_depth = 0;
+  /* U2e: make the v1 "GC stopped per run" posture airtight. The host
+     stops the collector (collectgarbage('stop') => GCSTPUSR), but
+     5.5's luaL_pushresult calls lua_gc(LUA_GCSTEP) after building any
+     box-backed buffer (strings > LUAL_BUFFERSIZE), and the STEP option
+     force-clears gcstp to run a collection EVEN under a user stop — a
+     sweep would free every value held only from wasm cells (the pool
+     and frames are not GC roots; the arena lifecycle is U6). The
+     internal GCSTPGC bit makes lua_gc refuse ALL options (lapi.c's
+     entry guard), including the forced step, so no collection can ever
+     start. collectgarbage turns inert (returns -1); no corpus observes
+     it (the wasm corpora never call it — the 5.1 blob's dialect made
+     the same surface unobservable). The U6 arena retires this freeze
+     with real rooting. */
+  G(curL)->gcstp |= GCSTPGC;
 }
 
 /* ---- value construction ---- */
