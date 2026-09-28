@@ -28,7 +28,8 @@ go test -short ./...  # skips heavy corpora (_lua5.1-tests etc. check testing.Sh
 go test ./testdiff/ -run TestWasmFullMatrix -v   # run a single differential gate
 # main gates: TestWasmFullMatrix (_wasm-tests), TestWasmErrorSuite (_wasm-err-tests),
 #             TestWasmGluaFull (_glua-tests), TestCLuaConformance (_lua5.1-tests),
-#             TestCLua55Conformance (_lua5.5-tests, 5.5 oracle), TestU1Gate (_u1: interp <-> clua55 byte-exact, the 5.2-core gate)
+#             TestCLua55Conformance (_lua5.5-tests, 5.5 oracle), TestU1Gate/TestU2Gate (_u1/_u2: interp <-> clua55 byte-exact),
+#             TestU2fMatrixOracle/TestU2fErrorOracle (the regenerated matrix + error suite interp <-> clua55, row 62)
 
 # CLI differential runner (exit 1 on any diff). wasm = wasmtime oracle
 # host; wazero = the pure-Go production engine (same blob — ledger row 32).
@@ -71,7 +72,7 @@ Three code-producing pieces plus a test harness, sharing the golua55-lua fronten
 - **`runtime/`** — vendored stock C Lua 5.1.5 (`runtime/lua51/`) + glue (`luawasm.c`, `rt_abi.c`) compiled to freestanding wasm32. Exports the frozen `rt_*` ABI the backend calls; hosts C functions and metamethod/coercion slow paths. The SJLJ/EH blob (`lua51_sjlj.wasm`) runs on wasmtime only — **wazero (pure Go) is the production engine**; an EH-free blob flavor is the tracked M6 item. `runtime/lua55/` (U0) vendors stock C Lua 5.5.1 with **zero patches** — driven by `luawasm55.c` (public C API only; determinism pinned by `build55.sh` flags) into `lua55_sjlj.wasm`, the new-oracle blob. U2d adds **ABI v4 on that same zero-patch tree**: `rt_abi55.c` (`lua55_rt.wasm` flavor) — variant-tag cells, `luaO_arith` semantics, and the CClosure dispatch seam replacing the 5.1 tree's patched-ldo.c adapter (ledger row 60); the U2e backend targets it.
 - **`testdiff/`** — differential harness. `Engine` interface with the engines: `interp` (the golua55-lua interpreter, primary oracle), `clua` (stock C Lua 5.1 in wasm on wasmtime), `clua55`/`clua55-wazero` (stock C Lua 5.5.1 — the semantic authority for the 5.2→5.5 upgrade, U0/D6), and `wasm`/`wazero` (the luawasm backend on the v4 `lua55_rt.wasm` blob — row 61). Engines produce normalized event logs (`PRINT`/`ERROR`/`STDOUT`/`GLOBALS` lines, `normalize.go`) that are diffed byte-for-byte; GLOBALS lines and interp traceback tails are excluded by contract. U0 adds `clua55`/`clua55-wazero` (stock C Lua 5.5.1 on both hosts — the semantic authority for the 5.2→5.5 upgrade per plan decision D6) and the `_lua5.5-tests` corpus (official suite, `TestCLua55Conformance`).
 
-Corpora (all `_`-prefixed so the Go tooling ignores them): `_glua-tests`, `_lua5.1-tests` (conformance), `_wasm-tests` (~510 generated opcode-matrix cases), `_wasm-err-tests` (~93 byte-exact error cases), `_cli-tests` (CLI black-box), `_lua5.5-tests` (official 5.5.1 suite), `_u1` (U1's 5.2-core cases, interp↔clua55).
+Corpora (all `_`-prefixed so the Go tooling ignores them): `_glua-tests`, `_lua5.1-tests` (conformance), `_wasm-tests` (~1440 generated opcode-matrix cases incl. the U2f int/float/bitwise grids), `_wasm-err-tests` (~93 byte-exact error cases), `_cli-tests` (CLI black-box), `_lua5.5-tests` (official 5.5.1 suite), `_u1` (U1's 5.2-core cases, interp↔clua55).
 
 Key invariants:
 

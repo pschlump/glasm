@@ -50,12 +50,21 @@ var baseFuncs = map[string]LGFunction{
 	// unpack moved to table.unpack.
 }
 
+// baseAssert is stock luaB_assert (U2f re-pin): on failure the message
+// (arg 2, ANY value, or the default) routes through Error(msg, 1) —
+// string messages gain the caller's position only when it is a Lua
+// frame, non-string values raise raw (assert(nil, 42) errors with 42,
+// not a type complaint about the message).
 func baseAssert(L *LState) int {
-	if !L.ToBool(1) {
-		L.RaiseError("%s", L.OptString(2, "assertion failed!"))
-		return 0
+	if L.ToBool(1) {
+		return L.GetTop()
 	}
-	return L.GetTop()
+	if L.GetTop() >= 2 {
+		L.Error(L.Get(2), 1)
+	} else {
+		L.Error(LString("assertion failed!"), 1)
+	}
+	return 0
 }
 
 func baseCollectGarbage(L *LState) int {
@@ -76,8 +85,15 @@ func baseDoFile(L *LState) int {
 	return L.GetTop() - top
 }
 
+// baseError is stock luaB_error (U2f re-pin): no CheckAny — error()
+// with no argument raises nil like stock (5.5 renders the missing
+// object downstream), and only STRING messages at level > 0 gain the
+// level-target frame's position (a G target adds none).
 func baseError(L *LState) int {
-	obj := L.CheckAny(1)
+	var obj LValue = LNil
+	if L.GetTop() >= 1 {
+		obj = L.Get(1)
+	}
 	level := L.OptInt(2, 1)
 	L.Error(obj, level)
 	return 0

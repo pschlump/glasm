@@ -483,3 +483,38 @@ U5).
   texts), the never-re-pinned wording families skip until U2f.
   Blobs byte-deterministic. **Next: U2f** (corpus regeneration +
   D7 re-pin + closeout).
+- **2026-09-26 (U2f)** — **implemented and gated: corpora, the D7
+  re-pin, and U2 closeout (ledger row 62). U2 IS COMPLETE.**
+  (a) The interp's error surface re-pinned to stock, probed against
+  clua55 case-by-case: concat/index/call/compare texts
+  (luaG_concaterror's operand choice; orderError's two-vs-mixed
+  shapes), lstrlib's op-named string-arith texts when a STRING operand
+  fails coercion (the full string-mt dispatch stays U3/row 58), stock
+  assert (message passthrough — assert(nil, 42) errors with 42) and
+  error() (level numbering via stockWhere: the running G function is
+  level 0, non-Lua targets add NO position — fixing pcall(error,
+  'x')'s bogus prefix and the old skipg level walks; RaiseError split
+  into raiseErrorAt so VM keeps current-frame positions). (b) The
+  matrix regenerated through TestGenMatrixCorpus's new D11 grids
+  (528→1438 cases: integer arith incl. wrap/maxint/minint/2^53,
+  bitwise, shift corners, mixed promotion, int/float compares,
+  string-coercion subtypes, integer/float for families). (c) Oracle
+  legs added — TestU2fMatrixOracle + TestU2fErrorOracle (interp↔clua55)
+  — completing the exit gate's ×{interp, clua55, wasm, wazero}. Row 62
+  rules the remainders: varinfo hints ((local 'x') etc. — the interp
+  raises hintless and the wasm seam cannot carry them; oracle-only
+  skips until U5/U7), the oracle's stock xoshiro rng (D5 shim is
+  rt-only), 5.5 read-only for-vars (U5), parse-error wording (U5).
+  TestM6cDeterminism5x stride-samples the tripled corpus (repeated
+  runs, not every case, carry the property). Corpus pins updated
+  (_glua-tests issues/vm, state_test, _cli-tests err1.i golden).
+  **Gate:** `go test ./...` green; TestU1Gate/TestU2Gate byte-exact;
+  TestWasmFullMatrix 1432/1432 + wazero twin; both error suites with
+  the seam-only skip set; oracle legs green; `_cli-tests make` PASS;
+  rt_set_dialect retired everywhere outside the 5.1 blob (the host's
+  dead call rides the U6-frozen path). **Closeout note:** the `global`
+  statement is still unimplemented — §5 ruling 1's alternative (the
+  official sections PORTED into `_u2` rather than run unmodified via
+  parse acceptance) is the path taken, so the U2b "accepted-as-no-op"
+  row never materialized; `global` lands whole with U5's declaration
+  work (reserved word + enforcement + read-only const globals).

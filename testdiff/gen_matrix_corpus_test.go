@@ -47,6 +47,90 @@ func TestGenMatrixCorpus(t *testing.T) {
 	for i, s := range []string{"'10' + 1", "'2' * '3'", "'7' .. 7", "1 .. 2", "'x' .. 0"} {
 		add(fmt.Sprintf("coerce%02d", i), fmt.Sprintf("print(%s)\n", s))
 	}
+
+	// ---- U2f (D11): the integer/bitwise/float matrix ----
+	// integer arith over a 5.5-shaped grid (wrap-around int64 semantics;
+	// values printed directly stay numeric at the print boundary, so the
+	// harness's %.14g mask keeps the engines byte-exact — integral
+	// FLOATS must not be stringified in-case (gnf discipline, D7/U5))
+	ivals := []string{"7", "-13", "0", "1", "-1", "0x10", "9223372036854775807", "-9223372036854775807", "9007199254740993", "1000000000000"}
+	iops := []string{"+", "-", "*", "//", "%"}
+	n = 0
+	for _, a := range ivals {
+		for _, b := range ivals {
+			for _, op := range iops {
+				if (op == "//" || op == "%") && b == "0" {
+					continue // div-by-zero family lives in the error corpus
+				}
+				add(fmt.Sprintf("iari%03d", n), fmt.Sprintf("print(%s %s %s)\n", a, op, b))
+				n++
+			}
+		}
+	}
+	// bitwise + shifts over the integer grid
+	bops := []string{"&", "|", "~"}
+	for _, a := range ivals {
+		for _, b := range ivals {
+			for _, op := range bops {
+				add(fmt.Sprintf("bit%03d", n), fmt.Sprintf("print(%s %s %s)\n", a, op, b))
+				n++
+			}
+		}
+	}
+	// shift corners: negative counts shift the other way, |y|>=64 => 0
+	for _, a := range []string{"1", "-1", "9223372036854775807", "-9223372036854775807", "0x55", "3"} {
+		for _, y := range []string{"0", "1", "63", "64", "65", "-1", "-63", "-64", "-65"} {
+			add(fmt.Sprintf("shf%03d", n), fmt.Sprintf("print(%s << %s, %s >> %s)\n", a, y, a, y))
+			n++
+		}
+	}
+	// mixed int/float promotion: any float infects; / and ^ are always float
+	fvals := []string{"2.5", "-0.5", "3.0", "1e15", "0.1", "4503599627370497.0"}
+	for _, a := range []string{"7", "9007199254740993", "-13"} {
+		for _, b := range fvals {
+			add(fmt.Sprintf("mix%03d", n), fmt.Sprintf("print(%s + %s, %s - %s, %s * %s, %s // %s, %s %% %s)\n", a, b, a, b, a, b, a, b, a, b))
+			n++
+			add(fmt.Sprintf("mix%03d", n), fmt.Sprintf("print(%s / %s, %s ^ %s)\n", a, b, b, a))
+			n++
+		}
+	}
+	// integer division/modulo sign semantics (floor convention)
+	for _, pair := range [][2]string{{"7", "2"}, {"-7", "2"}, {"7", "-2"}, {"-7", "-2"}, {"9223372036854775807", "3"}, {"-9223372036854775807", "3"}} {
+		add(fmt.Sprintf("idv%03d", n), fmt.Sprintf("print(%s // %s, %s %% %s, %s - (%s // %s) * %s)\n", pair[0], pair[1], pair[0], pair[1], pair[0], pair[0], pair[1], pair[1]))
+		n++
+	}
+	// wrap-around + minint edges
+	add("wrp00", "print(9223372036854775807 + 1, -9223372036854775807 - 2, 9223372036854775807 * 2)\n")
+	add("wrp01", "print(-9223372036854775807 - 1 == -9223372036854775808, -(-9223372036854775807 - 1))\n")
+	add("wrp02", "print(9007199254740993 + 1, 9007199254740993 - 1)\n")
+	add("wrp03", "print(0x7fffffffffffffff & -1, ~0, ~(-1))\n")
+	// mixed int/float comparisons incl. the 2^53 exact edges
+	n = 0
+	for _, pair := range [][2]string{{"9007199254740993", "9007199254740992.0"}, {"9007199254740993", "9007199254740994.0"}, {"-9007199254740993", "-9007199254740992.0"}, {"7", "7.0"}, {"-1", "-1.5"}, {"9223372036854775807", "1e308"}, {"-9223372036854775807", "-1e308"}, {"0", "0.5"}} {
+		a, b := pair[0], pair[1]
+		add(fmt.Sprintf("icmp%03d", n), fmt.Sprintf("print(%s < %s, %s <= %s, %s > %s, %s >= %s, %s == %s)\n", a, b, a, b, a, b, a, b, a, b))
+		n++
+	}
+	// string coercion subtype results (integer strings stay integer)
+	for i, x := range []string{"'7' // 2", "'0x10' + 0", "'2.5' + 0", "'10' / 4", "'-13' % 5", "'7' << 2 == 28"} {
+		add(fmt.Sprintf("scv%02d", i), fmt.Sprintf("print(%s)\n", x))
+	}
+	// integer for: descending, big steps, minint/maxint neighborhoods
+	add("forI00", "for i = 10, 1, -3 do print(i) end\n")
+	add("forI01", "for i = 1, 10, 4 do print(i) end\n")
+	add("forI02", "for i = 9223372036854775804, 9223372036854775807 do print(i) end\n")
+	add("forI03", "for i = -9223372036854775807, -9223372036854775804, 2 do print(i) end\n")
+	add("forI04", "local n = 0\nfor i = 1, 1000000000 do n = n + 1 if n == 5 then break end end\nprint(n, 'early')\n")
+	add("forI05", "for i = 5, 5 do print(i) end\nfor i = 5, 4 do print('never') end\nprint('done')\n")
+	add("forI06", "for i = 0, -10, -5 do print(i) end\n")
+	add("forI07", "local s = 0\nfor i = 1, 100 do s = s + i end\nprint(s)\n")
+	// float for: fractional steps, mixed int/float flavors
+	add("forF00", "for i = 0.0, 1.0, 0.25 do print(i) end\n")
+	add("forF01", "for i = 1, 2.5, 0.5 do print(i) end\n")
+	add("forF02", "for i = 2.5, 1, -0.5 do print(i) end\n")
+	add("forF03", "for i = 0.1, 0.3, 0.1 do print(i) end\n")
+	// for-loop integer-exactness: the float that could be an int isn't one
+	add("forX00", "for i = 1, 3, 1.0 do print(i, i == 2) end\n")
 	// unary
 	for i, s := range []string{"-5", "-(-5)", "- 2.5"} {
 		add(fmt.Sprintf("unm%02d", i), fmt.Sprintf("print(%s)\n", s))

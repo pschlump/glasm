@@ -657,7 +657,9 @@ func (ls *LState) raiseError(level int, format string, args ...interface{}) {
 		message = fmt.Sprintf(format, args...)
 	}
 	if level > 0 {
-		message = fmt.Sprintf("%v %v", ls.where(level-1, true), message)
+		if prefix := ls.stockWhere(level); prefix != "" {
+			message = fmt.Sprintf("%v %v", prefix, message)
+		}
 	}
 	if ls.reg.IsFull() {
 		// if the registry is full then it won't be possible to push a value, in this case, force a larger size
@@ -708,6 +710,24 @@ func (ls *LState) where(level int, skipg bool) string {
 		line = fmt.Sprintf("%v:", proto.DbgSourcePositions[cf.Pc-1])
 	}
 	return fmt.Sprintf("%v:%v", sourcename, line)
+}
+
+// stockWhere is luaL_where's semantics (U2f re-pin, D7 direction): the
+// position of the frame at 'level' counting the running (G) function as
+// level 0 — and EMPTY for non-Lua frames, never skipping past them.
+// The old skipg walk landed on the nearest Lua frame, so pcall(error,
+// 'x') gained pcall's caller's position where stock has none, and
+// error('m', 2) took the wrong frame's line.
+func (ls *LState) stockWhere(level int) string {
+	dbg, ok := ls.GetStack(level)
+	if !ok {
+		return ""
+	}
+	cf := dbg.frame
+	if cf.Fn == nil || cf.Fn.IsG || cf.Fn.Proto == nil {
+		return ""
+	}
+	return fmt.Sprintf("%v:%v:", parse.ChunkID(cf.Fn.Proto.SourceName), cf.Fn.Proto.DbgSourcePositions[cf.Pc-1])
 }
 
 func (ls *LState) stackTrace(level int) string {
@@ -1018,7 +1038,8 @@ func (ls *LState) pushCallFrame(cf callFrame, fn LValue, meta bool) { // +inline
 		ls.reg.Insert(fn, cf.LocalBase)
 	}
 	if cf.Fn == nil {
-		ls.RaiseError("attempt to call a non-function object")
+		// U2f re-pin: luaG_typeerror names the callee's type
+		ls.RaiseError("attempt to call a %s value", fn.Type().String())
 	}
 	if ls.stack.IsFull() {
 		ls.RaiseError("stack overflow")
@@ -1072,7 +1093,7 @@ func (ls *LState) getField(obj LValue, key LValue) LValue {
 		metaindex := ls.metaOp1(curobj, "__index")
 		if metaindex == LNil {
 			if !istable {
-				ls.RaiseError("attempt to index a non-table object(%v) with key '%s'", curobj.Type().String(), key.String())
+				ls.RaiseError("attempt to index a %s value", curobj.Type().String())
 			}
 			return LNil
 		}
@@ -1103,7 +1124,7 @@ func (ls *LState) getFieldString(obj LValue, key string) LValue {
 		metaindex := ls.metaOp1(curobj, "__index")
 		if metaindex == LNil {
 			if !istable {
-				ls.RaiseError("attempt to index a non-table object(%v) with key '%s'", curobj.Type().String(), key)
+				ls.RaiseError("attempt to index a %s value", curobj.Type().String())
 			}
 			return LNil
 		}
@@ -1134,7 +1155,7 @@ func (ls *LState) setField(obj LValue, key LValue, value LValue) {
 		metaindex := ls.metaOp1(curobj, "__newindex")
 		if metaindex == LNil {
 			if !istable {
-				ls.RaiseError("attempt to index a non-table object(%v) with key '%s'", curobj.Type().String(), key.String())
+				ls.RaiseError("attempt to index a %s value", curobj.Type().String())
 			}
 			ls.RawSet(tb, key, value)
 			return
@@ -1166,7 +1187,7 @@ func (ls *LState) setFieldString(obj LValue, key string, value LValue) {
 		metaindex := ls.metaOp1(curobj, "__newindex")
 		if metaindex == LNil {
 			if !istable {
-				ls.RaiseError("attempt to index a non-table object(%v) with key '%s'", curobj.Type().String(), key)
+				ls.RaiseError("attempt to index a %s value", curobj.Type().String())
 			}
 			tb.RawSetString(key, value)
 			return
@@ -1525,8 +1546,35 @@ func (ls *LState) registryOverflow() {
 }
 
 // This function is equivalent to luaL_error( http://www.lua.org/manual/5.1/manual.html#luaL_error ).
+// U2f: the position target is the CURRENT frame when raised from Lua
+// code (luaG_runerror semantics — the VM's own raises) and the caller
+// when raised from a G function (luaL_error semantics) — and a G
+// caller yields NO position (stock's luaL_where over a C frame is
+// empty; the old skipg walk skipped straight past it).
 func (ls *LState) RaiseError(format string, args ...interface{}) {
-	ls.raiseError(1, format, args...)
+	level := 0
+	if cf := ls.currentFrame; cf != nil && cf.Fn != nil && cf.Fn.IsG {
+		level = 1
+	}
+	ls.raiseErrorAt(level, format, args...)
+}
+
+// raiseErrorAt prefixes unconditionally (an empty stockWhere adds
+// nothing) — the internal-raise path where level 0 names the running
+// Lua frame itself; raiseError keeps error()'s level-0-means-none rule.
+func (ls *LState) raiseErrorAt(level int, format string, args ...interface{}) {
+	message := format
+	if len(args) > 0 {
+		message = fmt.Sprintf(format, args...)
+	}
+	if prefix := ls.stockWhere(level); prefix != "" {
+		message = fmt.Sprintf("%v %v", prefix, message)
+	}
+	if ls.reg.IsFull() {
+		ls.reg.forceResize(ls.reg.Top() + 1)
+	}
+	ls.reg.Push(LString(message))
+	ls.Panic(ls)
 }
 
 // This function is equivalent to lua_error( http://www.lua.org/manual/5.1/manual.html#lua_error ).

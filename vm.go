@@ -1055,6 +1055,10 @@ func init() {
 						}
 					}
 				} else {
+					if _, ok := unaryv.(LString); ok {
+						// U2f re-pin: the string mt's __unm text (see objectArith)
+						L.RaiseError("attempt to unm a 'string' with a 'string'")
+					}
 					L.RaiseError("attempt to perform arithmetic on a %s value", unaryv.Type().String())
 				}
 			}
@@ -1450,7 +1454,8 @@ func init() {
 					ls.reg.Insert(fn, cf.LocalBase)
 				}
 				if cf.Fn == nil {
-					ls.RaiseError("attempt to call a non-function object")
+					// U2f re-pin: luaG_typeerror names the callee's type
+					ls.RaiseError("attempt to call a %s value", fn.Type().String())
 				}
 				if ls.stack.IsFull() {
 					ls.RaiseError("stack overflow")
@@ -1583,7 +1588,8 @@ func init() {
 				callable, meta = L.metaCall(lv)
 			}
 			if callable == nil {
-				L.RaiseError("attempt to call a non-function object")
+				// U2f re-pin: luaG_typeerror names the callee's type
+				L.RaiseError("attempt to call a %s value", lv.Type().String())
 			}
 			// this section is inlined by go-inline
 			// source function is 'func (ls *LState) closeUpvalues(idx int) ' in '_state.go'
@@ -2400,10 +2406,10 @@ func leValues(L *LState, lhs, rhs LValue) bool {
 		return res
 	}
 	if isNumberValue(lhs) || isNumberValue(rhs) {
-		L.RaiseError("attempt to compare %v with %v", lhs.Type().String(), rhs.Type().String())
+		orderError(L, lhs, rhs)
 	}
 	if lhs.Type() != rhs.Type() {
-		L.RaiseError("attempt to compare %v with %v", lhs.Type().String(), rhs.Type().String())
+		orderError(L, lhs, rhs)
 	}
 	switch lhs.Type() {
 	case LTString:
@@ -3383,8 +3389,20 @@ func objectArith(L *LState, opcode int, lhs, rhs LValue) LValue {
 	} else if res == arithRaise {
 		L.RaiseError("%s", errText)
 	}
-	// stock luaT_trybinTM error shapes (luaG_opinterror picks the
-	// non-number operand; both non-numbers reports the first)
+	// stock luaT_trybinTM error shapes: a STRING operand failed its
+	// numeric coercion, so the string metatable's arith metamethod
+	// would have raised lstrlib's op-named text (U2f re-pin — the full
+	// string-mt dispatch is U3, row 58; the text lands now so interp ≡
+	// blob); anything else is luaG_opinterror (picks the non-number
+	// operand; both non-numbers reports the first)
+	if !isBitwiseOp(opcode) {
+		if _, ok := lhs.(LString); ok {
+			L.RaiseError("attempt to %s a '%s' with a '%s'", arithOpName(opcode), lhs.Type().String(), rhs.Type().String())
+		}
+		if _, ok := rhs.(LString); ok {
+			L.RaiseError("attempt to %s a '%s' with a '%s'", arithOpName(opcode), lhs.Type().String(), rhs.Type().String())
+		}
+	}
 	what := "arithmetic"
 	if isBitwiseOp(opcode) {
 		what = "bitwise operation"
@@ -3396,6 +3414,12 @@ func objectArith(L *LState, opcode int, lhs, rhs LValue) LValue {
 	L.RaiseError("attempt to perform %s on a %s value", what, bad.Type().String())
 
 	return LNil
+}
+
+// arithOpName: lstrlib's opname — the metamethod name without its "__"
+// prefix (add sub mul mod pow div idiv …).
+func arithOpName(opcode int) string {
+	return strings.TrimPrefix(arithEvent(opcode), "__")
 }
 
 // arithEvent maps an arith opcode to its metamethod name.
@@ -3628,7 +3652,14 @@ func stringConcat(L *LState, total, last int) LValue {
 				total--
 				i--
 			} else {
-				L.RaiseError("cannot perform concat operation between %v and %v", lhs.Type().String(), rhs.Type().String())
+				// U2f re-pin: luaG_concaterror — if the first operand is
+				// string/number-convertible the second is the offender,
+				// else the first is
+				bad := lhs
+				if LVCanConvToString(lhs) {
+					bad = rhs
+				}
+				L.RaiseError("attempt to concatenate a %s value", bad.Type().String())
 				return LNil
 			}
 		} else {
@@ -3774,16 +3805,27 @@ func eqIntFloat(i int64, f float64) bool {
 	return ok && fi == i
 }
 
+// orderError is luaG_ordererror (U2f re-pin): same types name them
+// twice, mixed types name each once.
+func orderError(L *LState, lhs, rhs LValue) {
+	t1, t2 := lhs.Type().String(), rhs.Type().String()
+	if t1 == t2 {
+		L.RaiseError("attempt to compare two %s values", t1)
+	} else {
+		L.RaiseError("attempt to compare %s with %s", t1, t2)
+	}
+}
+
 func lessThan(L *LState, lhs, rhs LValue) bool {
 	// optimization for numbers
 	if ret, ok := numLT(lhs, rhs); ok {
 		return ret
 	}
 	if isNumberValue(lhs) || isNumberValue(rhs) {
-		L.RaiseError("attempt to compare %v with %v", lhs.Type().String(), rhs.Type().String())
+		orderError(L, lhs, rhs)
 	}
 	if lhs.Type() != rhs.Type() {
-		L.RaiseError("attempt to compare %v with %v", lhs.Type().String(), rhs.Type().String())
+		orderError(L, lhs, rhs)
 		return false
 	}
 	ret := false
@@ -3840,7 +3882,7 @@ func objectRationalWithError(L *LState, lhs, rhs LValue, event string) bool {
 	case 0:
 		return false
 	}
-	L.RaiseError("attempt to compare %v with %v", lhs.Type().String(), rhs.Type().String())
+	orderError(L, lhs, rhs)
 	return false
 }
 

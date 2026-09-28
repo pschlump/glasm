@@ -54,7 +54,7 @@ assert(not ok and type(msg) == "string")
 local ok, msg = pcall(function()
   return {} .. (function() end)
 end)
-assert(not ok and string.find(msg, "cannot perform concat operation between table and function"))
+assert(not ok and string.find(msg, "attempt to concatenate a table value"))
 
 -- test table with initial elements over 511
 local bigtable = {1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,
