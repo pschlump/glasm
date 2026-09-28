@@ -2469,7 +2469,7 @@ func compileFuncCallExpr(context *funcContext, reg int, expr *ast.FuncCallExpr, 
 		b = 0
 	}
 	context.Code.AddABC(OP_CALL, funcreg, b, ec.varargopt+2, sline(expr))
-	context.Proto.DbgCalls = append(context.Proto.DbgCalls, DbgCall{Pc: context.Code.LastPC(), Name: name})
+	context.Proto.DbgCalls = append(context.Proto.DbgCalls, DbgCall{Pc: context.Code.LastPC(), Name: name, Method: expr.Func == nil})
 
 	if ec.varargopt == 0 && shouldmove(ec, funcreg) {
 		context.Code.AddABC(OP_MOVE, ec.reg, funcreg, 0, sline(expr))

@@ -214,7 +214,7 @@ assert(message == "attempt to call a number value")
 ok, message = pcall(function()
   pcall()
 end)
-assert(not ok and string.find(message, "bad argument #1 to pcall", 1, true))
+assert(not ok and string.find(message, "bad argument #1 to 'pcall'", 1, true))
 
 -- issue 216
 local function bar()

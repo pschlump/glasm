@@ -15,7 +15,6 @@ import (
 	_ "embed"
 	"fmt"
 	"math"
-	"math/rand"
 	"os"
 	"runtime"
 	"runtime/debug"
@@ -217,8 +216,6 @@ type WasmEngine struct {
 	// Sandbox: call rt_sandbox(1) after rt_set_state (M6c globals
 	// lockdown, ledger row 33) and skip the io.flush drain.
 	Sandbox bool
-	// Seed: host RNG seed (0 → 42); applied after lnewstate (D5).
-	Seed int64
 	// MaxMem: per-VM allocation budget in bytes (0 = unlimited). Applied
 	// via rt_set_memlimit BEFORE lnewstate so the whole VM lifetime
 	// counts; over-budget allocation dies with a clean pcall-catchable
@@ -302,12 +299,13 @@ func (e *WasmEngine) Run(c Case) (log []string) {
 		}
 	}
 
-	rng := rand.New(rand.NewSource(42))
 	linker := wt.NewLinker(engine)
 
 	// U2e: blob selection — the default is the ABI v4 rt blob (the stock
 	// 5.5 tree's rt_abi55), wired by the same host contract as v3.
 	// WASI wiring driven by the blob's own imports.
+	// U3b: no host.random* imports — stock xoshiro math.random runs in
+	// the blob over the makeseed=0 pin (the D5 host-RNG shim retired).
 	rtBin := lua55RtWasm
 	if e.RtBin != nil {
 		rtBin = e.RtBin
@@ -338,18 +336,6 @@ func (e *WasmEngine) Run(c Case) (log []string) {
 		eventFn = func(kind, ptr, length int32) {}
 	}
 	if err := linker.DefineFunc(store, "host", "event", eventFn); err != nil {
-		return []string{"ENGINE-ERROR\t" + err.Error()}
-	}
-	if err := linker.DefineFunc(store, "host", "random01",
-		func() float64 { return rng.Float64() }); err != nil {
-		return []string{"ENGINE-ERROR\t" + err.Error()}
-	}
-	if err := linker.DefineFunc(store, "host", "randomint",
-		func(lo, hi int32) int32 { return int32(rng.Intn(int(hi-lo+1)) + int(lo)) }); err != nil {
-		return []string{"ENGINE-ERROR\t" + err.Error()}
-	}
-	if err := linker.DefineFunc(store, "host", "randomseed",
-		func(seed int64) { rng = rand.New(rand.NewSource(seed)) }); err != nil {
 		return []string{"ENGINE-ERROR\t" + err.Error()}
 	}
 	// host.wasm_dispatch: the M5a reverse seam — the C runtime's
@@ -460,12 +446,6 @@ func (e *WasmEngine) Run(c Case) (log []string) {
 	L, err := call(rtInst, "lnewstate")
 	if err != nil {
 		return []string{"ENGINE-ERROR\tlnewstate: " + err.Error()}
-	}
-	// M6c: lnewstate just reseeded the host RNG to 42 (the C-side harness
-	// contract); apply the engine's seed on top so identically-seeded
-	// engines observe identical math.random streams (D5 determinism).
-	if e.Seed != 0 {
-		rng = rand.New(rand.NewSource(e.Seed))
 	}
 	// the ABI operates on this state (curL in rt_abi.c) — without it,
 	// NULL-derefs land in mapped page 0 and surface as wild call_indirects

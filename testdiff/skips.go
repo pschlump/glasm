@@ -32,7 +32,8 @@ var gluaWasmSkips = map[string]string{
 	"db.lua":        "debug.getinfo introspection over wasm frames — row 23",
 	"goto.lua":      "loadstring-mixed C-interpreted chunks — row 24",
 	"vm.lua":        "loadstring + gopher parser-error wording (register overflow) — row 24",
-	"math.lua":      "library-error wording/behavior (math.max arity text) — row 25",
+	// U3b: math.lua un-skipped — re-pinned to the 5.5 surface (pow
+	// removed, stock arity text); row 25's math clause closes.
 	"strings.lua":   "library-error wording/behavior (string.dump unsupported in the fork) — row 25",
 	// U2e: the wasm engine is the stock-5.5 stdlib now; the interp keeps
 	// 5.1-era extras (D8's removal list re-pins with the corpora at U2f)
@@ -62,6 +63,8 @@ var wasmTestsSkips = map[string]string{
 	// row 10 — table.sort + deep __call/tailcall chains corrupt the
 	// return path (pre-existing M5d/M6 bucket)
 	"tsort01.lua": "sort comparator + __call chains corrupt the return path — row 10",
+	// U3b: mod00 un-skipped — the D5 host-RNG shim retired; every engine
+	// runs stock xoshiro over the makeseed=0 pin.
 }
 
 // ledgeredErrSkips: _wasm-err-tests cases whose divergence has a ruling

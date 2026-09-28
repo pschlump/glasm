@@ -20,6 +20,10 @@ type DbgLocalInfo struct {
 type DbgCall struct {
 	Name string
 	Pc   int
+	// Method records a colon-syntax call site (`obj:name(...)`): stock's
+	// luaL_argerror does not count the implicit self in the argument
+	// number and has a dedicated "bad self" error for arg 1 (U3b).
+	Method bool
 }
 
 // Upvaldesc is a compiled upvalue-capture descriptor (U2c, stock

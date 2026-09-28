@@ -260,12 +260,125 @@ func (ls *LState) OptUserData(n int, d *LUserData) *LUserData {
 
 /* error operations {{{ */
 
-func (ls *LState) ArgError(n int, message string) {
-	ls.RaiseError("bad argument #%v to %v (%v)", n, ls.rawFrameFuncName(ls.currentFrame), message)
+// argErrorName resolves the current (G) function's name for argument
+// errors: the call-site name if there is one (stock getfuncname), else
+// the registry/globals search (stock pushglobalfuncname — how pcall'd
+// library functions still report 'math.random'), else '?'.
+func (ls *LState) argErrorName() (string, bool) {
+	name, isMethod, isChunk := ls.frameFuncNameFull(ls.currentFrame)
+	if isChunk || name == "(anonymous)" {
+		if path, ok := ls.pushGlobalFuncName(ls.currentFrame.Fn); ok {
+			return path, isMethod
+		}
+		return "?", isMethod
+	}
+	return name, isMethod
 }
 
+// pushGlobalFuncName ports lauxlib.c pushglobalfuncname: a depth-2 DFS
+// over the registry's _LOADED table (then a depth-1 pass over the
+// globals table) for a path naming the function value, with stock's
+// "_G." prefix strip (_LOADED["_G"] IS the globals table).
+func (ls *LState) pushGlobalFuncName(fn *LFunction) (string, bool) {
+	var find func(t *LTable, level int) (string, bool)
+	seen := map[*LTable]bool{}
+	find = func(t *LTable, level int) (string, bool) {
+		if t == nil || seen[t] || level <= 0 {
+			return "", false
+		}
+		seen[t] = true
+		// first pass: direct function fields; second: one level deeper
+		// through sub-tables (string keys only, like stock findfield)
+		var hit string
+		t.ForEach(func(key, v LValue) {
+			if hit != "" {
+				return
+			}
+			if _, ok := key.(LString); !ok {
+				return
+			}
+			if f, ok := v.(*LFunction); ok && f == fn {
+				hit = keyStr(key)
+			}
+		})
+		if hit != "" {
+			return hit, true
+		}
+		t.ForEach(func(key, v LValue) {
+			if hit != "" {
+				return
+			}
+			if _, ok := key.(LString); !ok {
+				return
+			}
+			if sub, ok := v.(*LTable); ok {
+				if name, ok2 := find(sub, level-1); ok2 {
+					hit = keyStr(key) + "." + name
+				}
+			}
+		})
+		return hit, hit != ""
+	}
+	if loaded, ok := ls.G.Registry.RawGetString("_LOADED").(*LTable); ok {
+		if name, ok2 := find(loaded, 2); ok2 {
+			return strings.TrimPrefix(name, "_G."), true
+		}
+	}
+	if name, ok := find(ls.G.Global, 1); ok {
+		return name, true
+	}
+	return "", false
+}
+
+func keyStr(key LValue) string {
+	if s, ok := key.(LString); ok {
+		return string(s)
+	}
+	return fmt.Sprint(key)
+}
+
+// argPresent distinguishes a MISSING argument (stock LUA_TNONE → "no
+// value" in type errors) from an explicit nil.
+func (ls *LState) argPresent(n int) bool {
+	return n >= 1 && ls.currentLocalBase()+n-1 < ls.reg.Top()
+}
+
+// argError is stock 5.5 luaL_argerror: colon-syntax call sites do not
+// count the implicit self in the argument number, with a dedicated
+// bad-self error for the first argument.
+func (ls *LState) argError(n int, message string) {
+	name, isMethod := ls.argErrorName()
+	arg := n
+	if isMethod {
+		if arg == 1 {
+			ls.RaiseError("calling '%s' on bad self (%s)", name, message)
+		}
+		arg--
+	}
+	ls.RaiseError("bad argument #%v to '%v' (%v)", arg, name, message)
+}
+
+func (ls *LState) ArgError(n int, message string) {
+	ls.argError(n, message)
+}
+
+// TypeError is luaL_typeerror with the fork's type-tag spelling; the
+// actual-operand side honors __name and reports "no value" when the
+// argument is absent.
 func (ls *LState) TypeError(n int, typ LValueType) {
-	ls.RaiseError("bad argument #%v to %v (%v expected, got %v)", n, ls.rawFrameFuncName(ls.currentFrame), typ.String(), ls.Get(n).Type().String())
+	ls.typeErrorStr(n, typ.String())
+}
+
+func (ls *LState) typeErrorStr(n int, tname string) {
+	actual := "no value"
+	if ls.argPresent(n) {
+		v := ls.Get(n)
+		actual = v.Type().String()
+		if name, ok := ls.GetMetaField(v, "__name").(LString); ok {
+			actual = string(name)
+		}
+	}
+	ls.argError(n, tname+" expected, got "+actual)
 }
 
 /* }}} */

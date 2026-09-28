@@ -34,8 +34,11 @@ var gluaTests []string = []string{
 // ledger rows; they stay attached to the frozen 5.1 engines (clua) until
 // U8. Portable cases are re-landed by the _u1 corpus (TestU1Gate) and the
 // version-neutral 5.5-suite subsets.
+//
+// U3d re-triage: sort.lua joins them — table.getn is gone (5.2 removal,
+// D8) and the file leans on it throughout; the sort surface is covered
+// by _u3's table slice and the official sort.lua at U5's full-suite leg.
 var luaTests []string = []string{
-	"sort.lua",
 	"strings.lua",
 	"files.lua",
 }

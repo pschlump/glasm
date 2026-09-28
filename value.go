@@ -207,6 +207,12 @@ type Global struct {
 	Registry      *LTable
 	Global        *LTable
 
+	// randState is the math.random xoshiro256** state (U3b). Stock keeps
+	// it in a userdata upvalue shared by the math functions; the Go side
+	// hangs it on the Global — one stream per lua_State, shared across
+	// coroutines, observationally identical.
+	randState rngState
+
 	builtinMts map[int]LValue
 	tempFiles  []*os.File
 	gccount    int32

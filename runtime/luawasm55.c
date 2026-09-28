@@ -67,16 +67,11 @@
 __attribute__((import_module("host"), import_name("event")))
 void host_event(int32_t kind, int32_t ptr, int32_t len);
 
-/* U2e: the D5 determinism contract (v3 parity) — math.random streams
-   through the host RNG so identically-seeded engines observe identical
-   sequences (the interp's deterministic shims + the harness seed). The
-   stock xoshiro stays underneath for anything the shim does not cover. */
-__attribute__((import_module("host"), import_name("random01")))
-double host_random01(void);
-__attribute__((import_module("host"), import_name("randomint")))
-int32_t host_randomint(int32_t lo, int32_t hi);
-__attribute__((import_module("host"), import_name("randomseed")))
-void host_randomseed(int64_t seed);
+/* U3b: the D5 host-RNG shim is RETIRED. Every engine now runs stock
+   xoshiro256** math.random over the build pin luai_makeseed()=0u
+   (build55.sh) — the interp's mathlib port and this blob share the
+   exact stream, so the host random01/randomint/randomseed imports are
+   gone (ledger row 65). */
 
 /* ---- event kinds and value tags ---- */
 
@@ -317,51 +312,14 @@ int32_t lnamebuf(void) { return (int32_t)(size_t)namebuf; }
 
 /* ---- exported driver API ---- */
 
-/* math.random over the host RNG (D5, U2e): float results, like the
-   interp's deterministic shim — printing normalizes through the
-   harness's %.14g mask, so the subtype is unobservable in event logs */
-static int g_random(lua_State *L) {
-  int n = lua_gettop(L);
-  switch (n) {
-  case 0:
-    lua_pushnumber(L, host_random01());
-    return 1;
-  case 1: {
-    int hi = (int)luaL_checkinteger(L, 1);
-    luaL_argcheck(L, hi >= 1, 1, "interval is empty");
-    lua_pushnumber(L, host_randomint(1, hi));
-    return 1;
-  }
-  default: {
-    int lo = (int)luaL_checkinteger(L, 1);
-    int hi = (int)luaL_checkinteger(L, 2);
-    luaL_argcheck(L, lo <= hi, 2, "interval is empty");
-    lua_pushnumber(L, host_randomint(lo, hi));
-    return 1;
-  }
-  }
-}
-
-static int g_randomseed(lua_State *L) {
-  host_randomseed((int64_t)luaL_checknumber(L, 1));
-  return 0;
-}
-
 static void install_shims(lua_State *L) {
   env_store("PATH", "/bin:/usr/bin");
 
   lua_pushcfunction(L, g_print);
   lua_setglobal(L, "print");
 
-#ifdef LUA_RT_FLAVOR
-  /* the D5 host-RNG shim rides only the rt flavor — the oracle blob
-     (lua55_sjlj.wasm) keeps stock math.random, as the semantic
-     authority */
-  lua_getglobal(L, "math");
-  lua_pushcfunction(L, g_random);     lua_setfield(L, -2, "random");
-  lua_pushcfunction(L, g_randomseed); lua_setfield(L, -2, "randomseed");
-  lua_pop(L, 1);
-#endif
+  /* U3b: no math.random shim on any flavor — stock xoshiro everywhere
+     (the D5 host-RNG shim retired; see the host-imports note above). */
 
   lua_getglobal(L, "os");
   lua_pushcfunction(L, g_tmpname);  lua_setfield(L, -2, "tmpname");

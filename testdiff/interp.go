@@ -7,7 +7,6 @@ package testdiff
 import (
 	"context"
 	"fmt"
-	"math/rand"
 	"os"
 	"path/filepath"
 	"strings"
@@ -20,9 +19,11 @@ import (
 // of them can be diffed against each other (the M1 self-diff gate).
 type Interp struct {
 	name string
-	// Seed: host RNG seed for the run (0 → 42, the harness contract —
-	// M6c D5 determinism plumbing, mirrors the wasm engines' Seed).
-	Seed int64
+	// SuiteFlags: run the official suite's "user tests" posture
+	// (_port/_soft/_nomsg = true, set as globals BEFORE the chunk — the
+	// clua55 engine runs the same prelude as a separate chunk; setting
+	// globals keeps line numbers identical) — the U3 official gate.
+	SuiteFlags bool
 	// Deadline: host timeout for the run (M6d D4 parity leg) — SetContext;
 	// mainLoopWithContext raises ctx.Err() ("context deadline exceeded")
 	// at the next instruction boundary. This is the oracle whose wording
@@ -58,7 +59,14 @@ func (e *Interp) Run(c Case) []string {
 		defer cancel()
 		L.SetContext(ctx)
 	}
-	installShim(L, emit, e.Seed)
+	installShim(L, emit)
+	if e.SuiteFlags {
+		// all.lua's "user tests" posture (the clua55 engine's
+		// suiteFlagsPrelude, set as globals so line numbers match)
+		L.SetGlobal("_port", lua.LTrue)
+		L.SetGlobal("_soft", lua.LTrue)
+		L.SetGlobal("_nomsg", lua.LTrue)
+	}
 	// The C driver exposes arg = { [0] = chunkname } (luawasm.c); align the
 	// oracle so scripts touching the GLOBAL arg see the same surface. (The
 	// compat `arg` LOCAL is unaffected — NeedsArg is cleared when `...` is
@@ -98,9 +106,10 @@ func serializeGlobals(L *lua.LState) string {
 
 // installShim replaces every nondeterministic surface with a deterministic
 // equivalent and hooks print into the event log. The shim set is part of
-// the engine contract: every engine (interp today; C-Lua-wasm at M2 and
-// the backend at M4) must provide the same replacements.
-func installShim(L *lua.LState, emit func(event, payload string), seed int64) {
+// the engine contract: every engine must provide the same replacements.
+// (math.random is NOT shimmed since U3b: the mathlib speaks stock
+// xoshiro256** over the same makeseed=0 pin as the blobs.)
+func installShim(L *lua.LState, emit func(event, payload string)) {
 	// print → event log
 	printFn := func(L *lua.LState) int {
 		top := L.GetTop()
@@ -179,42 +188,6 @@ func installShim(L *lua.LState, emit func(event, payload string), seed int64) {
 	L.SetField(L.GetGlobal("os"), "time", L.NewFunction(osTime))
 	L.SetField(L.GetGlobal("os"), "clock", L.NewFunction(constStub(0)))
 	L.SetField(L.GetGlobal("os"), "date", L.NewFunction(osDateShim))
-
-	// math.random/randomseed: deterministic, engine-owned RNG.
-	//
-	// golua55's mathlib draws from Go's global math/rand, whose
-	// rand.Seed is a no-op on Go >= 1.24 (GODEBUG randseednop), so
-	// math.randomseed(42) does not make sequences reproducible — and the
-	// unseeded stream is process-random, unlike C Lua's deterministic
-	// srand(1) start. The oracle therefore replaces both functions with a
-	// per-run source. Every engine must provide this same shim (design
-	// doc §7); see the divergence ledger.
-	if seed == 0 {
-		seed = 42 // harness contract: every run starts at seed 42
-	}
-	rng := rand.New(rand.NewSource(seed))
-	mathRandom := func(L *lua.LState) int {
-		switch L.GetTop() {
-		case 0:
-			L.Push(lua.LNumber(rng.Float64()))
-		case 1:
-			L.Push(lua.LNumber(rng.Intn(L.CheckInt(1)) + 1))
-		default:
-			min := L.CheckInt(1)
-			max := L.CheckInt(2)
-			if min > max {
-				L.ArgError(2, "interval is empty")
-			}
-			L.Push(lua.LNumber(rng.Intn(max-min+1) + min))
-		}
-		return 1
-	}
-	mathRandomseed := func(L *lua.LState) int {
-		rng = rand.New(rand.NewSource(L.CheckInt64(1)))
-		return 0
-	}
-	L.SetField(L.GetGlobal("math"), "random", L.NewFunction(mathRandom))
-	L.SetField(L.GetGlobal("math"), "randomseed", L.NewFunction(mathRandomseed))
 
 	// os.tmpname: unique per call (files.lua renames tmpname() A to
 	// tmpname() B — a constant would rename onto itself), deterministic

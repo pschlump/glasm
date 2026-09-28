@@ -26,7 +26,8 @@ var clua55MatrixSkips = map[string]string{
 	"err00.lua":  "clua55 appends the (local 't') varinfo hint — row 62",
 	"scv05.lua":  "clua55 appends the (constant '7') varinfo hint — row 62",
 	"gfor01.lua": "pairs iteration order is engine-specific (hash vs insertion) — corpus discipline",
-	"mod00.lua":  "math.random stream: the oracle keeps stock xoshiro (the D5 host-RNG shim is rt-blob-only) — row 61",
+	// U3b: mod00 un-skipped against the oracle too — the interp's
+	// mathlib is stock xoshiro over the same makeseed=0 pin.
 	// 5.5's read-only for-control variables (calcshape assigns one) are
 	// U5 language work — the interp still allows it
 	"calcshape.lua": "5.5 read-only for control variables — U5 (plan U5 row)",

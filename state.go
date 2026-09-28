@@ -883,12 +883,19 @@ func (ls *LState) rawFrameFuncName(fr *callFrame) string {
 }
 
 func (ls *LState) frameFuncName(fr *callFrame) (string, bool) {
+	name, _, ischunk := ls.frameFuncNameFull(fr)
+	return name, ischunk
+}
+
+// frameFuncNameFull is frameFuncName plus the colon-syntax flag of the
+// resolved call site (U3b: stock's argerror namewhat=="method" arm).
+func (ls *LState) frameFuncNameFull(fr *callFrame) (string, bool, bool) {
 	frame := fr.Parent
 	if frame == nil {
 		if ls.Parent == nil {
-			return "main chunk", true
+			return "main chunk", false, true
 		} else {
-			return "corountine", true
+			return "corountine", false, true
 		}
 	}
 	if !frame.Fn.IsG {
@@ -899,14 +906,14 @@ func (ls *LState) frameFuncName(fr *callFrame) (string, bool) {
 				if (name == "?" || fr.TailCall > 0) && !fr.Fn.IsG {
 					name = fmt.Sprintf("<%v:%v>", parse.ChunkID(fr.Fn.Proto.SourceName), fr.Fn.Proto.LineDefined)
 				}
-				return name, false
+				return name, call.Method, false
 			}
 		}
 	}
 	if !fr.Fn.IsG {
-		return fmt.Sprintf("<%v:%v>", parse.ChunkID(fr.Fn.Proto.SourceName), fr.Fn.Proto.LineDefined), false
+		return fmt.Sprintf("<%v:%v>", parse.ChunkID(fr.Fn.Proto.SourceName), fr.Fn.Proto.LineDefined), false, false
 	}
-	return "(anonymous)", false
+	return "(anonymous)", false, false
 }
 
 func (ls *LState) isStarted() bool {

@@ -67,34 +67,35 @@ func TestM6cDeterminism5x(t *testing.T) {
 	}
 }
 
-// TestM6cSeedAnchor: the same host Seed on interp, wasmtime and wazero must
-// produce identical math.random sequences — and those must equal the pinned
-// values (Go's math/rand stream for source 20260916; the const updates only
-// if Go ever changes the stream, loudly).
+// TestM6cSeedAnchor (U3b re-pin): every engine runs stock xoshiro256**
+// math.random over the same luai_makeseed()=0u pin (the D5 host-RNG shim
+// retired), so the same explicitly-seeded script must produce identical
+// sequences on interp, wasmtime and wazero — and those must equal the
+// pinned stock values (probed against clua55; the pins update only if
+// the algorithm ever changes, loudly).
 func TestM6cSeedAnchor(t *testing.T) {
 	src := `
+math.randomseed(20260916)
 print(math.random())
 print(math.random(1, 100))
 print(math.random())
-math.randomseed(99)
+math.randomseed(99, 0)
 print(math.random(10, 20))
 print(math.random())
 `
 	engines := []Engine{
-		&Interp{name: "interp", Seed: 20260916},
-		&WasmEngine{name: "wasmtime", Seed: 20260916},
-		&WazeroEngine{name: "wazero", Seed: 20260916},
+		&Interp{name: "interp"},
+		&WasmEngine{name: "wasmtime"},
+		&WazeroEngine{name: "wazero"},
 		// U2e: the prod-blob leg returns with the U6 cutover (the 5.1
-		// prod blob cannot host v4 modules — row 60); the v4 rt blob
-		// carries the D5 host-RNG shim, so the seed contract holds on
-		// the standard legs
+		// prod blob cannot host v4 modules — row 60)
 	}
 	want := []string{
-		"PRINT\t0.44287703335747",
-		"PRINT\t82",
-		"PRINT\t0.6533955337141",
-		"PRINT\t10",
-		"PRINT\t0.63581730392865",
+		"PRINT\t0.058600057131229",
+		"PRINT\t46",
+		"PRINT\t0.75242202870948",
+		"PRINT\t15",
+		"PRINT\t0.7593733360043",
 	}
 	for _, e := range engines {
 		log := e.Run(Case{Name: "seed_anchor.lua", Dir: ".", Source: []byte(src)})
@@ -114,13 +115,13 @@ print(math.random())
 		}
 	}
 
-	// a different seed must move the stream (guards a constant-seed bug
+	// a different seed must move the stream (guards a stuck-state bug
 	// hiding behind the anchor)
-	e := &WazeroEngine{name: "wazero-seed2", Seed: 777}
-	log := e.Run(Case{Name: "seed_anchor.lua", Dir: ".", Source: []byte("print(math.random())")})
+	e := &WazeroEngine{name: "wazero-seed2"}
+	log := e.Run(Case{Name: "seed_anchor2.lua", Dir: ".", Source: []byte("math.randomseed(777)\nprint(math.random())")})
 	for _, l := range log {
 		if l == want[0] {
-			t.Errorf("seed 777 produced the seed-20260916 first draw — seed not plumbed")
+			t.Errorf("seed 777 produced the seed-20260916 first draw — randomseed not plumbed")
 		}
 	}
 }

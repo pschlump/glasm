@@ -23,7 +23,6 @@ import (
 	"bytes"
 	"context"
 	"fmt"
-	"math/rand"
 	"os"
 	"runtime/debug"
 	"strconv"
@@ -72,10 +71,6 @@ type WazeroEngine struct {
 	// Sandbox: call rt_sandbox(1) after rt_set_state — the M6c globals
 	// lockdown (ledger row 33) — and skip the io.flush drain (io is nil).
 	Sandbox bool
-	// Seed: host RNG seed for the run (0 → 42, the harness contract).
-	// Applied after lnewstate (which reseeds to 42 from the C side), so
-	// engines with the same Seed observe identical math.random streams.
-	Seed int64
 	// MaxMem: per-VM allocation budget in bytes (0 = unlimited), via
 	// rt_set_memlimit before lnewstate (M6d D3, ledger row 36).
 	MaxMem int64
@@ -183,7 +178,8 @@ func (e *WazeroEngine) Run(c Case) (log []string) {
 		return int32(res[0])
 	}
 
-	rng := rand.New(rand.NewSource(42))
+	// U3b: no host.random* imports — stock xoshiro math.random runs in
+	// the blob over the makeseed=0 pin (the D5 host-RNG shim retired).
 	eventFn := func(kind, ptr, length int32) {
 		if m := r.Module("rt"); m != nil {
 			if raw, ok := m.Memory().Read(uint32(ptr), uint32(length)); ok {
@@ -196,11 +192,6 @@ func (e *WazeroEngine) Run(c Case) (log []string) {
 	}
 	_, err = r.NewHostModuleBuilder("host").
 		NewFunctionBuilder().WithFunc(eventFn).Export("event").
-		NewFunctionBuilder().WithFunc(func() float64 { return rng.Float64() }).Export("random01").
-		NewFunctionBuilder().WithFunc(func(lo, hi int32) int32 {
-		return int32(rng.Intn(int(hi-lo+1)) + int(lo))
-	}).Export("randomint").
-		NewFunctionBuilder().WithFunc(func(seed int64) { rng = rand.New(rand.NewSource(seed)) }).Export("randomseed").
 		NewFunctionBuilder().WithFunc(dispatch).Export("wasm_dispatch").
 		NewFunctionBuilder().WithFunc(func(fnidx, argsPtr, argsLen, retPtr, retCap int32) int32 {
 		// M7a: the hostfn seam is a host-package feature; this engine
@@ -246,12 +237,6 @@ func (e *WazeroEngine) Run(c Case) (log []string) {
 		return []string{"ENGINE-ERROR\tlnewstate: " + err.Error()}
 	}
 	Lv := int32(L[0])
-	// M6c: lnewstate just reseeded the host RNG to 42 (the C-side harness
-	// contract); apply the engine's seed on top so identically-seeded
-	// engines observe identical math.random streams (D5 determinism).
-	if e.Seed != 0 {
-		rng = rand.New(rand.NewSource(e.Seed))
-	}
 	ldostring := func(src, chunkname string, nres uint32) error {
 		in, err := call(rtInst, "linbuf")
 		if err != nil {
