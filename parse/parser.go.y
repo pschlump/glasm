@@ -16,6 +16,8 @@ import (
 %type<exprlist> varlist
 %type<expr> var
 %type<namelist> namelist
+%type<namelist> attnamelist
+%type<attrib> attrib
 %type<exprlist> exprlist
 %type<expr> expr
 %type<expr> string
@@ -48,6 +50,7 @@ import (
   fieldsep  string
 
   namelist []string
+  attrib   string
   parlist  *ast.ParList
 }
 
@@ -56,6 +59,11 @@ import (
 
 /* Literals */
 %token<token> TEqeq TNeq TLte TGte T2Comma T3Comma T2Colon TIdent TNumber TString '{' '(' TIDiv TBand TBor TBXor TShl TShr
+
+/* U3a: `global` as a contextual keyword (reserved word with enforcement
+   at U5); the lexer only emits TGlobal when the following token can
+   continue a global declaration (name / function / '<' / '*'). */
+%token<token> TGlobal
 
 /* Operators — precedence follows stock lparser.c priority[] (U2b):
    | < ~ < & < shifts < .. < + - < * / // % < unary < ^ */
@@ -186,13 +194,51 @@ stat:
             $$ = &ast.LocalAssignStmt{Names:[]string{$3.Str}, Exprs: []ast.Expr{$4}}
             $$.SetLine($1.Pos.Line)
             $$.SetLastLine($4.LastLine())
-        } | 
-        TLocal namelist '=' exprlist {
+        } |
+        /* U3a: attnamelist carries optional attributes (<const>/<close>)
+           in either grammar position; they parse and are IGNORED — the
+           real attribute semantics are U4 (ledger row). */
+        TLocal attnamelist '=' exprlist {
             $$ = &ast.LocalAssignStmt{Names: $2, Exprs:$4}
             $$.SetLine($1.Pos.Line)
         } |
-        TLocal namelist {
+        TLocal attnamelist {
             $$ = &ast.LocalAssignStmt{Names: $2, Exprs:[]ast.Expr{}}
+            $$.SetLine($1.Pos.Line)
+        } |
+        /* U3a: the 5.5 global declaration, accepted-as-no-op (a reserved
+           word with enforcement at U5 — ledger row). `global namelist`
+           lowers to a plain global assignment when initialized; the
+           declaration itself carries no observable behavior before U5.
+           `global *` / `global <attrib> *` change only the (absent)
+           declaration checking — nothing. */
+        TGlobal attnamelist '=' exprlist {
+            lhs := make([]ast.Expr, 0, len($2))
+            for i, name := range $2 {
+                ident := &ast.IdentExpr{Value: name}
+                ident.SetLine($1.Pos.Line + i)
+                lhs = append(lhs, ident)
+            }
+            $$ = &ast.AssignStmt{Lhs: lhs, Rhs: $4}
+            $$.SetLine($1.Pos.Line)
+        } |
+        TGlobal attnamelist {
+            $$ = &ast.DoBlockStmt{}
+            $$.SetLine($1.Pos.Line)
+        } |
+        TGlobal TFunction TIdent funcbody {
+            fn := &ast.IdentExpr{Value: $3.Str}
+            fn.SetLine($3.Pos.Line)
+            $$ = &ast.FuncDefStmt{Name: &ast.FuncName{Func: fn}, Func: $4}
+            $$.SetLine($1.Pos.Line)
+            $$.SetLastLine($4.LastLine())
+        } |
+        TGlobal '*' {
+            $$ = &ast.DoBlockStmt{}
+            $$.SetLine($1.Pos.Line)
+        } |
+        TGlobal attrib '*' {
+            $$ = &ast.DoBlockStmt{}
             $$.SetLine($1.Pos.Line)
         } |
         T2Colon TIdent T2Colon {
@@ -278,9 +324,38 @@ var:
 namelist:
         TIdent {
             $$ = []string{$1.Str}
-        } | 
+        } |
         namelist ','  TIdent {
             $$ = append($1, $3.Str)
+        }
+
+/* U3a: the 5.5 attnamelist — an attribute may prefix the first name
+   (list-wide in stock's localstat: `local <const> a, b` makes both const)
+   or follow any name. The attribute text parses and is discarded; real
+   <const>/<close> semantics are U4. */
+attnamelist:
+        TIdent {
+            $$ = []string{$1.Str}
+        } |
+        TIdent attrib {
+            $$ = []string{$1.Str}
+        } |
+        attrib TIdent {
+            $$ = []string{$2.Str}
+        } |
+        attrib TIdent attrib {
+            $$ = []string{$2.Str}
+        } |
+        attnamelist ',' TIdent {
+            $$ = append($1, $3.Str)
+        } |
+        attnamelist ',' TIdent attrib {
+            $$ = append($1, $3.Str)
+        }
+
+attrib:
+        '<' TIdent '>' {
+            $$ = $2.Str
         }
 
 exprlist:
@@ -494,10 +569,18 @@ function:
 
 funcbody:
         '(' parlist ')' block TEnd {
+            // U3a: a named vararg param (5.5 `...t`) binds a placeholder
+            // local for the name so dead-branch bodies referencing it
+            // compile; the real vararg-table semantics are U5.
+            if name := $2.VArgName; name != "" {
+                la := &ast.LocalAssignStmt{Names: []string{name}, Exprs: []ast.Expr{&ast.TableExpr{Fields: []*ast.Field{}}}}
+                la.SetLine($1.Pos.Line)
+                $4 = append([]ast.Stmt{la}, $4...)
+            }
             $$ = &ast.FunctionExpr{ParList: $2, Stmts: $4}
             $$.SetLine($1.Pos.Line)
             $$.SetLastLine($5.Pos.Line)
-        } | 
+        } |
         '(' ')' block TEnd {
             $$ = &ast.FunctionExpr{ParList: &ast.ParList{HasVargs: false, Names: []string{}}, Stmts: $3}
             $$.SetLine($1.Pos.Line)
@@ -507,14 +590,22 @@ funcbody:
 parlist:
         T3Comma {
             $$ = &ast.ParList{HasVargs: true, Names: []string{}}
-        } | 
+        } |
+        T3Comma TIdent {
+            $$ = &ast.ParList{HasVargs: true, Names: []string{}, VArgName: $2.Str}
+        } |
         namelist {
           $$ = &ast.ParList{HasVargs: false, Names: []string{}}
           $$.Names = append($$.Names, $1...)
-        } | 
+        } |
         namelist ',' T3Comma {
           $$ = &ast.ParList{HasVargs: true, Names: []string{}}
           $$.Names = append($$.Names, $1...)
+        } |
+        namelist ',' T3Comma TIdent {
+          $$ = &ast.ParList{HasVargs: true, Names: []string{}}
+          $$.Names = append($$.Names, $1...)
+          $$.VArgName = $4.Str
         }
 
 

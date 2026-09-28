@@ -781,13 +781,41 @@ type Lexer struct {
 	PNewLine      bool
 	Token         ast.Token
 	PrevTokenType int
+	// pushed is a one-token pushback (the `global` contextual-keyword
+	// lookahead — U3a). Zero when empty.
+	pushed    ast.Token
+	hasPushed bool
 }
 
 func (lx *Lexer) Lex(lval *yySymType) int {
 	lx.PrevTokenType = lx.Token.Type
-	tok, err := lx.scanner.Scan(lx)
-	if err != nil {
-		panic(err)
+	var tok ast.Token
+	if lx.hasPushed {
+		tok = lx.pushed
+		lx.hasPushed = false
+	} else {
+		var err error
+		tok, err = lx.scanner.Scan(lx)
+		if err != nil {
+			panic(err)
+		}
+		// U3a: `global` is a contextual keyword (a full reserved word at
+		// U5). An identifier "global" followed by a token that can only
+		// continue a global DECLARATION — a name, `function`, `<` (an
+		// attribute), or `*` — tokenizes as TGlobal; anything else keeps
+		// it a plain identifier (`global = 1`, `global.f()`, `global, x
+		// = ...` still parse as expressions in 5.1-era corpora).
+		if tok.Type == TIdent && tok.Str == "global" {
+			next, err := lx.scanner.Scan(lx)
+			if err != nil {
+				panic(err)
+			}
+			lx.pushed, lx.hasPushed = next, true
+			switch {
+			case next.Type == TIdent, next.Type == TFunction, next.Str == "*", next.Str == "<":
+				tok.Type = TGlobal
+			}
+		}
 	}
 	if tok.Type < 0 {
 		// $end to goyacc — but still record the token so error paths
@@ -842,7 +870,7 @@ func (lx *Lexer) TokenError(tok ast.Token, message string) {
 }
 
 func Parse(reader io.Reader, name string) (chunk []ast.Stmt, err error) {
-	lexer := &Lexer{NewScanner(reader, name), nil, false, ast.Token{Str: ""}, TNil}
+	lexer := &Lexer{scanner: NewScanner(reader, name)}
 	chunk = nil
 	defer func() {
 		if e := recover(); e != nil {

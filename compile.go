@@ -584,16 +584,30 @@ func (fc *funcContext) ConstIndex(value LValue) int {
 	return v
 }
 
-// kStringIndex interns a string constant for a K-operand slot (8-bit):
-// the 5.5 encoding addresses shortstring keys through B/C fields, so an
-// over-pooled key is a compile error like stock's "constant table
-// overflow".
-func (fc *funcContext) kStringIndex(s string, line int) int {
+// kStringIndex interns a string constant for a K-operand slot (8-bit)
+// and reports whether the index fits the K range. The 5.5 encoding
+// addresses shortstring keys through B/C fields; an over-pooled key takes
+// stock's fallback (luaK_indexed/isKstr): the key (and, for upvalue
+// tables, the table itself) loads into a register and the access uses the
+// register-form opcode (GETTABLE/SETTABLE). U3a: the fork used to raise
+// "constant table overflow" here — stock never does; large main chunks
+// (official strings.lua/math.lua) need the fallback.
+func (fc *funcContext) kStringIndex(s string, line int) (int, bool) {
 	idx := fc.ConstIndex(LString(s))
-	if idx > opMaxIndexK {
-		raiseCompileError(fc, line, "constant table overflow")
+	return idx, idx <= opMaxIndexK
+}
+
+// loadStringK loads a string constant into a register (LOADK, or
+// LOADKX+EXTRAARG past the Bx range) — the K-overflow fallback's key
+// materializer.
+func loadStringK(fc *funcContext, reg int, s string, line int) {
+	cindex := fc.ConstIndex(LString(s))
+	if cindex <= opMaxArgBx {
+		fc.Code.AddABx(OP_LOADK, reg, cindex, line)
+	} else {
+		fc.Code.AddABx(OP_LOADKX, reg, 0, line)
+		fc.Code.AddAx(OP_EXTRAARG, cindex, line)
 	}
-	return idx
 }
 
 func (fc *funcContext) BlockLocalVarsCount() int {
@@ -918,8 +932,16 @@ func compileAssignStmtLeft(context *funcContext, stmt *ast.AssignStmt) (int, []*
 			ac := &assigncontext{ec: &expcontext{ecTable, regNotDefined, 0}, envLocalIdx: -1}
 			compileExprWithKMVPropagation(context, st.Object, &reg, &ac.ec.reg)
 			if str, ok := st.Key.(*ast.StringExpr); ok {
-				ac.keyMode = keyKStr
-				ac.keyData = context.kStringIndex(str.Value, sline(st))
+				if kidx, fits := context.kStringIndex(str.Value, sline(st)); fits {
+					ac.keyMode = keyKStr
+					ac.keyData = kidx
+				} else {
+					// K-overflow fallback: key into a register
+					ac.keyMode = keyReg
+					ac.keyReg = reg
+					loadStringK(context, reg, str.Value, sline(st))
+					reg++
+				}
 			} else if idx, ok := intKeyLiteral(st.Key); ok {
 				ac.keyMode = keyInt
 				ac.keyData = idx
@@ -1103,15 +1125,26 @@ func compileAssignStmt(context *funcContext, stmt *ast.AssignStmt) { // {{{
 			}
 		case ecGlobal:
 			name := ex.(*ast.IdentExpr).Value
-			kidx := context.kStringIndex(name, sline(ex))
+			kidx, fits := context.kStringIndex(name, sline(ex))
 			// the value lives in a register for global targets (only
 			// ecTable targets propagate their value into a K operand)
 			if acs[i].envLocalIdx > -1 {
 				// D3: _ENV shadowed by a local — the global write is a
 				// keyed table write on that register
-				code.AddABCk(OP_SETFIELD, acs[i].envLocalIdx, kidx, reg, 0, sline(ex))
-			} else {
+				if fits {
+					code.AddABCk(OP_SETFIELD, acs[i].envLocalIdx, kidx, reg, 0, sline(ex))
+				} else {
+					loadStringK(context, reg+1, name, sline(ex))
+					code.AddABCk(OP_SETTABLE, acs[i].envLocalIdx, reg+1, reg, 0, sline(ex))
+				}
+			} else if fits {
 				code.AddABCk(OP_SETTABUP, envUpvalueIndexOf(context), kidx, reg, 0, sline(ex))
+			} else {
+				// K-overflow fallback (stock luaK_indexed): the upvalue
+				// table and the key both go into registers
+				code.AddABC(OP_GETUPVAL, reg+2, envUpvalueIndexOf(context), 0, sline(ex))
+				loadStringK(context, reg+1, name, sline(ex))
+				code.AddABCk(OP_SETTABLE, reg+2, reg+1, reg, 0, sline(ex))
 			}
 			reg -= 1
 		case ecUpvalue:
@@ -1379,8 +1412,14 @@ func compileFuncDefStmt(context *funcContext, stmt *ast.FuncDefStmt) { // {{{
 		var treg int
 		compileExprWithKMVPropagation(context, stmt.Name.Receiver, &reg, &treg)
 		compileExpr(context, reg, stmt.Func, ecfuncdef)
-		kidx := context.kStringIndex(stmt.Name.Method, sline(stmt.Name.Receiver))
-		context.Code.AddABC(OP_SETFIELD, treg, kidx, reg, sline(stmt.Name.Receiver))
+		kidx, fits := context.kStringIndex(stmt.Name.Method, sline(stmt.Name.Receiver))
+		if fits {
+			context.Code.AddABC(OP_SETFIELD, treg, kidx, reg, sline(stmt.Name.Receiver))
+		} else {
+			// K-overflow fallback: key into a register, SETTABLE
+			loadStringK(context, reg+1, stmt.Name.Method, sline(stmt.Name.Receiver))
+			context.Code.AddABCk(OP_SETTABLE, treg, reg+1, reg, 0, sline(stmt.Name.Receiver))
+		}
 	} else {
 		astmt := &ast.AssignStmt{Lhs: []ast.Expr{stmt.Name.Func}, Rhs: []ast.Expr{stmt.Func}}
 		astmt.SetLine(sline(stmt.Func))
@@ -1541,12 +1580,24 @@ func compileExpr(context *funcContext, reg int, expr ast.Expr, ec *expcontext) i
 			// D3: a global reads a field of _ENV. With _ENV shadowed by
 			// a local, that is a plain keyed table read; otherwise it is
 			// a field of the frame function's _ENV upvalue cell
-			// (GETTABUP — same shape as stock).
-			kidx := context.kStringIndex(ex.Value, sline(ex))
+			// (GETTABUP — same shape as stock). A key past the 8-bit K
+			// range takes stock's fallback: key (and the upvalue table)
+			// into registers, GETTABLE.
+			kidx, fits := context.kStringIndex(ex.Value, sline(ex))
 			if envlocal, _ := envAccess(context); envlocal > -1 {
-				code.AddABC(OP_GETFIELD, sreg, envlocal, kidx, sline(ex))
-			} else {
+				if fits {
+					code.AddABC(OP_GETFIELD, sreg, envlocal, kidx, sline(ex))
+				} else {
+					loadStringK(context, reg, ex.Value, sline(ex))
+					code.AddABC(OP_GETTABLE, sreg, envlocal, reg, sline(ex))
+				}
+			} else if fits {
 				code.AddABC(OP_GETTABUP, sreg, envUpvalueIndexOf(context), kidx, sline(ex))
+			} else {
+				envreg := reg
+				code.AddABC(OP_GETUPVAL, envreg, envUpvalueIndexOf(context), 0, sline(ex))
+				loadStringK(context, envreg+1, ex.Value, sline(ex))
+				code.AddABC(OP_GETTABLE, sreg, envreg, envreg+1, sline(ex))
 			}
 		case ecUpvalue:
 			code.AddABC(OP_GETUPVAL, sreg, context.Upvalues.RegisterUnique(ex.Value), 0, sline(ex))
@@ -1570,8 +1621,15 @@ func compileExpr(context *funcContext, reg int, expr ast.Expr, ec *expcontext) i
 		b := reg
 		compileExprWithMVPropagation(context, ex.Object, &reg, &b)
 		if str, ok := ex.Key.(*ast.StringExpr); ok {
-			kidx := context.kStringIndex(str.Value, sline(ex))
-			code.AddABC(OP_GETFIELD, a, b, kidx, sline(ex))
+			kidx, fits := context.kStringIndex(str.Value, sline(ex))
+			if fits {
+				code.AddABC(OP_GETFIELD, a, b, kidx, sline(ex))
+			} else {
+				// K-overflow fallback (stock isKstr miss): key into a
+				// register, GETTABLE
+				loadStringK(context, reg, str.Value, sline(ex))
+				code.AddABC(OP_GETTABLE, a, b, reg, sline(ex))
+			}
 		} else if idx, ok := intKeyLiteral(ex.Key); ok {
 			code.AddABC(OP_GETI, a, b, idx, sline(ex))
 		} else {
@@ -1854,10 +1912,17 @@ func compileTableExpr(context *funcContext, reg int, ex *ast.TableExpr, ec *expc
 			line := sline(ex)
 			var vreg int
 			if str, ok := field.Key.(*ast.StringExpr); ok {
-				kidx := context.kStringIndex(str.Value, line)
+				kidx, fits := context.kStringIndex(str.Value, line)
 				compileExprWithKMVPropagation(context, field.Value, &reg, &vreg)
 				vk := boolInt(opIsK(vreg))
-				code.AddABCk(OP_SETFIELD, tablereg, kidx, opIndexOrReg(vreg), vk, line)
+				if fits {
+					code.AddABCk(OP_SETFIELD, tablereg, kidx, opIndexOrReg(vreg), vk, line)
+				} else {
+					// K-overflow fallback: key into a register, SETTABLE
+					loadStringK(context, reg, str.Value, line)
+					reg++
+					code.AddABCk(OP_SETTABLE, tablereg, reg-1, opIndexOrReg(vreg), vk, line)
+				}
 			} else {
 				b := reg
 				reg += compileExpr(context, reg, field.Key, ecnone(0))
