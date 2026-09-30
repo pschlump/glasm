@@ -6,3 +6,4 @@ cmd/luawasmc/luawasmc
 cmd/luawasm-run/luawasm-run
 ,*
 cmd/luafuzz/luafuzz
+parse/y.output
