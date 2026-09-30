@@ -2445,31 +2445,22 @@ func condJump(cf *callFrame, cond bool, k int) {
 	}
 }
 
-// leValues is the OP_LE comparison core (shared with the immediate
-// order family's LEI/GEI metamethod path).
+// leValues is the OP_LE comparison core, shared with the immediate order
+// family's LEI/GEI metamethod path — luaV_lessequal's shape (U4e): both
+// numbers, both strings, else the __le metamethod. The __le→!__lt mirror
+// (LUA_COMPAT_LT_LE, removed from stock in 5.4) is gone: only __le is
+// consulted, so a type with only __lt defined now order-errors on <=
+// exactly like stock 5.5.
 func leValues(L *LState, lhs, rhs LValue) bool {
 	if res, ok := numLE(lhs, rhs); ok {
 		return res
 	}
-	if isNumberValue(lhs) || isNumberValue(rhs) {
-		orderError(L, lhs, rhs)
-	}
-	if lhs.Type() != rhs.Type() {
-		orderError(L, lhs, rhs)
-	}
-	switch lhs.Type() {
-	case LTString:
-		return strCmp(string(lhs.(LString)), string(rhs.(LString))) <= 0
-	default:
-		switch objectRational(L, lhs, rhs, "__le") {
-		case 1:
-			return true
-		case 0:
-			return false
-		default:
-			return !objectRationalWithError(L, rhs, lhs, "__lt")
+	if ls, ok1 := lhs.(LString); ok1 {
+		if rs, ok2 := rhs.(LString); ok2 {
+			return strCmp(string(ls), string(rs)) <= 0
 		}
 	}
+	return objectRationalWithError(L, lhs, rhs, "__le")
 }
 
 // tmToArithOp maps an MMBIN C operand (a tag-method number) back to its
@@ -3880,26 +3871,24 @@ func orderError(L *LState, lhs, rhs LValue) {
 	}
 }
 
+// lessThan is luaV_lessthan (U4e restructure): both numbers compare
+// numerically, both strings lexically, and EVERYTHING else — mixed types
+// included — goes to the order metamethod (luaT_callorderTM's first-found
+// rule via objectRational); no metamethod → orderError. The old
+// mixed-type/number early orderError was a 5.1-ism (5.1's ttype(l) !=
+// ttype(r) guard): with user metatables, `5.0 > a` must reach a's __lt
+// (events.lua's capture battery), and a number operand no longer masks
+// the other side's metamethod.
 func lessThan(L *LState, lhs, rhs LValue) bool {
-	// optimization for numbers
 	if ret, ok := numLT(lhs, rhs); ok {
 		return ret
 	}
-	if isNumberValue(lhs) || isNumberValue(rhs) {
-		orderError(L, lhs, rhs)
+	if ls, ok1 := lhs.(LString); ok1 {
+		if rs, ok2 := rhs.(LString); ok2 {
+			return strCmp(string(ls), string(rs)) < 0
+		}
 	}
-	if lhs.Type() != rhs.Type() {
-		orderError(L, lhs, rhs)
-		return false
-	}
-	ret := false
-	switch lhs.Type() {
-	case LTString:
-		ret = strCmp(string(lhs.(LString)), string(rhs.(LString))) < 0
-	default:
-		ret = objectRationalWithError(L, lhs, rhs, "__lt")
-	}
-	return ret
+	return objectRationalWithError(L, lhs, rhs, "__lt")
 }
 
 func equals(L *LState, lhs, rhs LValue, raw bool) bool {

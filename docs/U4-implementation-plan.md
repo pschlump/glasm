@@ -358,6 +358,26 @@ re-port + searchpath, U4d error(nil)/os surface, U4e mirror removal, U4f seam en
   confirmed pre-existing at HEAD 8430230). Full gate battery green (root,
   U1/U2/U3, GluaFull, CLua55Conformance, U2fMatrix/Error oracles,
   WasmFullMatrix/ErrorSuite × wasmtime/wazero) — no baseline shifts.
-- U4e next — leValues/lessThan order-family restructure: drop the
-  mixed-type/number early orderError, strings primitive, else first-found
-  metamethod (objectRational already rewrites); events.lua to green.
+- **U4e DONE (2026-09-30, row 74)** — the order-family restructure +
+  events.lua green. lessThan/leValues = luaV_lessthan/luaV_lessequal:
+  numbers primitive, strings primitive, else first-found metamethod
+  (objectRational, row 73g); the mixed-type/number early orderError
+  (5.1's ttype guard) and the `__le`→`!__lt` mirror (LUA_COMPAT_LT_LE,
+  gone in 5.4) both die; opOrderI's metamethod arms route through the
+  same two functions. rawlen (luaB_rawlen, 5.2+) added. builtinMts keyed
+  by the BASIC type (`basicTypeIndex`: the integer/float pair shares the
+  number bucket — `debug.setmetatable(10, mt)` covers 3.45). PLUS a
+  latent compiler bug found on the way (events.lua's
+  `(a or 1) + (b or 2)` metamethod body): compileConstOperand popped a
+  TRAILING constant load as the operand's value, but an and/or operand
+  ends with the never-executed other arm's load behind a jump —
+  `5 + (23 or 2)` compiled to `23 + 2` (and a materialized operand
+  landed dead behind the residual jump). The pop is now gated on the
+  load being the expression's entire code. events.lua GREEN vs clua55;
+  full battery green, no baseline shifts (root, U1/U2/U3 gates,
+  GluaFull, CLua55Conformance, U2f oracles, WasmFullMatrix/ErrorSuite
+  ×wasmtime/wazero, full -short ./...). Official triage unchanged:
+  attrib:33 → U4g, errors:264 → U4g skip, coroutine:283 → row 22.
+- U4f next — wasm backend OP_TBC/OP_CLOSE lowering (the luawasm/emit.go
+  panic list), rt_tbc/rt_close ABI entries on the v4 blob, blob rebuild
+  + `go clean -testcache` + runtime/tests coverage.

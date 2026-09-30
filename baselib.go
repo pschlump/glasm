@@ -35,14 +35,16 @@ var baseFuncs = map[string]LGFunction{
 	"print":          basePrint,
 	"rawequal":       baseRawEqual,
 	"rawget":         baseRawGet,
-	"rawset":         baseRawSet,
-	"select":         baseSelect,
-	"_printregs":     base_PrintRegs,
-	"setmetatable":   baseSetMetatable,
-	"tonumber":       baseToNumber,
-	"tostring":       baseToString,
-	"type":           baseType,
-	"xpcall":         baseXPCall,
+	// U4e: rawlen (5.2+) — the length WITHOUT metamethods
+	"rawlen":       baseRawLen,
+	"rawset":       baseRawSet,
+	"select":       baseSelect,
+	"_printregs":   base_PrintRegs,
+	"setmetatable": baseSetMetatable,
+	"tonumber":     baseToNumber,
+	"tostring":     baseToString,
+	"type":         baseType,
+	"xpcall":       baseXPCall,
 	// U3h: warn (5.4) with the @on/@off control-message protocol; the
 	// default handler writes "Lua warning: <msg>" lines to stderr (not
 	// captured by the engines — unobservable in diffs, like the oracle).
@@ -368,6 +370,22 @@ func baseRawGet(L *LState) int {
 func baseRawSet(L *LState) int {
 	L.RawSet(L.CheckTable(1), L.CheckAny(2), L.CheckAny(3))
 	return 0
+}
+
+// baseRawLen ports luaB_rawlen (5.2+, U4e): the length WITHOUT
+// metamethods — a table's raw border or a string's byte length;
+// luaL_argexpected's "table or string expected" otherwise (a missing
+// argument reports "no value" via typeErrorStr's argPresent check).
+func baseRawLen(L *LState) int {
+	switch v := L.Get(1).(type) {
+	case *LTable:
+		L.Push(LInteger(v.Len()))
+	case LString:
+		L.Push(LInteger(len(v)))
+	default:
+		L.typeErrorStr(1, "table or string")
+	}
+	return 1
 }
 
 func baseSelect(L *LState) int {

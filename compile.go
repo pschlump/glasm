@@ -833,9 +833,17 @@ type opnd struct {
 // between arith operands and comparison operands, which may keep strings
 // for EQK).
 func compileConstOperand(fc *funcContext, expr ast.Expr, reg int, numericOnly bool) (opnd, int) {
+	startpc := fc.Code.LastPC()
 	compileExpr(fc, reg, expr, ecnone(0))
 	last := fc.Code.Last()
-	if opGetArgA(last) >= fc.RegTop() {
+	// The trailing load is attributable to the expression only when it is
+	// the expression's ENTIRE code (U4e): an and/or operand ends with the
+	// never-executed other arm's load behind a jump, and popping that
+	// steals the dead arm's value while the live arm stays in the
+	// register — `5 + (23 or 2)` compiled to `23 + 2` (events.lua's
+	// basic-type metatable battery). Multi-instruction code keeps the
+	// register form; the value is already where it belongs.
+	if fc.Code.LastPC() == startpc+1 && opGetArgA(last) >= fc.RegTop() {
 		switch opGetOpCode(last) {
 		case OP_LOADI:
 			fc.Code.Pop()

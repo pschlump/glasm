@@ -1021,7 +1021,7 @@ func (ls *LState) metatable(lvalue LValue, rawget bool) LValue {
 	case *LUserData:
 		metatable = obj.Metatable
 	default:
-		if table, ok := ls.G.builtinMts[int(obj.Type())]; ok {
+		if table, ok := ls.G.builtinMts[basicTypeIndex(obj)]; ok {
 			metatable = table
 		}
 	}
@@ -2191,7 +2191,19 @@ func (ls *LState) SetMetatable(obj LValue, mt LValue) {
 	case *LUserData:
 		v.Metatable = mt
 	default:
-		ls.G.builtinMts[int(obj.Type())] = mt
+		ls.G.builtinMts[basicTypeIndex(obj)] = mt
+	}
+}
+
+// basicTypeIndex keys a basic-type metatable by the LUA basic type, not
+// the fork's subtype tag: the integer/float pair is one number type
+// (U4e — debug.setmetatable(10, mt) must cover 3.45 too, and
+// getmetatable(3.0) must see a metatable set through 10).
+func basicTypeIndex(v LValue) int {
+	if t := v.Type(); t == LTInteger {
+		return int(LTNumber)
+	} else {
+		return int(t)
 	}
 }
 
