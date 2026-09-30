@@ -396,7 +396,9 @@ func TestCoroutineApi1(t *testing.T) {
 	st, err, values = L.Resume(co, fn)
 	errorIfNotEqual(t, ResumeError, st)
 	errorIfNil(t, err)
-	errorIfFalse(t, strings.Contains(err.Error(), "can not resume a dead thread"), "can not resume a dead thread")
+	// U4d re-pin: stock lua_resume texts ("cannot resume dead coroutine");
+	// the old fork text was gopherlua's
+	errorIfFalse(t, strings.Contains(err.Error(), "cannot resume dead coroutine"), "cannot resume dead coroutine")
 
 }
 

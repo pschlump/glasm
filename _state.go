@@ -919,6 +919,73 @@ func (ls *LState) closeTBC(level int) {
 	}
 }
 
+// closeSelfUnwind (U4d; stock luaD_throwbaselevel from lua_closethread's
+// running arm) is the panic a thread raises to close ITSELF: every pcall
+// level of that thread re-panics it (no recovery point may catch it) until
+// threadRun's recover terminates the thread — ok carries whether the
+// closes succeeded (false ⇒ errobj is the reported error object).
+type closeSelfUnwind struct {
+	errobj LValue
+	ok     bool
+}
+
+// closeErrorPath is the pcall-boundary tail (U4d): the stock nil-object
+// fix (luaG_errormsg replaces a nil crossing the boundary with the literal
+// "<no error object>" — AFTER any message handler ran, before the closes)
+// then the error-path tbc closes (luaD_pcall's luaD_closeprotected before
+// luaD_seterrorobj: the closes see the handler's result as errobj, and a
+// failing close replaces the reported object — last error wins).
+func (ls *LState) closeErrorPath(base int, errp *error) {
+	e, ok := (*errp).(*ApiError)
+	if !ok {
+		return
+	}
+	if e.Object == LNil {
+		e.Object = LString("<no error object>")
+	}
+	if obj, failed := ls.closeTBCProtected(base, e.Object); failed {
+		e.Object = obj
+	}
+}
+
+// closeTBCProtected is the error-path form of closeTBC (U4d; stock
+// luaD_closeprotected driving luaF_close's tbc loop): every entry >= level
+// closes with __close(obj, errobj) — the in-flight error object — under
+// per-close protection, and a failing close only REPLACES the in-flight
+// object; closing continues until the list is clean, so the LAST raised
+// error wins (stock's status replacement — there is no special "error in
+// __close" text). A nil errobj means no in-flight error: the calls take
+// the 1-argument normal-exit shape (coroutine.close / state close, where
+// stock maps YIELD to LUA_OK). Returns the final object and whether any
+// close raised.
+func (ls *LState) closeTBCProtected(level int, errobj LValue) (LValue, bool) {
+	failed := false
+	for ls.tbclist != nil && ls.tbclist.idx >= level {
+		e := ls.tbclist
+		ls.tbclist = e.prev
+		lv := ls.reg.Get(e.idx)
+		if LVIsFalse(lv) {
+			continue // defensive: false/nil never register
+		}
+		if op := ls.metaOp1(lv, "__close"); op.Type() == LTFunction {
+			ls.reg.Push(op)
+			ls.reg.Push(lv)
+			if errobj != LNil {
+				ls.reg.Push(errobj)
+			}
+			if perr := ls.PCall(1+boolInt(errobj != LNil), 0, nil); perr != nil {
+				failed = true
+				if ae, ok := perr.(*ApiError); ok {
+					errobj = ae.Object
+				} else {
+					errobj = LString(perr.Error())
+				}
+			}
+		}
+	}
+	return errobj, failed
+}
+
 func (ls *LState) findUpvalue(idx int) *Upvalue {
 	var prev *Upvalue
 	var next *Upvalue
@@ -1324,6 +1391,20 @@ func (ls *LState) IsClosed() bool {
 
 func (ls *LState) Close() {
 	atomic.AddInt32(&ls.stop, 1)
+	if ls.stack == nil {
+		return
+	}
+	// U4d (stock close_state): a full close runs the MAIN thread's
+	// Lua-level exits — upvalues first, then every tbc entry as a 1-arg
+	// __close(obj) (YIELD-mapped-to-OK shape; failures are swallowed like
+	// close_state's ignored closeprotected status). Suspended coroutines'
+	// entries are NOT closed here (each thread owns its list).
+	th := ls
+	if ls.G.MainThread != nil {
+		th = ls.G.MainThread
+	}
+	th.closeUpvalues(0)
+	th.closeTBCProtected(0, LNil)
 	for _, file := range ls.G.tempFiles {
 		// ignore errors in these operations
 		file.Close()
@@ -1686,7 +1767,10 @@ func (ls *LState) GetInfo(what string, dbg *Debug, fn LValue) (LValue, error) {
 			if dbg.frame != nil && dbg.frame.Parent == nil {
 				dbg.What = "main"
 			} else if f.IsG {
-				dbg.What = "G"
+				// U4d stock pin: builtin (Go) functions are C functions —
+				// getinfo().what is "C" (coroutine.lua:249 checks the
+				// __close caller's level; db.lua:38 pins it generally)
+				dbg.What = "C"
 			} else if dbg.frame != nil && dbg.frame.TailCall > 0 {
 				dbg.What = "tail"
 			} else {
@@ -1992,6 +2076,13 @@ func (ls *LState) PCall(nargs, nret int, errfunc *LFunction) (err error) {
 		ls.hasErrorFunc = false
 		rcv := recover()
 		if rcv != nil {
+			if _, isunwind := rcv.(*closeSelfUnwind); isunwind {
+				// U4d (stock luaD_throwbaselevel): a thread closing
+				// itself unwinds EVERY pcall level of that thread; no
+				// recovery point may catch it (threadRun's recover
+				// terminates the thread)
+				panic(rcv)
+			}
 			// close exactly the dying frames' upvalues (register index
 			// >= base — every frame the pcall pushed lives at or above
 			// it; surviving frames keep theirs open, matching C Lua's
@@ -2017,6 +2108,9 @@ func (ls *LState) PCall(nargs, nret int, errfunc *LFunction) (err error) {
 					ls.Panic = oldpanic
 					rcv := recover()
 					if rcv != nil {
+						if _, isunwind := rcv.(*closeSelfUnwind); isunwind {
+							panic(rcv) // base-level unwind: never caught here
+						}
 						// the errfunc itself panicked — its frames die too
 						ls.closeUpvalues(base)
 						if _, ok := rcv.(*ApiError); !ok {
@@ -2030,6 +2124,7 @@ func (ls *LState) PCall(nargs, nret int, errfunc *LFunction) (err error) {
 							err = rcv.(*ApiError)
 							err.(*ApiError).StackTrace = ls.stackTrace(0)
 						}
+						ls.closeErrorPath(base, &err)
 						ls.stack.SetSp(sp)
 						ls.currentFrame = ls.stack.Last()
 						ls.reg.SetTop(base)
@@ -2040,6 +2135,7 @@ func (ls *LState) PCall(nargs, nret int, errfunc *LFunction) (err error) {
 			} else if len(err.(*ApiError).StackTrace) == 0 {
 				err.(*ApiError).StackTrace = ls.stackTrace(0)
 			}
+			ls.closeErrorPath(base, &err)
 			ls.stack.SetSp(sp)
 			ls.currentFrame = ls.stack.Last()
 			ls.reg.SetTop(base)
@@ -2133,10 +2229,10 @@ func (ls *LState) Resume(th *LState, fn *LFunction, args ...LValue) (ResumeState
 	}
 
 	if ls.G.CurrentThread == th {
-		return ResumeError, newApiErrorS(ApiErrorRun, "can not resume a running thread"), nil
+		return ResumeError, newApiErrorS(ApiErrorRun, "cannot resume non-suspended coroutine"), nil
 	}
 	if th.Dead {
-		return ResumeError, newApiErrorS(ApiErrorRun, "can not resume a dead thread"), nil
+		return ResumeError, newApiErrorS(ApiErrorRun, "cannot resume dead coroutine"), nil
 	}
 	th.Parent = ls
 	ls.G.CurrentThread = th

@@ -119,10 +119,24 @@ func osExecute(L *LState) int {
 	return 3
 }
 
+// osExit ports stock os_exit (5.4's two-argument shape): a boolean first
+// argument maps true→0 / false→1, anything else is the exit status
+// (default 0); a truthy second argument runs a full state close (every
+// live main-thread tbc/upvalue close, U4d) before exiting.
 func osExit(L *LState) int {
-	L.Close()
-	os.Exit(L.OptInt(1, 0))
-	return 1
+	status := 0
+	if b, ok := L.Get(1).(LBool); ok {
+		if !bool(b) {
+			status = 1
+		}
+	} else {
+		status = L.OptInt(1, 0)
+	}
+	if !LVIsFalse(L.Get(2)) {
+		L.Close()
+	}
+	os.Exit(status)
+	return 0
 }
 
 // setDateFields mirrors stock loslib.c setallfields: the os.date("*t")

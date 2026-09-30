@@ -41,28 +41,55 @@ func coYield(L *LState) int {
 	return -1
 }
 
+// isResumeAncestor reports whether th is an ancestor of cur in the resume
+// chain (U4d; stock's L->ci != &L->base_ci structural check): a thread
+// blocked in threadRun waiting on a child it resumed is NORMAL, not
+// suspended — the chain from CurrentThread up through Parent links is
+// exactly that set (the main thread mid-run included).
+func isResumeAncestor(cur, th *LState) bool {
+	for p := cur.Parent; p != nil; p = p.Parent {
+		if p == th {
+			return true
+		}
+	}
+	return false
+}
+
+// resumeError reports a failed resume (U4d; stock resume_error): the
+// message is returned as false + msg through coroutine.resume, or raised
+// (with the caller's position, stock auxwrap's luaL_where(L,1)) through
+// a wrap.
+func resumeError(L *LState, th *LState, msg string) int {
+	if th.wrapped {
+		L.RaiseError("%s", msg)
+		return 0
+	}
+	L.Push(LFalse)
+	L.Push(LString(msg))
+	return 2
+}
+
 func coResume(L *LState) int {
 	th := L.CheckThread(1)
-	if L.G.CurrentThread == th {
-		msg := "can not resume a running thread"
-		if th.wrapped {
-			L.RaiseError("%s", msg)
-			return 0
-		}
-		L.Push(LFalse)
-		L.Push(LString(msg))
-		return 2
+	// U4d stock pin (lua_resume's guards, stock order): only a fresh or
+	// suspended coroutine resumes. A running one (CurrentThread) or a
+	// normal one (resume-chain ancestor) reports non-suspended; a
+	// finished/errored one reports dead; then the nesting ceiling. The
+	// old fork texts were gopherlua's ("can not resume a ... thread") —
+	// nothing live pins them (_glua-tests/coroutine.lua is row-22
+	// skipped), and without the normal guard, resuming a normal thread
+	// re-entered threadRun and recursed to a fatal Go stack overflow.
+	if L.G.CurrentThread == th || isResumeAncestor(L.G.CurrentThread, th) {
+		return resumeError(L, th, "cannot resume non-suspended coroutine")
 	}
 	if th.Dead {
-		msg := "can not resume a dead thread"
-		if th.wrapped {
-			L.RaiseError("%s", msg)
-			return 0
-		}
-		L.Push(LFalse)
-		L.Push(LString(msg))
-		return 2
+		return resumeError(L, th, "cannot resume dead coroutine")
 	}
+	if L.G.resumeDepth >= luaMaxCCalls {
+		return resumeError(L, th, "C stack overflow")
+	}
+	L.G.resumeDepth++
+	defer func() { L.G.resumeDepth-- }()
 	th.Parent = L
 	L.G.CurrentThread = th
 	if !th.isStarted() {
@@ -121,10 +148,13 @@ func coOptThread(L *LState) *LState {
 }
 
 // coClose ports luaB_close (5.4 coroutine.close, 5.5 no-arg extension):
-// dead or suspended coroutines reset — true, or false + the error
-// object the coroutine died with; a normal coroutine errors; the main
-// thread errors. (TBC variables in suspended coroutines get their
-// __close calls at U4; today no TBC exists.)
+// dead or suspended coroutines reset — true, or false + the error object
+// the coroutine died with (dead arm) / the failing __close raised
+// (suspended arm); a normal coroutine errors; the main thread errors.
+// U4d: both closing arms follow stock luaE_resetthread's order — resetCI
+// (kill) BEFORE the closes, so a nested coroutine.close(co) inside its own
+// __close sees the dead arm and returns true — and close with the 1-arg
+// __close(obj) shape (YIELD maps to LUA_OK; err == nil).
 func coClose(L *LState) int {
 	th := coOptThread(L)
 	switch L.Status(th) {
@@ -140,7 +170,12 @@ func coClose(L *LState) int {
 		L.Push(LTrue)
 		return 1
 	case "suspended":
-		th.kill()
+		th.kill() // resetCI first: nested closes see the dead arm
+		if obj, failed := th.closeTBCProtected(0, LNil); failed {
+			L.Push(LFalse)
+			L.Push(obj)
+			return 2
+		}
 		L.Push(LTrue)
 		return 1
 	case "normal":
@@ -149,10 +184,13 @@ func coClose(L *LState) int {
 		if th == L.G.MainThread {
 			L.RaiseError("cannot close main thread")
 		}
-		// stock terminates the running coroutine itself via
-		// luaD_throwbaselevel (it never returns); the closest fork shape
-		// until the U4 error-path work is the explicit error
-		L.RaiseError("cannot close a running coroutine")
+		// U4d (stock lua_closethread's self-close): reset (kill) first,
+		// run the thread's whole tbc list 1-arg, then unwind EVERY pcall
+		// level via the base-level panic — threadRun's closeSelfUnwind
+		// arm terminates the thread with the close outcome
+		th.kill()
+		obj, failed := th.closeTBCProtected(0, LNil)
+		panic(&closeSelfUnwind{errobj: obj, ok: !failed})
 	}
 	return 0
 }

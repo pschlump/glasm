@@ -328,5 +328,36 @@ re-port + searchpath, U4d error(nil)/os surface, U4e mirror removal, U4f seam en
   "scope of 'xuxu'" errmsg targets; the 5.4 "goto to correct label when
   nested" case is an error now — replaced with an errmsg; the official
   5.5 suite dropped it). tbc×goto/break probes byte-exact. All gates green.
-- U4d next — PCall recover closeTBCprotected, threadRun/coClose, error(nil),
-  os.exit(code, close).
+- **U4d done (row 73)** — error-path `__close` + coroutine lifecycle + the
+  errors.lua naming battery. coResume = stock lua_resume guards (running/
+  normal via the resume-chain Parent walk → "non-suspended"; dead; the
+  resumeDepth ceiling → "C stack overflow"); threadRun's recover fixes the
+  nil object to `<no error object>`, closes the dying thread's upvalues +
+  tbc list with the error object (2-arg `__close`, last-error-wins), records
+  deadErr; wrappedDeath makes a wrapped thread's corpse state + re-raise
+  match the official "bug in 5.4.1" block; coroutine.close() on the running
+  thread = kill-first + whole-list 1-arg closes + a base-level
+  closeSelfUnwind panic no pcall catches (nested self-close returns true;
+  os.exit after it unreachable); os.exit(code, close) runs L.Close()'s
+  main-thread Lua-level exits before os.Exit. Naming battery: a
+  present-but-not-callable metamethod is CALLED (guard `!= LNil`, unary/
+  len events pass the object twice) so the error reads "attempt to call a X
+  value (metamethod 'add')" via row 62's tmEventName; objectRational =
+  callbinTM first-found (the gopherlua m1==m2 guard dies; a real 5.1↔5.5
+  `__eq` divergence resolved toward 5.5, no corpus case hits the mismatch);
+  objTypeName = luaT_objtypename (`__name` overrides every error text; io's
+  "FILE*" metatable + io.input/io.output arg errors replace the "string or
+  file expedted" typo). Re-pins: state_test.go + _glua-tests/coroutine.lua
+  to the stock resume texts (+ the `%-` pattern escape). Verified: the
+  official close battery (coroutine.lua :142-233) byte-exact standalone;
+  errors.lua green except the light-udata block (:262-268, U4g skip —
+  debug.upvalueid + light userdata, sethook precedent); remaining official
+  failures attributed: events.lua:186 → U4e, attrib.lua:33 → U4g
+  (loadlib), coroutine.lua's pcall-vs-close/self-close/msgh sections →
+  row 22 (yield across the G seam; isyieldable-in-C is the same machinery;
+  confirmed pre-existing at HEAD 8430230). Full gate battery green (root,
+  U1/U2/U3, GluaFull, CLua55Conformance, U2fMatrix/Error oracles,
+  WasmFullMatrix/ErrorSuite × wasmtime/wazero) — no baseline shifts.
+- U4e next — leValues/lessThan order-family restructure: drop the
+  mixed-type/number early orderError, strings primitive, else first-found
+  metamethod (objectRational already rewrites); events.lua to green.

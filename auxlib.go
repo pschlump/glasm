@@ -133,7 +133,7 @@ func (ls *LState) CheckTypes(n int, typs ...LValueType) {
 	for _, typ := range typs {
 		buf = append(buf, typ.String())
 	}
-	ls.ArgError(n, strings.Join(buf, " or ")+" expected, got "+ls.Get(n).Type().String())
+	ls.ArgError(n, strings.Join(buf, " or ")+" expected, got "+ls.objTypeName(ls.Get(n)))
 }
 
 func (ls *LState) CheckOption(n int, options []string) int {
@@ -372,13 +372,19 @@ func (ls *LState) TypeError(n int, typ LValueType) {
 func (ls *LState) typeErrorStr(n int, tname string) {
 	actual := "no value"
 	if ls.argPresent(n) {
-		v := ls.Get(n)
-		actual = v.Type().String()
-		if name, ok := ls.GetMetaField(v, "__name").(LString); ok {
-			actual = string(name)
-		}
+		actual = ls.objTypeName(ls.Get(n))
 	}
 	ls.argError(n, tname+" expected, got "+actual)
+}
+
+// objTypeName — stock luaT_objtypename: the value's type name as error
+// messages render it, which a string __name metafield overrides (io's
+// "FILE*", a test's "My Type"); type() and the base names are unchanged.
+func (ls *LState) objTypeName(v LValue) string {
+	if name, ok := ls.GetMetaField(v, "__name").(LString); ok {
+		return string(name)
+	}
+	return v.Type().String()
 }
 
 /* }}} */

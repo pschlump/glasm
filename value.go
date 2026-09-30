@@ -214,10 +214,21 @@ type Global struct {
 	// coroutines, observationally identical.
 	randState rngState
 
+	// resumeDepth counts nested coroutine resumes (U4d). Stock bounds
+	// them with nCcalls >= LUAI_MAXCCALLS ("C stack overflow"); the fork
+	// has no C-call counter, so coResume tracks the resume chain depth
+	// here — without it, mutual resume recursion overflows the Go stack
+	// fatally (official coroutine.lua's "infinite recursion" block).
+	resumeDepth int
+
 	builtinMts map[int]LValue
 	tempFiles  []*os.File
 	gccount    int32
 }
+
+// luaMaxCCalls mirrors stock LUAI_MAXCCALLS (ldo.h): the nested C-call
+// ceiling, applied here to nested resumes.
+const luaMaxCCalls = 200
 
 type LState struct {
 	G       *Global

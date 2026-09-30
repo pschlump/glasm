@@ -181,6 +181,9 @@ func OpenIo(L *LState) int {
 	mod := L.RegisterModule(IoLibName, map[string]LGFunction{}).(*LTable)
 	mt := L.NewTypeMetatable(lFileClass)
 	mt.RawSetString("__index", mt)
+	// stock luaL_newmetatable(LUA_FILEHANDLE): the class metatable
+	// carries __name = "FILE*", which error texts render as the type
+	mt.RawSetString("__name", LString(lFileClass))
 	L.SetFuncs(mt, fileMethods)
 	mt.RawSetString("lines", L.NewClosure(fileLines, L.NewFunction(fileLinesIter)))
 
@@ -707,7 +710,9 @@ func ioInput(L *LState) int {
 		}
 
 	}
-	L.ArgError(1, "string or file expedted, but got "+L.Get(1).Type().String())
+	// stock g_iofile: a non-string, non-nil argument goes through
+	// tofile → luaL_checkudata(L, 1, "FILE*")
+	L.typeErrorStr(1, lFileClass)
 	return 0
 }
 
@@ -889,7 +894,9 @@ func ioOutput(L *LState) int {
 		}
 
 	}
-	L.ArgError(1, "string or file expedted, but got "+L.Get(1).Type().String())
+	// stock g_iofile: a non-string, non-nil argument goes through
+	// tofile → luaL_checkudata(L, 1, "FILE*")
+	L.typeErrorStr(1, lFileClass)
 	return 0
 }
 

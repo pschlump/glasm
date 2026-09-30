@@ -425,7 +425,7 @@ func (ls *LState) raiseCallError(fn LValue) {
 		}
 		extra = formatVarInfo(kind, name)
 	}
-	ls.RaiseError("attempt to call a %s value%s", fn.Type().String(), extra)
+	ls.RaiseError("attempt to call a %s value%s", ls.objTypeName(fn), extra)
 }
 
 /* }}} */

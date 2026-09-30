@@ -276,6 +276,21 @@ func callGFunction(L *LState, tailcall bool) bool {
 	return false
 }
 
+// wrappedDeath finishes a WRAPPED thread that died with error lv (U4d):
+// the error surfaces as a raise on the resumer, but the thread itself
+// must still die — Dead set, CurrentThread handed back to the resumer —
+// else a later resume of the corpse hits the running guard instead of
+// the dead one (stock's unrecoverable-error arm sets L->status; official
+// coroutine.lua's "bug in 5.4.1" block pins it).
+func wrappedDeath(L, parent *LState, lv LValue) {
+	L.deadErr = lv
+	L.Push(lv)
+	L.G.CurrentThread = parent
+	L.Parent = nil
+	L.kill()
+	parent.Panic(L)
+}
+
 func threadRun(L *LState) {
 	if L.stack.IsEmpty() {
 		return
@@ -283,17 +298,55 @@ func threadRun(L *LState) {
 
 	defer func() {
 		if rcv := recover(); rcv != nil {
+			if te, ok := rcv.(*closeSelfUnwind); ok {
+				// U4d (stock luaD_throwbaselevel + luaE_resetthread): the
+				// thread closed ITSELF — its closes already ran in coClose;
+				// terminate at the base level with the close outcome (clean
+				// or error), bypassing every intermediate recovery point
+				if te.ok {
+					L.SetTop(0)
+					if parent := L.Parent; parent != nil {
+						switchToParentThread(L, 0, false, true)
+					} else {
+						L.kill()
+					}
+				} else {
+					if parent := L.Parent; parent != nil {
+						if L.wrapped {
+							wrappedDeath(L, parent, te.errobj)
+						} else {
+							L.deadErr = te.errobj
+							L.SetTop(0)
+							L.Push(te.errobj)
+							switchToParentThread(L, 1, true, true)
+						}
+					} else {
+						L.deadErr = te.errobj
+						panic(rcv)
+					}
+				}
+				return
+			}
 			var lv LValue
 			if v, ok := rcv.(*ApiError); ok {
 				lv = v.Object
 			} else {
 				lv = LString(fmt.Sprint(rcv))
 			}
+			// U4d (stock luaE_resetthread): the nil-object fix, then the
+			// dying thread's upvalues and tbc close with the dying error
+			// object (2-arg __close) before it propagates
+			if lv == LNil {
+				lv = LString("<no error object>")
+			}
+			L.closeUpvalues(0)
+			if obj, failed := L.closeTBCProtected(0, lv); failed {
+				lv = obj
+			}
 			L.deadErr = lv // coroutine.close's false+err source (U3h)
 			if parent := L.Parent; parent != nil {
 				if L.wrapped {
-					L.Push(lv)
-					parent.Panic(L)
+					wrappedDeath(L, parent, lv)
 				} else {
 					L.SetTop(0)
 					L.Push(lv)
@@ -998,12 +1051,16 @@ func init() {
 				}
 			} else {
 				// U3c: the string metatable's __unm carries the coercion
-				// (row 58) — no VM-level string fast path remains
+				// (row 58) — no VM-level string fast path remains. U4d:
+				// stock luaT_trybinTM(v1, v1) calls whatever metamethod
+				// it found — a non-callable one surfaces as the call
+				// error "metamethod 'unm'" (errors.lua's naming battery)
 				op := L.metaOp1(unaryv, "__unm")
-				if op.Type() == LTFunction {
+				if op != LNil {
 					reg.Push(op)
 					reg.Push(unaryv)
-					L.Call(1, 1)
+					reg.Push(unaryv)
+					L.Call(2, 1)
 					// this section is inlined by go-inline
 					// source function is 'func (rg *registry) Set(regi int, vali LValue) ' in '_state.go'
 					{
@@ -1027,7 +1084,7 @@ func init() {
 				} else {
 					// luaG_opinterror picks the (non-number) operand —
 					// here and below, varinfo names its register (row 62)
-					L.RaiseError("attempt to perform arithmetic on a %s value%s", unaryv.Type().String(), regHint(cf, B).resolve(L))
+					L.RaiseError("attempt to perform arithmetic on a %s value%s", L.objTypeName(unaryv), regHint(cf, B).resolve(L))
 				}
 			}
 			return 0
@@ -1090,11 +1147,14 @@ func init() {
 					L.RaiseError("number%s has no integer representation", regHint(cf, B).resolve(L))
 				}
 			} else {
+				// U4d: stock luaT_trybinTM(v1, v1) — call whatever
+				// metamethod was found (see OP_UNM)
 				op := L.metaOp1(unaryv, "__bnot")
-				if op.Type() == LTFunction {
+				if op != LNil {
 					reg.Push(op)
 					reg.Push(unaryv)
-					L.Call(1, 1)
+					reg.Push(unaryv)
+					L.Call(2, 1)
 					// this section is inlined by go-inline
 					// source function is 'func (rg *registry) Set(regi int, vali LValue) ' in '_state.go'
 					{
@@ -1119,7 +1179,7 @@ func init() {
 					// no string coercion: the string metatable has no
 					// __bnot (stock stringmetamethods); luaG_opinterror
 					// names the operand's register (row 62)
-					L.RaiseError("attempt to perform bitwise operation on a %s value%s", unaryv.Type().String(), regHint(cf, B).resolve(L))
+					L.RaiseError("attempt to perform bitwise operation on a %s value%s", L.objTypeName(unaryv), regHint(cf, B).resolve(L))
 				}
 			}
 			return 0
@@ -1208,11 +1268,15 @@ func init() {
 					}
 				}
 			default:
+				// U4d: stock luaV_objlen calls the FIRST metamethod found
+				// with the object twice (luaT_callTMres(tm, rb, rb)) — a
+				// non-callable one surfaces as "metamethod 'len'"
 				op := L.metaOp1(lv, "__len")
-				if op.Type() == LTFunction {
+				if op != LNil {
 					reg.Push(op)
 					reg.Push(lv)
-					L.Call(1, 1)
+					reg.Push(lv)
+					L.Call(2, 1)
 					ret := reg.Pop()
 					// this section is inlined by go-inline
 					// source function is 'func (rg *registry) Set(regi int, vali LValue) ' in '_state.go'
@@ -1258,7 +1322,7 @@ func init() {
 					}
 				} else {
 					// luaG_typeerror(rb, "get length of") + varinfo (row 62)
-					L.RaiseError("attempt to get length of a %s value%s", lv.Type().String(), regHint(cf, B).resolve(L))
+					L.RaiseError("attempt to get length of a %s value%s", L.objTypeName(lv), regHint(cf, B).resolve(L))
 				}
 			}
 			return 0
@@ -3283,7 +3347,7 @@ func forNumber(L *LState, v LValue, what string) (LNumber, bool) {
 			return n, true
 		}
 	}
-	L.RaiseError("bad 'for' %s (number expected, got %s)", what, v.Type().String())
+	L.RaiseError("bad 'for' %s (number expected, got %s)", what, L.objTypeName(v))
 	return 0, false
 }
 
@@ -3318,7 +3382,7 @@ func forLimitInt(L *LState, init int64, lim LValue, step int64) (int64, bool) {
 	} else if num, ok := coerceStringNumber(lim); ok {
 		return forLimitInt(L, init, num, step)
 	} else {
-		L.RaiseError("bad 'for' limit (number expected, got %s)", lim.Type().String())
+		L.RaiseError("bad 'for' limit (number expected, got %s)", L.objTypeName(lim))
 	}
 	if step > 0 {
 		return p, init > p
@@ -3354,11 +3418,13 @@ func luaModulo(lhs, rhs LNumber) LNumber {
 // cannot see either).
 func objectArith(L *LState, opcode int, lhs, rhs LValue, reg1, reg2 int) LValue {
 	event := arithEvent(opcode)
-	op := L.metaOp2(lhs, rhs, event)
-	if _, ok := op.(*LFunction); ok {
+	if op := L.metaOp2(lhs, rhs, event); op != LNil {
 		// covers user metamethods AND the string metatable's arith
 		// metamethods (U3c, row 58) — string coercion lives there, not
-		// in the VM
+		// in the VM. U4d: stock luaT_trybinTM calls whatever metamethod
+		// it found — a non-callable one surfaces as the call error
+		// "metamethod '<ev>'" (errors.lua's call-naming battery), so the
+		// old *LFunction guard is gone
 		L.reg.Push(op)
 		L.reg.Push(lhs)
 		L.reg.Push(rhs)
@@ -3380,7 +3446,7 @@ func objectArith(L *LState, opcode int, lhs, rhs LValue, reg1, reg2 int) LValue 
 	if isNumberValue(lhs) {
 		bad, badreg = rhs, reg2
 	}
-	L.RaiseError("attempt to perform %s on a %s value%s", what, bad.Type().String(), frameRegVarinfo(L, badreg))
+	L.RaiseError("attempt to perform %s on a %s value%s", what, L.objTypeName(bad), frameRegVarinfo(L, badreg))
 
 	return LNil
 }
@@ -3630,8 +3696,11 @@ func stringConcat(L *LState, total, last int, cf *callFrame) LValue {
 	for i := last - 1; total > 0; {
 		lhs := L.reg.Get(i)
 		if !(LVCanConvToString(lhs) && LVCanConvToString(rhs)) {
+			// U4d: stock luaT_tryconcatTM calls whatever metamethod was
+			// found — a non-callable one surfaces as the call error
+			// "metamethod 'concat'"
 			op := L.metaOp2(lhs, rhs, "__concat")
-			if op.Type() == LTFunction {
+			if op != LNil {
 				L.reg.Push(op)
 				L.reg.Push(lhs)
 				L.reg.Push(rhs)
@@ -3651,7 +3720,7 @@ func stringConcat(L *LState, total, last int, cf *callFrame) LValue {
 				if cf != nil {
 					hint = protoVarinfo(L, cf, badreg-cf.LocalBase)
 				}
-				L.RaiseError("attempt to concatenate a %s value%s", bad.Type().String(), hint)
+				L.RaiseError("attempt to concatenate a %s value%s", L.objTypeName(bad), hint)
 				return LNil
 			}
 		} else {
@@ -3803,7 +3872,7 @@ func eqIntFloat(i int64, f float64) bool {
 // family compares, and NO position when the compare comes from a G
 // function via lua_compare (math.min("2", 1) raises bare).
 func orderError(L *LState, lhs, rhs LValue) {
-	t1, t2 := lhs.Type().String(), rhs.Type().String()
+	t1, t2 := L.objTypeName(lhs), L.objTypeName(rhs)
 	if t1 == t2 {
 		L.raiseErrorAt(0, "attempt to compare two %s values", t1)
 	} else {
@@ -3881,11 +3950,17 @@ func objectRationalWithError(L *LState, lhs, rhs LValue, event string) bool {
 	return false
 }
 
+// objectRational is the metamethod comparison core (stock callbinTM's
+// first-found rule, shared by luaT_callorderTM and luaV_equalobj's __eq
+// arm): the FIRST operand's metamethod, else the second's — called
+// whatever it is (a non-callable one surfaces as the call error
+// "metamethod '<ev>'", U4d) — with the boolean result mapped to 1/0;
+// -1 when neither operand has the event. The old fork guard required
+// the SAME function on both operands (a gopherlua artifact — stock 5.1
+// and 5.5 both call the first one found).
 func objectRational(L *LState, lhs, rhs LValue, event string) int {
-	m1 := L.metaOp1(lhs, event)
-	m2 := L.metaOp1(rhs, event)
-	if m1.Type() == LTFunction && m1 == m2 {
-		L.reg.Push(m1)
+	if op := L.metaOp2(lhs, rhs, event); op != LNil {
+		L.reg.Push(op)
 		L.reg.Push(lhs)
 		L.reg.Push(rhs)
 		L.Call(2, 1)
