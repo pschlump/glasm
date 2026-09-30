@@ -23,6 +23,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 )
 
@@ -50,6 +51,29 @@ type Result struct {
 	Engines []string            // engine order
 	Skipped bool
 	SkipWhy string
+	// hintless records which engines raise without the row-70 varinfo
+	// hints (the luawasm seam — see seamHintless). Diff consults it
+	// per pair: a leg involving a hintless engine compares messages
+	// with the hint suffix stripped (row 71); interp↔C-oracle legs
+	// compare hints byte-exact.
+	hintless map[string]bool
+}
+
+// seamHintless reports whether e is a luawasm-backend engine: its raises
+// go through the rt seam, whose compiled protos are CClosures over
+// host.wasm_dispatch — no C CallInfo carries the proto — so ldebug's
+// varinfo() answers "" and every runtime error arrives without stock's
+// " (local 'x')"-class suffixes (ledger row 71; the durable fix — the
+// backend precomputing findsetreg hints per raise site, a static string,
+// and passing them through the rt raise path — belongs to the row-60/61
+// seam family at U6). The interp and the C oracles DO emit the hints
+// (varinfo.go / stock ldebug.c), so only these engines are flagged.
+func seamHintless(e Engine) bool {
+	switch e.(type) {
+	case *WasmEngine, *WazeroEngine:
+		return true
+	}
+	return false
 }
 
 // LoadCorpus reads every *.lua file in dir (sorted) as cases.
@@ -100,9 +124,12 @@ func FilterSkips(cases []Case, skips map[string]string) ([]Case, []string) {
 func RunCorpus(cases []Case, engines []Engine) []Result {
 	results := make([]Result, 0, len(cases))
 	for _, c := range cases {
-		r := Result{Name: c.Name, Logs: map[string][]string{}}
+		r := Result{Name: c.Name, Logs: map[string][]string{}, hintless: map[string]bool{}}
 		for _, e := range engines {
 			r.Engines = append(r.Engines, e.Name())
+			if seamHintless(e) {
+				r.hintless[e.Name()] = true
+			}
 			log := e.Run(c)
 			if log == nil { // an engine paniced — keep the corpus running
 				log = []string{"ENGINE-PANIC\t" + e.Name()}
@@ -116,13 +143,16 @@ func RunCorpus(cases []Case, engines []Engine) []Result {
 
 // Diff compares a result across engines. It returns the first differing
 // engine pair and a human-readable description ("" when all agree).
+// Pairs that include a hintless (seam) engine compare error messages
+// with the varinfo hint suffix stripped — see DiffLogs.
 func (r Result) Diff() string {
 	if len(r.Engines) < 2 {
 		return ""
 	}
 	base := r.Engines[0]
 	for _, other := range r.Engines[1:] {
-		if d := DiffLogs(r.Logs[base], r.Logs[other]); d != "" {
+		seam := r.hintless[base] || r.hintless[other]
+		if d := DiffLogs(r.Logs[base], r.Logs[other], seam); d != "" {
 			return fmt.Sprintf("%s vs %s:\n%s", base, other, d)
 		}
 	}
@@ -134,9 +164,22 @@ func (r Result) Diff() string {
 // sets differ by construction (golua55 vs C Lua 5.1 — ledger row: the
 // globals surface aligns with the host module in M7); the differential
 // contract covers script-observable PRINT/ERROR/STDOUT events.
-func DiffLogs(a, b []string) string {
+//
+// seam (row 71): when true, at least one of the two engines raises
+// without the row-70 varinfo hints (the luawasm rt seam —
+// seamHintless), so the " (local 'x')"-class suffixes are stripped from
+// ERROR lines on BOTH sides before comparing. Oracle legs (interp ↔
+// clua/clua55) always pass false and compare hints byte-exact. Narrow
+// cost: a literal `error("... (local 'x')")` tail is masked on seam legs
+// only, and cases that PRINT a hint-bearing pcall message stay out of
+// the wasm corpora by discipline (they probe with substring finds, the
+// _u3 idiom) until the seam carries hints.
+func DiffLogs(a, b []string, seam ...bool) string {
 	a, b = dropGlobals(a), dropGlobals(b)
 	a, b = stripTracebacks(a), stripTracebacks(b)
+	if len(seam) > 0 && seam[0] {
+		a, b = stripVarinfoHints(a), stripVarinfoHints(b)
+	}
 	n := len(a)
 	if len(b) < n {
 		n = len(b)
@@ -150,6 +193,27 @@ func DiffLogs(a, b []string) string {
 		return diffAt(a, b, n)
 	}
 	return ""
+}
+
+// varinfoHintSuffix matches stock ldebug.c's varinfo suffix at the end of
+// an ERROR line's quoted message: " (local 'x')", " (global 'g')",
+// " (field 'f')", " (constant 'k')", " (upvalue 'u')", " (method 'm')".
+// Greedy .* spans quote-bearing constant names; the anchor keeps
+// non-matching messages untouched.
+var varinfoHintSuffix = regexp.MustCompile(` \((?:local|global|field|constant|upvalue|method) '.*'\)"$`)
+
+// stripVarinfoHints implements the row-71 seam exclusion: remove the
+// varinfo suffixes from ERROR lines (both sides of the leg — see
+// DiffLogs).
+func stripVarinfoHints(log []string) []string {
+	out := make([]string, 0, len(log))
+	for _, l := range log {
+		if strings.HasPrefix(l, "ERROR\t") {
+			l = varinfoHintSuffix.ReplaceAllString(l, `"`)
+		}
+		out = append(out, l)
+	}
+	return out
 }
 
 func diffAt(a, b []string, i int) string {

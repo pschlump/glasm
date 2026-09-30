@@ -288,5 +288,117 @@ func TestGenMatrixCorpus(t *testing.T) {
 	add("tco08", "local function g(...) return ... end\nlocal function f(...) return g(2, ...) end\nprint(f(1, 2, 3))\n")                                                                                          // const+varargs tailcall
 	add("tco09", "local mt = {__call = function(self, n) if n == 0 then return 'cd' end return self(n-1) end}\nlocal f = setmetatable({}, mt)\nprint(f(120))\n")                                                   // deep __call+tailcall chain (row 18 pin — fixed with row 31's call_body rebasing; 120 < RTW_MAX_DEPTH=150, whose depth divergence is row 20)
 
+	// ---- U3 stdlib grid (row 70): the 5.3/5.4/5.5 library surface on the
+	// wasm legs — engine-portable basics only (probe-verified interp↔wasm
+	// before landing). Discipline: error texts are asserted with substring
+	// finds (the _u3 idiom), never by printing hint-bearing pcall messages
+	// (the row-71 seam raises hint-less); no %p of live objects (Go
+	// pseudo-addresses vs C pointers); no pairs-order, io, or os surfaces.
+	// slm: math — the stock 5.5.1 surface + the xoshiro pin (row 64)
+	n = 0
+	for _, s := range []string{
+		"print(math.type(1), math.type(1.0), math.type('1'), math.type('x'))\n",
+		"print(math.tointeger(3.0), math.tointeger('7'), math.tointeger(3.5), math.tointeger('x'))\n",
+		"print(math.maxinteger, math.mininteger, math.ult(1, -1), math.ult(-1, 1))\n",
+		"print(math.floor(-3.5), math.ceil(-3.5), math.floor(2.5), math.ceil(2.5))\n",
+		"print(math.floor(2^53), math.floor(-2^53), math.abs(math.mininteger))\n",
+		"print(math.fmod(7, 3), math.fmod(-7, 3), math.fmod(7, -3))\n",
+		"print(math.fmod(7.5, 2), math.fmod(-7.5, 2), math.fmod(1e300, 1e-300))\n",
+		"print(math.modf(3.7))\nprint(math.modf(-3.7))\nprint(math.modf(5))\n",
+		"print(math.max(1, 2.5, 2), math.min(1, 0.5, 1))\n",
+		"print(math.atan(1), math.atan(1, 1), math.atan(-1, -1))\n",
+		"print(math.log(8, 2), math.log(100, 10), math.log(math.exp(1)))\n",
+		"print(math.frexp(3.5))\nprint(math.ldexp(0.875, 2))\n",
+	} {
+		add(fmt.Sprintf("slm%02d", n), s)
+		n++
+	}
+	add("slm20", "math.randomseed(42)\nprint(math.random(100), math.random(100), math.random())\n")
+	add("slm21", "math.randomseed(42)\nlocal a = math.random(100)\nmath.randomseed(42)\nprint(a == math.random(100))\n")
+	add("slm22", "math.randomseed(1007)\nprint(math.random(0))\n") // the math.lua anchor draw (row 64)
+	add("slm23", "local ok, e = pcall(math.random, 5, 2)\nprint(not ok and e:find(\"interval is empty\") ~= nil)\n")
+	// slt: table — move/create + the 5.2 pack/unpack (row 65)
+	n = 0
+	for _, s := range []string{
+		"local t = {1, 2, 3, 4, 5}\ntable.move(t, 1, 3, 3)\nprint(t[3], t[4], t[5])\n",
+		"local t = {1, 2, 3, 4, 5}\ntable.move(t, 2, 4, 1)\nprint(t[1], t[2], t[3], #t)\n",
+		"local d = table.move({1, 2, 3}, 1, 3, 1, {})\nprint(#d, d[1], d == table.move(d, 1, 3, 1, d))\n",
+		"local c = table.create(4, 0)\nprint(#c, c[1], c[4])\n",
+		"print(table.unpack({1, 2, 3}, 2, 3))\nprint(table.unpack({1, 2, 3}, 2))\n",
+		"print(table.pack(1, nil, 3).n, select('#', table.unpack(table.pack(1, nil, 3), 1, 3)))\n",
+		"print(table.concat({1, 2, 3}, '-', 2, 3), table.concat({}, '-'))\n",
+		"local t = setmetatable({}, {__index = function(_, k) return k * 10 end, __len = function() return 2 end})\nprint(t[1], #t)\n",
+	} {
+		add(fmt.Sprintf("slt%02d", n), s)
+		n++
+	}
+	// slu: utf8 (row 65)
+	n = 0
+	for _, s := range []string{
+		"local utf8 = require'utf8'\nprint(utf8.len(\"h\\xc3\\xa9llo\"), utf8.len(\"\\xe1\\x80\\x80\"))\n",
+		"local utf8 = require'utf8'\nprint(utf8.char(0x41, 0xE9, 0x10FFFF))\n",
+		"local utf8 = require'utf8'\nprint(utf8.codepoint(\"\\xc3\\xa9\", 1, -1))\n",
+		"local utf8 = require'utf8'\nprint(utf8.offset(\"h\\xc3\\xa9llo\", 3), utf8.offset(\"h\\xc3\\xa9llo\", -1), select('#', utf8.offset(\"h\\xc3\\xa9llo\", 2)))\n",
+		"local utf8 = require'utf8'\nfor p, c in utf8.codes(\"a\\xc3\\xa9\") do print(p, c) end\n",
+		"local utf8 = require'utf8'\nprint(utf8.charpattern == \"[\\0-\\127\\194-\\253][\\128-\\191]*\")\n",
+		"local utf8 = require'utf8'\nlocal ok, e = pcall(utf8.codepoint, \"\\xFF\")\nprint(ok, e:find(\"invalid UTF%-8 code\") ~= nil)\n",
+		"local utf8 = require'utf8'\nlocal ok, e = pcall(utf8.len, \"a\\xFFb\")\nprint(ok, e)\n", // fail → offending position
+	} {
+		add(fmt.Sprintf("slu%02d", n), s)
+		n++
+	}
+	// slp: string.pack family on the wasm32 size model (row 68)
+	n = 0
+	for _, s := range []string{
+		"print(string.packsize('h'), string.packsize('i'), string.packsize('l'), string.packsize('T'))\n",
+		"print(string.packsize('j'), string.packsize('f'), string.packsize('d'), string.packsize('n'))\n",
+		"print(string.unpack('i4', string.pack('i4', -2)))\n",
+		"print(string.unpack('<i2', '\\1\\0'), string.unpack('>i4', string.pack('>i4', 0x01020304)))\n",
+		"print(string.unpack('n', string.pack('n', 0.5)), string.unpack('d', string.pack('d', -0.25)))\n",
+		"print(string.unpack('z', 'abc\\0de'), string.unpack('s1', '\\3abc'))\n",
+		"print((string.pack('i4', 0x01020304):gsub('.', function(c) return string.format('%02x', c:byte()) end)))\n",
+		"print(string.unpack('i2i2', '\\1\\0\\2\\0'))\nprint(select('#', string.unpack('i2i2', '\\1\\0\\2\\0')))\n",
+		"print(string.packsize('!xXi16'), string.packsize('=i4i4'))\n",
+		"local s = string.pack('i4', 7)\nprint(string.unpack('i4', s, #s + 1 - 4))\n", // negative init position
+		"local ok, e = pcall(string.pack, 'i17', 1)\nprint(not ok and e:find(\"out of limits %[1,16%]\") ~= nil)\n",
+		"local ok, e = pcall(string.packsize, 'z')\nprint(not ok and e:find('variable%-length format') ~= nil)\n",
+	} {
+		add(fmt.Sprintf("slp%02d", n), s)
+		n++
+	}
+	// slf: string.format — the stock port (row 67)
+	n = 0
+	for _, s := range []string{
+		"print(string.format('%d %i %u', 42, -42, 42))\n",
+		"print(string.format('%x %X %o %#x %#o', 255, 255, 8, 255, 8))\n",
+		"print(string.format('%e %E', 1234.5, 1234.5))\n",
+		"print(string.format('%f %.2f %5.1f', 1.5, 1.5, 1.5))\n",
+		"print(string.format('%g %G %.3g', 0.0001, 0.0001, 12345))\n",
+		"print(string.format('%a %A %.3a', 0.5, 0.5, 0.5))\n",
+		"print(string.format('%g %g %g', math.huge, -math.huge, 0/0))\n",
+		"print(string.format('%q', 'a\\nb'), string.format('%q', 0/0) == '\"(0/0)\"')\n",
+		"print(string.format('%5.2s|%-5d|%+d| %d', 'abcdef', 42, 42, 42))\n",
+		"print(string.format('%c%c', 65, 66))\n",
+		"print(string.format('%%'))\nprint(string.format('%s %s', 1.0, 3))\n",
+		"local ok, e = pcall(string.format, '%10q', 'x')\nprint(not ok and e:find('cannot have modifiers') ~= nil)\n",
+		"local ok, e = pcall(string.format, '%y', 1)\nprint(not ok and e:find(\"invalid conversion '%%y' to 'format'\") ~= nil)\n",
+	} {
+		add(fmt.Sprintf("slf%02d", n), s)
+		n++
+	}
+	// sls: string-metatable arithmetic, the 5.4 coercion model (row 66)
+	n = 0
+	for _, s := range []string{
+		"print('7' // 2, '0x10' + 0, '2.5' + 0, '-13' % 5)\n",
+		"print(math.type('7' + 1), math.type('7.0' + 0))\n", // subtype preserved
+		"print(getmetatable('') == getmetatable('x'), getmetatable('').__index == string)\n",
+		"local ok, e = pcall(function() return '3' & 5 end)\nprint(ok, e:find('bitwise operation on a string value') ~= nil)\n",
+		"local ok, e = pcall(function() return ('x') + 1 end)\nprint(ok, e:find('arithmetic on a string value') ~= nil)\n",
+		"local ok, e = pcall(function() return -('x') end)\nprint(ok, e:find('arith on a string value') ~= nil)\n",
+	} {
+		add(fmt.Sprintf("sls%02d", n), s)
+		n++
+	}
+
 	t.Logf("wrote %d cases to %s", len(cases), dir)
 }

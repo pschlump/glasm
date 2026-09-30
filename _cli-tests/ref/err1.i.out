@@ -1,5 +1,5 @@
 before the crash
-false	./err1.lua:13: attempt to index a nil value
+false	./err1.lua:13: attempt to index a nil value (upvalue 't')
 false	./err1.lua:18: attempt to concatenate a nil value
 ./err1.lua:22: deliberate uncaught error
 stack traceback:

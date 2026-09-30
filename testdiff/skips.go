@@ -24,6 +24,39 @@ func CorpusSkips(dir string) map[string]string {
 	}
 }
 
+// CorpusSkipsFor: CorpusSkips plus the skips that apply only when the
+// engine set includes a hintless seam engine (row 71 — the wasm legs).
+func CorpusSkipsFor(dir string, engines []Engine) map[string]string {
+	skips := CorpusSkips(dir)
+	seam := false
+	for _, e := range engines {
+		if seamHintless(e) {
+			seam = true
+			break
+		}
+	}
+	if !seam {
+		return skips
+	}
+	merged := make(map[string]string, len(skips)+len(seamHintPrintSkips))
+	for k, v := range skips {
+		merged[k] = v
+	}
+	for k, v := range seamHintPrintSkips {
+		merged[k] = v
+	}
+	return merged
+}
+
+// seamHintPrintSkips: cases that PRINT a pcall-captured runtime error
+// whose message carries a row-70 varinfo hint. The hint rides a PRINT
+// line, beyond the row-71 ERROR-line seam strip, and the wasm seam
+// raises hint-less — so these skip on wasm-family legs only; the oracle
+// legs (interp ↔ clua55, both hint-bearing) run them in full.
+var seamHintPrintSkips = map[string]string{
+	"pc10.lua": "printed error message carries a varinfo hint on interp only — row 71 seam (U6)",
+}
+
 // gluaWasmSkips: _glua-tests cases with a ruled divergence (each cites
 // its row in docs/Lua-Wasm-Divergence-Ledger.md).
 var gluaWasmSkips = map[string]string{
@@ -34,10 +67,9 @@ var gluaWasmSkips = map[string]string{
 	"vm.lua":        "loadstring + gopher parser-error wording (register overflow) — row 24",
 	// U3b: math.lua un-skipped — re-pinned to the 5.5 surface (pow
 	// removed, stock arity text); row 25's math clause closes.
-	"strings.lua":   "library-error wording/behavior (string.dump unsupported in the fork) — row 25",
-	// U2e: the wasm engine is the stock-5.5 stdlib now; the interp keeps
-	// 5.1-era extras (D8's removal list re-pins with the corpora at U2f)
-	"table.lua": "table.maxn is a 5.1-era extra on interp, removed in 5.2+ — row 61 (re-pin at U2f)",
+	// U3d: table.lua un-skipped — the table lib is on the stock surface
+	// and the corpus case was re-pinned with it (no maxn/getn).
+	"strings.lua": "library-error wording/behavior (string.dump unsupported in the fork) — row 25",
 }
 
 // wasmTestsSkips: _wasm-tests cases with a ruled divergence (each cites
@@ -56,10 +88,9 @@ var wasmTestsSkips = map[string]string{
 	"var20.lua": "compat `arg` table not on the v4 blob until U6 — row 60",
 	// U2f: err00/err02 un-skipped — the interp's index/concat texts are
 	// re-pinned to stock, matching the blob.
-	// row 60(4) — the blob formats floats with stock %.14g; the interp
-	// prints Go-dialect shortest-float (D7 unification at U5)
-	"gnf00.lua": "float printing: stock %.14g on wasm, Go dialect on interp — row 60(4) / D7 (U5)",
-	"gnf01.lua": "float printing: stock %.14g on wasm, Go dialect on interp — row 60(4) / D7 (U5)",
+	// U3i (row 70d): gnf00/gnf01 un-skipped — the interp's number
+	// tostring is numberToStringStock (the stock %.14g-with-".0"
+	// spelling), matching the v4 blob; row 60(4)'s clause closes.
 	// row 10 — table.sort + deep __call/tailcall chains corrupt the
 	// return path (pre-existing M5d/M6 bucket)
 	"tsort01.lua": "sort comparator + __call chains corrupt the return path — row 10",

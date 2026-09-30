@@ -201,7 +201,7 @@ func TestToString(t *testing.T) {
 	L.Push(LNumber(10))
 	L.Push(LString("99.9"))
 	L.Push(L.NewTable())
-	errorIfNotEqual(t, "10", L.ToString(1))
+	errorIfNotEqual(t, "10.0", L.ToString(1))
 	errorIfNotEqual(t, "99.9", L.ToString(2))
 	errorIfNotEqual(t, "", L.ToString(3))
 }
@@ -273,7 +273,7 @@ func TestObjLen(t *testing.T) {
 func TestConcat(t *testing.T) {
 	L := NewState()
 	defer L.Close()
-	errorIfNotEqual(t, "a1c", L.Concat(LString("a"), LNumber(1), LString("c")))
+	errorIfNotEqual(t, "a1.0c", L.Concat(LString("a"), LNumber(1), LString("c")))
 }
 
 func TestPCall(t *testing.T) {

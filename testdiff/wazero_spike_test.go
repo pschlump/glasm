@@ -57,23 +57,25 @@ io.write("line two\n")`},
 		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
 			if tc.name == "pcall_core_raise" {
-				// U2e: the interp's index-error wording is still gopher
-				// dialect; the v4 blob speaks stock 5.5 ("attempt to
-				// index a nil value") — the wording re-pins with the
-				// corpora at U2f (row 56)
-				t.Skip("index error text is gopher dialect on interp — row 56 (re-pin at U2f)")
+				// U2e/U3i: the interp's index-error wording re-pinned to
+				// stock at U2f (row 56), but the message is PRINTED — the
+				// row-70 varinfo hint (" (local 't')") rides a PRINT line,
+				// where the row-71 seam strip cannot reach it (the wasm
+				// seam raises hint-less). Printed hint messages stay out
+				// of wasm legs until the seam carries hints.
+				t.Skip("printed error message carries a varinfo hint on interp only — row 71 seam (U6)")
 			}
 			c := Case{Name: tc.name + ".lua", Dir: ".", Source: []byte(tc.src)}
 			wazero := (&WazeroEngine{name: "wazero", SkipUnsupported: true}).Run(c)
 			if tc.name == "iowrite" {
 				wasmtime := (&WasmEngine{name: "wasm"}).Run(c)
-				if d := DiffLogs(wasmtime, wazero); d != "" {
+				if d := DiffLogs(wasmtime, wazero, true); d != "" {
 					t.Errorf("ENGINE PARITY DIFF wasmtime vs wazero: %s\n  wasmtime: %v\n  wazero: %v", d, wasmtime, wazero)
 				}
 				return
 			}
 			want := interp.Run(c)
-			if d := DiffLogs(want, wazero); d != "" {
+			if d := DiffLogs(want, wazero, true); d != "" {
 				t.Errorf("DIFF interp vs wazero: %s\n  interp: %v\n  wazero: %v", d, want, wazero)
 			}
 		})

@@ -43,6 +43,10 @@ var baseFuncs = map[string]LGFunction{
 	"tostring":       baseToString,
 	"type":           baseType,
 	"xpcall":         baseXPCall,
+	// U3h: warn (5.4) with the @on/@off control-message protocol; the
+	// default handler writes "Lua warning: <msg>" lines to stderr (not
+	// captured by the engines — unobservable in diffs, like the oracle).
+	"warn": baseWarn,
 	// loadlib
 	"require": loRequire,
 	// U1 (D8 hard cut): setfenv, getfenv, module, loadstring, unpack and
@@ -421,9 +425,10 @@ func baseSetMetatable(L *LState) int {
 }
 
 // str2intBase ports stock lbaselib.c b_str2int (tonumber with an explicit
-// base): skip spaces, optional sign, one or more alphanumerics interpreted
-// in the base, unsigned accumulate with wraparound, trailing spaces; the
-// caller must pass the whole string and requires at least one valid digit.
+// base): skip spaces, optional sign, then alphanumerics while they last
+// (letters are valued past 'F' — 'z' is a digit 25 for base 36); a digit
+// outside the base fails outright; trailing spaces; unsigned accumulate
+// with wraparound. The whole string must be consumed.
 func str2intBase(s string, base int) (int64, bool) {
 	neg := false
 	i := 0
@@ -435,9 +440,11 @@ func str2intBase(s string, base int) (int64, bool) {
 	} else if i < len(s) && s[i] == '+' {
 		i++
 	}
-	start := i
+	if i >= len(s) || !isAlnumByte(s[i]) {
+		return 0, false // no digit at all
+	}
 	var n uint64
-	for ; i < len(s); i++ {
+	for ; i < len(s) && isAlnumByte(s[i]); i++ {
 		c := s[i]
 		var d int
 		switch {
@@ -445,18 +452,13 @@ func str2intBase(s string, base int) (int64, bool) {
 			d = int(c - '0')
 		case 'a' <= c && c <= 'z':
 			d = int(c-'a') + 10
-		case 'A' <= c && c <= 'Z':
+		default: // 'A'..'Z'
 			d = int(c-'A') + 10
-		default:
-			return 0, false // isalnum only, per stock
 		}
 		if d >= base {
-			return 0, false
+			return 0, false // invalid numeral
 		}
 		n = n*uint64(base) + uint64(d)
-	}
-	if i == start {
-		return 0, false // no digit at all
 	}
 	for ; i < len(s) && strings.IndexByte(" \t\n\v\f\r", s[i]) >= 0; i++ {
 	}
@@ -468,6 +470,10 @@ func str2intBase(s string, base int) (int64, bool) {
 		v = -v
 	}
 	return v, true
+}
+
+func isAlnumByte(c byte) bool {
+	return '0' <= c && c <= '9' || 'a' <= c && c <= 'z' || 'A' <= c && c <= 'Z'
 }
 
 func baseToNumber(L *LState) int {
@@ -516,6 +522,48 @@ func baseToString(L *LState) int {
 func baseType(L *LState) int {
 	L.Push(LString(L.CheckAny(1).Type().String()))
 	return 1
+}
+
+// warnOn mirrors the default handler's state (lauxlib warnfon/warnfoff):
+// warnings print to stderr until an "@off" control message arrives.
+var warnOn = true
+
+// baseWarn ports luaB_warn: all arguments must be strings (checked
+// before emitting anything); every argument but the last continues the
+// message; a complete message starting with '@' is a control message
+// ("@on" re-enables, "@off" silences, others are swallowed).
+func baseWarn(L *LState) int {
+	n := L.GetTop()
+	if n == 0 {
+		L.CheckString(1)
+	}
+	msgs := make([]string, n)
+	for i := 1; i <= n; i++ {
+		msgs[i-1] = L.CheckString(i)
+	}
+	for i, m := range msgs {
+		last := i == len(msgs)-1
+		if last && len(m) > 0 && m[0] == '@' {
+			switch m {
+			case "@on":
+				warnOn = true
+			case "@off":
+				warnOn = false
+			}
+			continue
+		}
+		if warnOn {
+			if i == 0 {
+				fmt.Fprintf(os.Stderr, "Lua warning: %s", m)
+			} else {
+				fmt.Fprintf(os.Stderr, "%s", m)
+			}
+			if last {
+				fmt.Fprintln(os.Stderr)
+			}
+		}
+	}
+	return 0
 }
 
 // baseXPCall implements 5.2 xpcall(f, msgh [, ...]): the extra arguments

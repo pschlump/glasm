@@ -125,6 +125,20 @@ func osExit(L *LState) int {
 	return 1
 }
 
+// setDateFields mirrors stock loslib.c setallfields: the os.date("*t")
+// table fields as integers, with yday/wday resolved and isdst a boolean.
+func setDateFields(ret *LTable, t time.Time) {
+	ret.RawSetString("year", LInteger(t.Year()))
+	ret.RawSetString("month", LInteger(int(t.Month())))
+	ret.RawSetString("day", LInteger(t.Day()))
+	ret.RawSetString("hour", LInteger(t.Hour()))
+	ret.RawSetString("min", LInteger(t.Minute()))
+	ret.RawSetString("sec", LInteger(t.Second()))
+	ret.RawSetString("yday", LInteger(t.YearDay()))
+	ret.RawSetString("wday", LInteger(int(t.Weekday())+1))
+	ret.RawSetString("isdst", LBool(t.IsDST()))
+}
+
 func osDate(L *LState) int {
 	t := time.Now()
 	isUTC := false
@@ -142,17 +156,10 @@ func osDate(L *LState) int {
 			t = t.UTC()
 		}
 		if strings.HasPrefix(cfmt, "*t") {
+			// stock 5.5 setallfields: every field an integer (U3 tail),
+			// real yday/wday, isdst from the time value.
 			ret := L.NewTable()
-			ret.RawSetString("year", LNumber(t.Year()))
-			ret.RawSetString("month", LNumber(t.Month()))
-			ret.RawSetString("day", LNumber(t.Day()))
-			ret.RawSetString("hour", LNumber(t.Hour()))
-			ret.RawSetString("min", LNumber(t.Minute()))
-			ret.RawSetString("sec", LNumber(t.Second()))
-			ret.RawSetString("wday", LNumber(t.Weekday()+1))
-			// TODO yday & dst
-			ret.RawSetString("yday", LNumber(0))
-			ret.RawSetString("isdst", LFalse)
+			setDateFields(ret, t)
 			L.Push(ret)
 			return 1
 		}
@@ -215,11 +222,11 @@ func osSetEnv(L *LState) int {
 
 func osTime(L *LState) int {
 	if L.GetTop() == 0 {
-		L.Push(LNumber(time.Now().Unix()))
+		L.Push(LInteger(time.Now().Unix()))
 	} else {
 		lv := L.CheckAny(1)
 		if lv == LNil {
-			L.Push(LNumber(time.Now().Unix()))
+			L.Push(LInteger(time.Now().Unix()))
 		} else {
 			tbl, ok := lv.(*LTable)
 			if !ok {
@@ -232,12 +239,11 @@ func osTime(L *LState) int {
 			month := getIntField(L, tbl, "month", -1)
 			year := getIntField(L, tbl, "year", -1)
 			isdst := getBoolField(L, tbl, "isdst", false)
+			_ = isdst // stock lets isdst hint mktime; Go has no such hint
 			t := time.Date(year, time.Month(month), day, hour, min, sec, 0, time.Local)
-			// TODO dst
-			if false {
-				print(isdst)
-			}
-			L.Push(LNumber(t.Unix()))
+			// stock os.time normalizes the table (setallfields writeback)
+			setDateFields(tbl, t)
+			L.Push(LInteger(t.Unix()))
 		}
 	}
 	return 1

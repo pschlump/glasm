@@ -338,7 +338,7 @@ var opProps = []opProp{
 	/*74*/ opProp{"FORPREP", false, true, opArgModeN, opArgModeN, opModeABx},
 	/*75*/ opProp{"TFORPREP", false, false, opArgModeN, opArgModeN, opModeABx},
 	/*76*/ opProp{"TFORCALL", false, false, opArgModeN, opArgModeU, opModeABC},
-	/*77*/ opProp{"TFORLOOP", false, false, opArgModeN, opArgModeN, opModeABx},
+	/*77*/ opProp{"TFORLOOP", false, true, opArgModeN, opArgModeN, opModeABx},
 	/*78*/ opProp{"SETLIST", false, false, opArgModeU, opArgModeU, opModevABC},
 	/*79*/ opProp{"CLOSURE", false, true, opArgModeU, opArgModeN, opModeABx},
 	/*80*/ opProp{"VARARG", false, true, opArgModeU, opArgModeN, opModeABC},

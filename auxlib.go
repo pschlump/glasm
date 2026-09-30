@@ -547,17 +547,27 @@ func (ls *LState) DoString(source string) error {
 
 /* GopherLua original APIs {{{ */
 
-// ToStringMeta returns string representation of given LValue.
-// This method calls the `__tostring` meta method if defined.
+// ToStringMeta returns string representation of given LValue — the
+// luaL_tolstring port (U3h): __tostring's result must be a string (a
+// number converts, like lua_isstring); the default rendering for
+// tables/functions/etc. is "kind: 0x..." with kind from a string
+// __name metafield when present.
 func (ls *LState) ToStringMeta(lv LValue) LValue {
 	if fn, ok := ls.metaOp1(lv, "__tostring").(*LFunction); ok {
 		ls.Push(fn)
 		ls.Push(lv)
 		ls.Call(1, 1)
-		return ls.reg.Pop()
-	} else {
-		return LString(lv.String())
+		ret := ls.reg.Pop()
+		switch ret.(type) {
+		case LString, LNumber, LInteger:
+			return LString(LVAsString(ret))
+		}
+		ls.RaiseError("'__tostring' must return a string")
 	}
+	if name, ok := ls.GetMetaField(lv, "__name").(LString); ok {
+		return LString(fmt.Sprintf("%s: %p", string(name), lv))
+	}
+	return LString(lv.String())
 }
 
 // Set a module loader to the package.preload table.

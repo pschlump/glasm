@@ -199,6 +199,9 @@ func parseNumber(number string) (LValue, error) {
 	if isHex {
 		h := body[2:]
 		if strings.IndexAny(h, ".pP") >= 0 {
+			if !numeralHasMantissaDigit(h, true) {
+				return LNumber(0), fmt.Errorf("invalid number: %s", number)
+			}
 			if v, err := strconv.ParseFloat(normalizeNumeral(number), LNumberBit); err == nil || errors.Is(err, strconv.ErrRange) {
 				return LNumber(v), nil
 			}
@@ -228,6 +231,11 @@ func parseNumber(number string) (LValue, error) {
 		if v, err := strconv.ParseInt(number, 10, LNumberBit); err == nil {
 			return LInteger(v), nil
 		}
+		// the mantissa must carry a digit — "." / "-." / ".e1" are not
+		// numbers even after the trailing-dot fixup (strtod contract)
+		if !numeralHasMantissaDigit(body, false) {
+			return LNumber(0), fmt.Errorf("invalid number: %s", number)
+		}
 		// decimal integer overflow (2^63 and beyond): float, per 5.4+
 		if v, err := strconv.ParseFloat(normalizeNumeral(number), LNumberBit); err == nil || errors.Is(err, strconv.ErrRange) {
 			return LNumber(v), nil
@@ -249,18 +257,31 @@ func hexDigitValue(c byte) int {
 }
 
 // normalizeNumeral adapts Lua numeral syntax to Go's ParseFloat: a digit
-// after a trailing '.' ("3." → "3.0", "3.e5" → "3.0e5") and, for
-// dot-bearing hex numerals without a p-exponent, an explicit "p0"
+// after a '.' not followed by one ("3." → "3.0", "3.e5" → "3.0e5") and,
+// for dot-bearing hex numerals without a p-exponent, an explicit "p0"
 // ("0x8.8" → "0x8.8p0" — C strtod accepts the bare form, Go requires the
-// exponent). parse/lexer.go carries the same helper for lex-time
-// validation.
+// exponent). The digit test is base-aware ('e' is a hex digit but a
+// decimal exponent marker). parse/lexer.go carries the same helper for
+// lex-time validation.
 func normalizeNumeral(s string) string {
 	b := []byte(s)
-	for i := 0; i < len(b); i++ {
-		if b[i] == '.' && (i+1 == len(b) || !isHexNumeralDigit(b[i+1])) {
-			b = append(b, 0)
-			copy(b[i+2:], b[i+1:])
-			b[i+1] = '0'
+	j := 0
+	if j < len(b) && (b[j] == '-' || b[j] == '+') {
+		j++
+	}
+	hex := j+1 < len(b) && b[j] == '0' && (b[j+1] == 'x' || b[j+1] == 'X')
+	for i := j; i < len(b); i++ {
+		if b[i] == '.' {
+			next := byte(0) // the end counts as "no digit follows"
+			if i+1 < len(b) {
+				next = b[i+1]
+			}
+			if !(isHexNumeralDigit(next) && (hex || (next >= '0' && next <= '9'))) {
+				b = append(b, 0)
+				copy(b[i+2:], b[i+1:])
+				b[i+1] = '0'
+				i++ // skip the inserted zero
+			}
 		}
 	}
 	t := string(b)
@@ -276,6 +297,26 @@ func normalizeNumeral(s string) string {
 
 func isHexNumeralDigit(c byte) bool {
 	return '0' <= c && c <= '9' || 'a' <= c && c <= 'f' || 'A' <= c && c <= 'F'
+}
+
+// numeralHasMantissaDigit reports whether the numeral's mantissa carries
+// at least one digit — C's strtod contract: "." and "0x." are not numbers
+// no matter what the trailing-dot fixup manufactures (math.lua:411,
+// not tonumber'.').
+func numeralHasMantissaDigit(body string, hex bool) bool {
+	for i := 0; i < len(body); i++ {
+		c := body[i]
+		if isHexNumeralDigit(c) && (hex || (c >= '0' && c <= '9')) {
+			return true
+		}
+		if !hex && (c == 'e' || c == 'E') {
+			return false // exponent: the mantissa is complete
+		}
+		if hex && (c == 'p' || c == 'P') {
+			return false
+		}
+	}
+	return false
 }
 
 func popenArgs(arg string) (string, []string) {

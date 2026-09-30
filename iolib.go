@@ -320,127 +320,217 @@ func fileFlushAux(L *LState, file *lFile) int {
 	return 1
 }
 
+// readNumberFile ports liolib.c read_number: scan a maximal valid
+// numeral prefix (spaces, sign, hex, decimal point, exponent; the C
+// accepts both the locale decimal point and '.'), convert through the
+// full numeral grammar so the SUBTYPE is preserved ("3" → integer,
+// "3.5" → float); anything else fails to nil.
+func readNumberFile(L *LState, file *lFile) bool {
+	rd := file.reader
+	const maxLenNum = 200
+	var buff []byte
+	c := -1
+	// skip spaces
+	for {
+		b, err := rd.ReadByte()
+		if err != nil {
+			c = -1
+			break
+		}
+		if b == ' ' || b == '\t' || b == '\n' || b == '\v' || b == '\f' || b == '\r' {
+			continue
+		}
+		c = int(b)
+		break
+	}
+	nextc := func() bool {
+		if len(buff) >= maxLenNum {
+			return false
+		}
+		buff = append(buff, byte(c))
+		b, err := rd.ReadByte()
+		c = -1
+		if err == nil {
+			c = int(b)
+		}
+		return true
+	}
+	test2 := func(set string) bool {
+		if c == int(set[0]) || c == int(set[1]) {
+			return nextc()
+		}
+		return false
+	}
+	isDigit := func() bool { return c >= '0' && c <= '9' }
+	isXdigit := func() bool {
+		return isDigit() || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')
+	}
+	readdigits := func(hex bool) int {
+		count := 0
+		for (hex && isXdigit() || !hex && isDigit()) && nextc() {
+			count++
+		}
+		return count
+	}
+	count := 0
+	hex := false
+	test2("-+")
+	if test2("00") {
+		if test2("xX") {
+			hex = true
+		} else {
+			count = 1
+		}
+	}
+	count += readdigits(hex)
+	if test2("..") { // matches a single '.' (set of 2)
+		count += readdigits(hex)
+	}
+	if count > 0 && test2(func() string {
+		if hex {
+			return "pP"
+		}
+		return "eE"
+	}()) {
+		test2("-+")
+		readdigits(false)
+	}
+	// unread the look-ahead byte
+	if c >= 0 {
+		rd.UnreadByte()
+	}
+	if v, err := parseNumber(string(buff)); err == nil {
+		L.Push(v)
+		return true
+	}
+	L.Push(LNil)
+	return false
+}
+
+// fileReadAux ports g_read: each argument is one option — an integer
+// count (0 → EOF probe returning "" or nil), or a string option with an
+// optional '*' prefix: n (number, subtype-preserving) / l / L / a; no
+// arguments defaults to "l". Reading stops at the first failure.
 func fileReadAux(L *LState, file *lFile, idx int) int {
 	if n := fileIsReadable(L, file); n != 0 {
 		return n
 	}
 	errorIfFileIsClosed(L, file)
-	if L.GetTop() == idx-1 {
-		L.Push(LString("*l"))
-	}
-	var err error
-	top := L.GetTop()
-	for i := idx; i <= top; i++ {
-		switch lv := L.Get(i).(type) {
-		case LInteger:
-			size := int64(lv)
-			if size == 0 {
-				_, err = file.reader.ReadByte()
-				if err == io.EOF {
-					L.Push(LNil)
-					goto normalreturn
-				}
-				file.reader.UnreadByte()
-			}
-			var buf []byte
-			var iseof bool
-			buf, err, iseof = readBufioSize(file.reader, size)
-			if iseof {
-				L.Push(LNil)
-				goto normalreturn
-			}
-			if err != nil {
-				goto errreturn
-			}
-			L.Push(LString(string(buf)))
-		case LNumber:
-			size := int64(lv)
-			if size == 0 {
-				_, err = file.reader.ReadByte()
-				if err == io.EOF {
-					L.Push(LNil)
-					goto normalreturn
-				}
-				file.reader.UnreadByte()
-			}
-			var buf []byte
-			var iseof bool
-			buf, err, iseof = readBufioSize(file.reader, size)
-			if iseof {
-				L.Push(LNil)
-				goto normalreturn
-			}
-			if err != nil {
-				goto errreturn
-			}
-			L.Push(LString(string(buf)))
-		case LString:
-			options := L.CheckString(i)
-			if len(options) > 0 && options[0] != '*' {
-				L.ArgError(2, "invalid options:"+options)
-			}
-			for _, opt := range options[1:] {
-				switch opt {
-				case 'n':
-					var v LNumber
-					_, err = fmt.Fscanf(file.reader, LNumberScanFormat, &v)
-					if err == io.EOF {
-						L.Push(LNil)
-						goto normalreturn
-					}
-					if err != nil {
-						goto errreturn
-					}
-					L.Push(v)
-				case 'a':
-					var buf []byte
-					buf, err = io.ReadAll(file.reader)
-					if err == io.EOF {
-						L.Push(emptyLString)
-						goto normalreturn
-					}
-					if err != nil {
-						goto errreturn
-					}
-					L.Push(LString(string(buf)))
-				case 'l':
-					var buf []byte
-					var iseof bool
-					buf, err, iseof = readBufioLine(file.reader)
-					if iseof {
-						L.Push(LNil)
-						goto normalreturn
-					}
-					if err != nil {
-						goto errreturn
-					}
-					L.Push(LString(string(buf)))
-				case 'L': // 5.2: like l, but keeps the trailing newline
-					var buf []byte
-					var iseof bool
-					buf, _, iseof, err = readLineKeep(file.reader)
-					if iseof {
-						L.Push(LNil)
-						goto normalreturn
-					}
-					if err != nil {
-						goto errreturn
-					}
-					L.Push(LString(string(buf)))
-				default:
-					L.ArgError(2, "invalid options:"+string(opt))
-				}
-			}
+	base := L.GetTop()
+	if base == idx-1 { // no options: default "l"
+		buf, err, iseof := readBufioLine(file.reader)
+		if iseof {
+			L.Push(LNil)
+			return 1
 		}
+		if err != nil {
+			L.Push(LNil)
+			L.Push(LString(err.Error()))
+			L.Push(LNumber(1))
+			return 3
+		}
+		L.Push(LString(string(buf)))
+		return 1
 	}
-normalreturn:
-	return L.GetTop() - top
-
-errreturn:
-	L.Push(LNil)
-	L.Push(LString(err.Error()))
-	L.Push(LNumber(1)) // C-Lua compatibility: Original Lua pushes errno to the stack
-	return 3
+	nresults := 0
+	for i := idx; i <= base; i++ {
+		var success bool
+		switch lv := L.Get(i).(type) {
+		case LInteger, LNumber:
+			size := checkInteger(L, i)
+			if size == 0 {
+				// test_eof: "" iff not at EOF
+				if _, err := file.reader.ReadByte(); err != nil {
+					L.Push(LNil)
+					nresults++
+					return nresults
+				}
+				file.reader.UnreadByte()
+				L.Push(emptyLString)
+				success = true
+			} else {
+				var buf []byte
+				var iseof bool
+				var err error
+				buf, err, iseof = readBufioSize(file.reader, size)
+				if iseof || err == io.EOF {
+					L.Push(LNil)
+					nresults++
+					return nresults
+				}
+				if err != nil {
+					L.Push(LNil)
+					L.Push(LString(err.Error()))
+					L.Push(LNumber(1))
+					return nresults + 3
+				}
+				L.Push(LString(string(buf)))
+				success = true
+			}
+		case LString:
+			options := string(lv)
+			if len(options) > 0 && options[0] == '*' {
+				options = options[1:]
+			}
+			if len(options) == 0 {
+				L.ArgError(i, "invalid format")
+			}
+			switch options[0] {
+			case 'n':
+				success = readNumberFile(L, file)
+				if !success {
+					nresults++
+					return nresults
+				}
+			case 'l':
+				buf, err, iseof := readBufioLine(file.reader)
+				if iseof {
+					L.Push(LNil)
+					nresults++
+					return nresults
+				}
+				if err != nil && err != io.EOF {
+					L.Push(LNil)
+					L.Push(LString(err.Error()))
+					L.Push(LNumber(1))
+					return nresults + 3
+				}
+				L.Push(LString(string(buf)))
+				success = true
+			case 'L': // line with the end-of-line kept
+				buf, _, iseof, err := readLineKeep(file.reader)
+				if iseof {
+					L.Push(LNil)
+					nresults++
+					return nresults
+				}
+				if err != nil && err != io.EOF {
+					L.Push(LNil)
+					L.Push(LString(err.Error()))
+					L.Push(LNumber(1))
+					return nresults + 3
+				}
+				L.Push(LString(string(buf)))
+				success = true
+			case 'a':
+				buf, err := io.ReadAll(file.reader)
+				if err != nil && err != io.EOF {
+					L.Push(LNil)
+					L.Push(LString(err.Error()))
+					L.Push(LNumber(1))
+					return nresults + 3
+				}
+				L.Push(LString(string(buf)))
+				success = true // 'a' always succeeds
+			default:
+				L.ArgError(i, "invalid format")
+			}
+		default:
+			L.TypeError(i, LTString)
+		}
+		nresults++
+	}
+	return nresults
 }
 
 var fileSeekOptions = []string{"set", "cur", "end"}
@@ -510,23 +600,29 @@ func fileFlush(L *LState) int {
 	return fileFlushAux(L, checkFile(L))
 }
 
+// fileLinesIter: the shared 5.4 lines iterator. Upvalues: (1) iterbase,
+// (2) the file userdata, (3) format count, (4) toclose flag, (5..) the
+// saved read formats. Each call runs g_read over the formats; at EOF the
+// generator closes the file when it owns it.
 func fileLinesIter(L *LState) int {
-	var file *lFile
-	if ud, ok := L.Get(1).(*LUserData); ok {
-		file = ud.Value.(*lFile)
-	} else {
-		file = L.Get(UpvalueIndex(2)).(*LUserData).Value.(*lFile)
+	ud, _ := L.Get(UpvalueIndex(2)).(*LUserData)
+	file := ud.Value.(*lFile)
+	errorIfFileIsClosed(L, file)
+	nformats := int(L.ToInt64(UpvalueIndex(3)))
+	L.SetTop(1)
+	for i := 0; i < nformats; i++ {
+		L.Push(L.Get(UpvalueIndex(5 + i)))
 	}
-	buf, _, err := file.reader.ReadLine()
-	if err != nil {
-		if err == io.EOF {
-			L.Push(LNil)
-			return 1
-		}
-		L.RaiseError("%s", err.Error())
+	n := fileReadAux(L, file, 2)
+	if v := L.Get(L.GetTop() - n + 1); v != LNil && v.Type() != LTNil {
+		return n
 	}
-	L.Push(LString(string(buf)))
-	return 1
+	// EOF (first result nil): close if the generator owns the file
+	if LVAsBool(L.Get(UpvalueIndex(4))) {
+		L.SetTop(0)
+		fileCloseAux(L, file)
+	}
+	return 0
 }
 
 func fileLines(L *LState) int {
@@ -535,7 +631,12 @@ func fileLines(L *LState) int {
 	if n := fileIsReadable(L, file); n != 0 {
 		return 0
 	}
-	L.Push(L.NewClosure(fileLinesIter, L.Get(UpvalueIndex(1)), ud))
+	nformats := L.GetTop() - 1
+	upvalues := []LValue{L.Get(UpvalueIndex(1)), ud, LInteger(nformats), LFalse}
+	for i := 0; i < nformats; i++ {
+		upvalues = append(upvalues, L.Get(2+i))
+	}
+	L.Push(L.NewClosure(fileLinesIter, upvalues...))
 	return 1
 }
 
@@ -622,42 +723,44 @@ func ioFlush(L *LState) int {
 }
 
 func ioLinesIter(L *LState) int {
-	var file *lFile
-	toclose := false
-	if ud, ok := L.Get(1).(*LUserData); ok {
-		file = ud.Value.(*lFile)
-	} else {
-		file = L.Get(UpvalueIndex(2)).(*LUserData).Value.(*lFile)
-		toclose = true
-	}
-	buf, _, err := file.reader.ReadLine()
-	if err != nil {
-		if err == io.EOF {
-			if toclose {
-				fileCloseAux(L, file)
-			}
-			L.Push(LNil)
-			return 1
-		}
-		L.RaiseError("%s", err.Error())
-	}
-	L.Push(LString(string(buf)))
-	return 1
+	return fileLinesIter(L)
 }
 
+// ioLines ports 5.4 io.lines: with a filename it opens the file and
+// returns FOUR values (iterator, state, control, the file — the
+// to-be-closed variable of the generic for); with no argument (or the
+// default input) it returns just the iterator; the remaining arguments
+// are read formats forwarded to each iteration.
 func ioLines(L *LState) int {
-	if L.GetTop() == 0 {
-		L.Push(L.Get(UpvalueIndex(2)))
-		L.Push(fileDefIn(L))
-		return 2
+	var ud *LUserData
+	toclose := false
+	if v := L.Get(1); v == LNil || v.Type() == LTNil {
+		ud = fileDefIn(L)
+	} else {
+		path := L.CheckString(1)
+		file, err := newFile(L, nil, path, os.O_RDONLY, os.FileMode(0600), false, true)
+		if err != nil {
+			L.RaiseError("%s: No such file or directory", path)
+		}
+		ud = file
+		toclose = true
 	}
-
-	path := L.CheckString(1)
-	ud, err := newFile(L, nil, path, os.O_RDONLY, os.FileMode(0600), false, true)
-	if err != nil {
-		return 0
+	nformats := L.GetTop() - 1
+	if nformats < 0 {
+		nformats = 0
 	}
-	L.Push(L.NewClosure(ioLinesIter, L.Get(UpvalueIndex(1)), ud))
+	upvalues := []LValue{L.Get(UpvalueIndex(1)), ud, LInteger(nformats), LBool(toclose)}
+	for i := 0; i < nformats; i++ {
+		upvalues = append(upvalues, L.Get(2+i))
+	}
+	_ = nformats
+	L.Push(L.NewClosure(ioLinesIter, upvalues...))
+	if toclose {
+		L.Push(LNil) // state
+		L.Push(LNil) // control
+		L.Push(ud)   // the file as the to-be-closed variable
+		return 4
+	}
 	return 1
 }
 

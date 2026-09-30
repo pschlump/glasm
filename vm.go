@@ -219,6 +219,18 @@ func callGFunction(L *LState, tailcall bool) bool {
 		return true
 	}
 
+	if L.Parent != nil && L.stack.Sp() == 1 {
+		// a G function as a coroutine's base frame (e.g. the gmatch
+		// iterator resumed through coroutine.wrap — the Lua 5.3.2 bug
+		// block in strings.lua): the last frame returning routes its
+		// results back to the parent thread and finishes the thread,
+		// exactly like doReturn's last-frame path (the base frame's
+		// NRet is always MultRet, so the results are already staged
+		// contiguously at the register top for XMoveTo)
+		switchToParentThread(L, wantret, false, true)
+		return true
+	}
+
 	// this section is inlined by go-inline
 	// source function is 'func (rg *registry) CopyRange(regv, start, limit, n int) ' in '_state.go'
 	{
@@ -277,6 +289,7 @@ func threadRun(L *LState) {
 			} else {
 				lv = LString(fmt.Sprint(rcv))
 			}
+			L.deadErr = lv // coroutine.close's false+err source (U3h)
 			if parent := L.Parent; parent != nil {
 				if L.wrapped {
 					L.Push(lv)
@@ -619,7 +632,7 @@ func init() {
 			C := int(inst>>24) & 0xff //GETC
 			t := cf.Fn.Upvalues[B].Value()
 			k := cf.Fn.Proto.Constants[C]
-			v := L.getFieldString(t, string(k.(LString)))
+			v := L.getFieldString(t, string(k.(LString)), upvalHint(cf, B))
 			// this section is inlined by go-inline
 			// source function is 'func (rg *registry) Set(regi int, vali LValue) ' in '_state.go'
 			{
@@ -650,7 +663,7 @@ func init() {
 			RA := lbase + A
 			B := int(inst>>16) & 0xff //GETB
 			C := int(inst>>24) & 0xff //GETC
-			v := L.getField(reg.Get(lbase+B), reg.Get(lbase+C))
+			v := L.getField(reg.Get(lbase+B), reg.Get(lbase+C), regHint(cf, B))
 			// this section is inlined by go-inline
 			// source function is 'func (rg *registry) Set(regi int, vali LValue) ' in '_state.go'
 			{
@@ -681,7 +694,7 @@ func init() {
 			RA := lbase + A
 			B := int(inst>>16) & 0xff //GETB
 			C := int(inst>>24) & 0xff //GETC
-			v := L.getField(reg.Get(lbase+B), LInteger(C))
+			v := L.getField(reg.Get(lbase+B), LInteger(C), regHint(cf, B))
 			// this section is inlined by go-inline
 			// source function is 'func (rg *registry) Set(regi int, vali LValue) ' in '_state.go'
 			{
@@ -712,7 +725,7 @@ func init() {
 			RA := lbase + A
 			B := int(inst>>16) & 0xff //GETB
 			C := int(inst>>24) & 0xff //GETC
-			v := L.getFieldString(reg.Get(lbase+B), string(cf.Fn.Proto.Constants[C].(LString)))
+			v := L.getFieldString(reg.Get(lbase+B), string(cf.Fn.Proto.Constants[C].(LString)), regHint(cf, B))
 			// this section is inlined by go-inline
 			// source function is 'func (rg *registry) Set(regi int, vali LValue) ' in '_state.go'
 			{
@@ -751,7 +764,7 @@ func init() {
 			} else {
 				v = reg.Get(lbase + C)
 			}
-			L.setFieldString(t, key, v)
+			L.setFieldString(t, key, v, upvalHint(cf, A))
 			return 0
 		},
 		func(L *LState, inst uint32, baseframe *callFrame) int { //OP_SETTABLE
@@ -769,7 +782,7 @@ func init() {
 			} else {
 				v = reg.Get(lbase + C)
 			}
-			L.setField(reg.Get(RA), reg.Get(lbase+B), v)
+			L.setField(reg.Get(RA), reg.Get(lbase+B), v, regHint(cf, A))
 			return 0
 		},
 		func(L *LState, inst uint32, baseframe *callFrame) int { //OP_SETI
@@ -787,7 +800,7 @@ func init() {
 			} else {
 				v = reg.Get(lbase + C)
 			}
-			L.setField(reg.Get(RA), LInteger(B), v)
+			L.setField(reg.Get(RA), LInteger(B), v, regHint(cf, A))
 			return 0
 		},
 		func(L *LState, inst uint32, baseframe *callFrame) int { //OP_SETFIELD
@@ -806,7 +819,7 @@ func init() {
 			} else {
 				v = reg.Get(lbase + C)
 			}
-			L.setFieldString(reg.Get(RA), key, v)
+			L.setFieldString(reg.Get(RA), key, v, regHint(cf, A))
 			return 0
 		},
 		func(L *LState, inst uint32, baseframe *callFrame) int { //OP_NEWTABLE
@@ -862,7 +875,7 @@ func init() {
 			B := int(inst>>16) & 0xff //GETB
 			C := int(inst>>24) & 0xff //GETC
 			selfobj := reg.Get(lbase + B)
-			v := L.getFieldString(selfobj, string(cf.Fn.Proto.Constants[C].(LString)))
+			v := L.getFieldString(selfobj, string(cf.Fn.Proto.Constants[C].(LString)), regHint(cf, B))
 			// this section is inlined by go-inline
 			// source function is 'func (rg *registry) Set(regi int, vali LValue) ' in '_state.go'
 			{
@@ -984,6 +997,8 @@ func init() {
 					}
 				}
 			} else {
+				// U3c: the string metatable's __unm carries the coercion
+				// (row 58) — no VM-level string fast path remains
 				op := L.metaOp1(unaryv, "__unm")
 				if op.Type() == LTFunction {
 					reg.Push(op)
@@ -1009,57 +1024,10 @@ func init() {
 							rg.top = regi + 1
 						}
 					}
-				} else if num, ok1 := coerceStringNumber(unaryv); ok1 {
-					if iv, ok2 := num.(LInteger); ok2 {
-						// this section is inlined by go-inline
-						// source function is 'func (rg *registry) SetInteger(regi int, vali LInteger) ' in '_state.go'
-						{
-							rg := reg
-							regi := RA
-							vali := -iv
-							newSize := regi + 1
-							// this section is inlined by go-inline
-							// source function is 'func (rg *registry) checkSize(requiredSize int) ' in '_state.go'
-							{
-								requiredSize := newSize
-								if requiredSize > cap(rg.array) {
-									rg.resize(requiredSize)
-								}
-							}
-							rg.array[regi] = rg.alloc.LInteger2I(vali)
-							if regi >= rg.top {
-								rg.top = regi + 1
-							}
-						}
-					} else {
-						fv := num.(LNumber)
-						// this section is inlined by go-inline
-						// source function is 'func (rg *registry) SetNumber(regi int, vali LNumber) ' in '_state.go'
-						{
-							rg := reg
-							regi := RA
-							vali := -fv
-							newSize := regi + 1
-							// this section is inlined by go-inline
-							// source function is 'func (rg *registry) checkSize(requiredSize int) ' in '_state.go'
-							{
-								requiredSize := newSize
-								if requiredSize > cap(rg.array) {
-									rg.resize(requiredSize)
-								}
-							}
-							rg.array[regi] = rg.alloc.LNumber2I(vali)
-							if regi >= rg.top {
-								rg.top = regi + 1
-							}
-						}
-					}
 				} else {
-					if _, ok := unaryv.(LString); ok {
-						// U2f re-pin: the string mt's __unm text (see objectArith)
-						L.RaiseError("attempt to unm a 'string' with a 'string'")
-					}
-					L.RaiseError("attempt to perform arithmetic on a %s value", unaryv.Type().String())
+					// luaG_opinterror picks the (non-number) operand —
+					// here and below, varinfo names its register (row 62)
+					L.RaiseError("attempt to perform arithmetic on a %s value%s", unaryv.Type().String(), regHint(cf, B).resolve(L))
 				}
 			}
 			return 0
@@ -1118,7 +1086,8 @@ func init() {
 						}
 					}
 				} else {
-					L.RaiseError("number has no integer representation")
+					// luaG_tointerror over the operand (row 62)
+					L.RaiseError("number%s has no integer representation", regHint(cf, B).resolve(L))
 				}
 			} else {
 				op := L.metaOp1(unaryv, "__bnot")
@@ -1148,8 +1117,9 @@ func init() {
 					}
 				} else {
 					// no string coercion: the string metatable has no
-					// __bnot (stock stringmetamethods)
-					L.RaiseError("attempt to perform bitwise operation on a %s value", unaryv.Type().String())
+					// __bnot (stock stringmetamethods); luaG_opinterror
+					// names the operand's register (row 62)
+					L.RaiseError("attempt to perform bitwise operation on a %s value%s", unaryv.Type().String(), regHint(cf, B).resolve(L))
 				}
 			}
 			return 0
@@ -1287,7 +1257,8 @@ func init() {
 						}
 					}
 				} else {
-					L.RaiseError("attempt to get length of a %s value", lv.Type().String())
+					// luaG_typeerror(rb, "get length of") + varinfo (row 62)
+					L.RaiseError("attempt to get length of a %s value%s", lv.Type().String(), regHint(cf, B).resolve(L))
 				}
 			}
 			return 0
@@ -1299,7 +1270,7 @@ func init() {
 			A := int(inst>>7) & 0xff  //GETA
 			B := int(inst>>16) & 0xff //GETB
 			RA := lbase + A
-			v := stringConcat(L, B, RA+B-1)
+			v := stringConcat(L, B, RA+B-1, cf)
 			// this section is inlined by go-inline
 			// source function is 'func (rg *registry) Set(regi int, vali LValue) ' in '_state.go'
 			{
@@ -1455,7 +1426,7 @@ func init() {
 				}
 				if cf.Fn == nil {
 					// U2f re-pin: luaG_typeerror names the callee's type
-					ls.RaiseError("attempt to call a %s value", fn.Type().String())
+					ls.raiseCallError(fn)
 				}
 				if ls.stack.IsFull() {
 					ls.RaiseError("stack overflow")
@@ -1588,8 +1559,9 @@ func init() {
 				callable, meta = L.metaCall(lv)
 			}
 			if callable == nil {
-				// U2f re-pin: luaG_typeerror names the callee's type
-				L.RaiseError("attempt to call a %s value", lv.Type().String())
+				// U2f re-pin: luaG_typeerror names the callee's type;
+				// U3 row 62: luaG_callerror's call-site name or varinfo
+				L.raiseCallError(lv)
 			}
 			// this section is inlined by go-inline
 			// source function is 'func (ls *LState) closeUpvalues(idx int) ' in '_state.go'
@@ -2494,7 +2466,7 @@ func opArith(L *LState, inst uint32, baseframe *callFrame) int { //OP_ADD..OP_SH
 		}
 		cf.Pc++
 	} else if res == arithRaise {
-		L.RaiseError("%s", errText)
+		raiseArithError(L, errText, lhs, rhs, B, C)
 	}
 	return 0
 }
@@ -2625,7 +2597,8 @@ func opArithK(L *LState, inst uint32, baseframe *callFrame) int { //OP_ADDK..OP_
 		}
 		cf.Pc++
 	} else if res == arithRaise {
-		L.RaiseError("%s", errText)
+		// the constant operand carries no register (stock instack)
+		raiseArithError(L, errText, lhs, rhs, B, -1)
 	}
 	return 0
 }
@@ -2756,7 +2729,7 @@ func opMMBIN(L *LState, inst uint32, baseframe *callFrame) int { //OP_MMBIN
 	dest := lbase + opGetArgA(pi)
 	p1 := reg.Get(lbase + A)
 	p2 := reg.Get(lbase + B)
-	v := objectArith(L, tmToArithOp(C), p1, p2)
+	v := objectArith(L, tmToArithOp(C), p1, p2, A, B)
 	// this section is inlined by go-inline
 	// source function is 'func (rg *registry) Set(regi int, vali LValue) ' in '_state.go'
 	{
@@ -2792,10 +2765,12 @@ func opMMBINI(L *LState, inst uint32, baseframe *callFrame) int { //OP_MMBINI
 	dest := lbase + opGetArgA(pi)
 	p1 := reg.Get(lbase + A)
 	p2 := LValue(LInteger(int64(sC2int(B))))
-	if k != 0 { // flipped: the immediate was the first operand
+	r1, r2 := A, -1 // the immediate carries no register (stock instack)
+	if k != 0 {     // flipped: the immediate was the first operand
 		p1, p2 = p2, p1
+		r1, r2 = r2, r1
 	}
-	v := objectArith(L, tmToArithOp(C), p1, p2)
+	v := objectArith(L, tmToArithOp(C), p1, p2, r1, r2)
 	// this section is inlined by go-inline
 	// source function is 'func (rg *registry) Set(regi int, vali LValue) ' in '_state.go'
 	{
@@ -2831,10 +2806,12 @@ func opMMBINK(L *LState, inst uint32, baseframe *callFrame) int { //OP_MMBINK
 	dest := lbase + opGetArgA(pi)
 	p1 := reg.Get(lbase + A)
 	p2 := cf.Fn.Proto.Constants[B]
-	if k != 0 { // flipped: the constant was the first operand
+	r1, r2 := A, -1 // the constant carries no register (stock instack)
+	if k != 0 {     // flipped: the constant was the first operand
 		p1, p2 = p2, p1
+		r1, r2 = r2, r1
 	}
-	v := objectArith(L, tmToArithOp(C), p1, p2)
+	v := objectArith(L, tmToArithOp(C), p1, p2, r1, r2)
 	// this section is inlined by go-inline
 	// source function is 'func (rg *registry) Set(regi int, vali LValue) ' in '_state.go'
 	{
@@ -3357,69 +3334,56 @@ func luaModulo(lhs, rhs LNumber) LNumber {
 	return LNumber(v)
 }
 
-func objectArith(L *LState, opcode int, lhs, rhs LValue) LValue {
+// objectArith is the MMBIN-slot slow path (luaT_trybinTM); reg1/reg2
+// are the operands' frame-relative registers for the row-62 varinfo
+// hints (-1 for the MMBINI/MMBINK aux values, which stock's instack
+// cannot see either).
+func objectArith(L *LState, opcode int, lhs, rhs LValue, reg1, reg2 int) LValue {
 	event := arithEvent(opcode)
 	op := L.metaOp2(lhs, rhs, event)
 	if _, ok := op.(*LFunction); ok {
+		// covers user metamethods AND the string metatable's arith
+		// metamethods (U3c, row 58) — string coercion lives there, not
+		// in the VM
 		L.reg.Push(op)
 		L.reg.Push(lhs)
 		L.reg.Push(rhs)
 		L.Call(2, 1)
 		return L.reg.Pop()
 	}
-	// string→number coercion preserving the syntactic subtype, for the
-	// ARITHMETIC ops only — stock's string metatable carries __add…
-	// __unm but no bitwise metamethods (lstrlib.c stringmetamethods), so
-	// "3" & 5 is a type error, never a coercion. 5.5 routes the
-	// arithmetic coercion through the string metatable — U3 (row 58).
-	if !isBitwiseOp(opcode) {
-		if str, ok := lhs.(LString); ok {
-			if lnum, err := parseNumber(string(str)); err == nil {
-				lhs = lnum
-			}
-		}
-		if str, ok := rhs.(LString); ok {
-			if rnum, err := parseNumber(string(str)); err == nil {
-				rhs = rnum
-			}
-		}
-	}
 	if v, errText, res := arithCompute(opcode, lhs, rhs); res == arithDone {
 		return v
 	} else if res == arithRaise {
-		L.RaiseError("%s", errText)
+		raiseArithError(L, errText, lhs, rhs, reg1, reg2)
 	}
-	// stock luaT_trybinTM error shapes: a STRING operand failed its
-	// numeric coercion, so the string metatable's arith metamethod
-	// would have raised lstrlib's op-named text (U2f re-pin — the full
-	// string-mt dispatch is U3, row 58; the text lands now so interp ≡
-	// blob); anything else is luaG_opinterror (picks the non-number
-	// operand; both non-numbers reports the first)
-	if !isBitwiseOp(opcode) {
-		if _, ok := lhs.(LString); ok {
-			L.RaiseError("attempt to %s a '%s' with a '%s'", arithOpName(opcode), lhs.Type().String(), rhs.Type().String())
-		}
-		if _, ok := rhs.(LString); ok {
-			L.RaiseError("attempt to %s a '%s' with a '%s'", arithOpName(opcode), lhs.Type().String(), rhs.Type().String())
-		}
-	}
+	// stock luaT_trybinTM failure: luaG_opinterror picks the non-number
+	// operand (both non-numbers reports the first) — varinfo names it
 	what := "arithmetic"
 	if isBitwiseOp(opcode) {
 		what = "bitwise operation"
 	}
-	bad := lhs
+	bad, badreg := lhs, reg1
 	if isNumberValue(lhs) {
-		bad = rhs
+		bad, badreg = rhs, reg2
 	}
-	L.RaiseError("attempt to perform %s on a %s value", what, bad.Type().String())
+	L.RaiseError("attempt to perform %s on a %s value%s", what, bad.Type().String(), frameRegVarinfo(L, badreg))
 
 	return LNil
 }
 
-// arithOpName: lstrlib's opname — the metamethod name without its "__"
-// prefix (add sub mul mod pow div idiv …).
-func arithOpName(opcode int) string {
-	return strings.TrimPrefix(arithEvent(opcode), "__")
+// raiseArithError: the numeric arithRaise texts. luaG_tointerror
+// ("number has no integer representation") appends the varinfo of the
+// operand without an exact integer value (p1 unless it converts); the
+// divide-by-zero / 'n%%0' texts are bare luaG_runerror raises.
+func raiseArithError(L *LState, errText string, lhs, rhs LValue, reg1, reg2 int) {
+	if errText == "number has no integer representation" {
+		badreg := reg2
+		if _, ok := toIntBitwise(lhs); !ok {
+			badreg = reg1
+		}
+		L.RaiseError("number%s has no integer representation", frameRegVarinfo(L, badreg))
+	}
+	L.RaiseError("%s", errText)
 }
 
 // arithEvent maps an arith opcode to its metamethod name.
@@ -3483,6 +3447,13 @@ func arithCompute(opcode int, lhs, rhs LValue) (v LValue, err string, res arithO
 	lNum := liOK || lfOK
 	rNum := riOK || rfOK
 	switch opcode {
+	case OP_UNM: // luaO_arith's unary case (both slots hold the operand)
+		if lNum && rNum {
+			if liOK {
+				return LInteger(-int64(li)), "", arithDone
+			}
+			return LNumber(-float64(lf)), "", arithDone
+		}
 	case OP_DIV, OP_POW: // float-only ops (int operands promote)
 		if lNum && rNum {
 			return LNumber(floatArith(opcode, asFloat(li, lf, liOK), asFloat(ri, rf, riOK))), "", arithDone
@@ -3636,7 +3607,10 @@ func bitwiseInt(op int, x, y int64) int64 {
 	panic("should not reach here")
 }
 
-func stringConcat(L *LState, total, last int) LValue {
+// stringConcat is the OP_CONCAT core (luaV_concat); cf names the
+// frame for the row-62 varinfo hint (nil from host-API Concat, where
+// stock's varinfo sees a C frame and yields no name).
+func stringConcat(L *LState, total, last int, cf *callFrame) LValue {
 	rhs := L.reg.Get(last)
 	total--
 	for i := last - 1; total > 0; {
@@ -3654,12 +3628,16 @@ func stringConcat(L *LState, total, last int) LValue {
 			} else {
 				// U2f re-pin: luaG_concaterror — if the first operand is
 				// string/number-convertible the second is the offender,
-				// else the first is
-				bad := lhs
+				// else the first is (U3 row 62: varinfo names it)
+				bad, badreg := lhs, i
 				if LVCanConvToString(lhs) {
-					bad = rhs
+					bad, badreg = rhs, last
 				}
-				L.RaiseError("attempt to concatenate a %s value", bad.Type().String())
+				hint := ""
+				if cf != nil {
+					hint = protoVarinfo(L, cf, badreg-cf.LocalBase)
+				}
+				L.RaiseError("attempt to concatenate a %s value%s", bad.Type().String(), hint)
 				return LNil
 			}
 		} else {
@@ -3806,13 +3784,16 @@ func eqIntFloat(i int64, f float64) bool {
 }
 
 // orderError is luaG_ordererror (U2f re-pin): same types name them
-// twice, mixed types name each once.
+// twice, mixed types name each once. luaG_runerror semantics (U3b):
+// position from the CURRENT frame — the running Lua frame for OP_LT-
+// family compares, and NO position when the compare comes from a G
+// function via lua_compare (math.min("2", 1) raises bare).
 func orderError(L *LState, lhs, rhs LValue) {
 	t1, t2 := lhs.Type().String(), rhs.Type().String()
 	if t1 == t2 {
-		L.RaiseError("attempt to compare two %s values", t1)
+		L.raiseErrorAt(0, "attempt to compare two %s values", t1)
 	} else {
-		L.RaiseError("attempt to compare %s with %s", t1, t2)
+		L.raiseErrorAt(0, "attempt to compare %s with %s", t1, t2)
 	}
 }
 

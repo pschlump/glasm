@@ -266,6 +266,9 @@ func numeralOK(s string) bool {
 	if isHex {
 		body := s[2:]
 		if strings.IndexAny(body, ".pP") >= 0 {
+			if !hasMantissaDigit(body, true) {
+				return false // "0x." and friends: no digit at all
+			}
 			_, err := strconv.ParseFloat(normalizeNumeral(s), 64)
 			return err == nil || errors.Is(err, strconv.ErrRange)
 		}
@@ -281,6 +284,9 @@ func numeralOK(s string) bool {
 		return true
 	}
 	if strings.IndexAny(s, ".eE") >= 0 {
+		if !hasMantissaDigit(s, false) {
+			return false // ".e5" and friends: no digit at all
+		}
 		_, err := strconv.ParseFloat(normalizeNumeral(s), 64)
 		// out-of-range floats are valid numerals with value ±Inf
 		// (math.lua: 10e500 == math.huge)
@@ -294,17 +300,46 @@ func numeralOK(s string) bool {
 	return err == nil || errors.Is(err, strconv.ErrRange)
 }
 
+// hasMantissaDigit is the strtod contract — at least one digit before the
+// exponent ('p' for hex, 'e' for decimal; 'e' is a hex digit, not a hex
+// exponent). utils.go carries the same rule as numeralHasMantissaDigit.
+func hasMantissaDigit(body string, hex bool) bool {
+	for i := 0; i < len(body); i++ {
+		c := body[i]
+		if isHexDigit(c) && (hex || (c >= '0' && c <= '9')) {
+			return true
+		}
+		if !hex && (c == 'e' || c == 'E') {
+			return false
+		}
+		if hex && (c == 'p' || c == 'P') {
+			return false
+		}
+	}
+	return false
+}
+
 // normalizeNumeral adapts Lua numeral syntax to Go's ParseFloat: digits
 // after a trailing '.' ("3." → "3.0"), and a p-exponent on dot-bearing hex
-// numerals ("0x8.8" → "0x8.8p0"). Only forms the scanner can produce are
-// handled. utils.go's parseNumber carries the same normalizations.
+// numerals ("0x8.8" → "0x8.8p0"). The digit test is base-aware ('e' is a
+// hex digit but a decimal exponent marker). Only forms the scanner can
+// produce are handled. utils.go's parseNumber carries the same
+// normalizations.
 func normalizeNumeral(s string) string {
 	b := []byte(s)
+	hex := len(s) > 2 && s[0] == '0' && (s[1] == 'x' || s[1] == 'X')
 	for i := 0; i < len(b); i++ {
-		if b[i] == '.' && (i+1 == len(b) || !isHexDigit(b[i+1])) {
-			b = append(b, 0)
-			copy(b[i+2:], b[i+1:])
-			b[i+1] = '0'
+		if b[i] == '.' {
+			next := byte(0) // the end counts as "no digit follows"
+			if i+1 < len(b) {
+				next = b[i+1]
+			}
+			if !(isHexDigit(next) && (hex || (next >= '0' && next <= '9'))) {
+				b = append(b, 0)
+				copy(b[i+2:], b[i+1:])
+				b[i+1] = '0'
+				i++ // skip the inserted zero
+			}
 		}
 	}
 	t := string(b)

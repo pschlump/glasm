@@ -76,8 +76,9 @@ Effort estimate: 2–5 person-weeks, `string.pack` the long pole.
 - wasm32 size profile for pack (the oracle blob's C type model — the Go port must match the
   ORACLE, not native Go): `j/J`=8, `n`=8 (double), `T`=**4** (wasm32 `size_t`), `s` default
   length prefix = **4**, `l/L`=4, `i/I` default 4, `h/H`=2, `f`=4, `d`=8, native little-endian,
-  `!` default maxalign = **8** (offsetof of LUAI_MAXALIGN's double member), `!n` cap 16,
-  MAXINTSIZE 16.
+  `!` default maxalign = **16** (offsetof of `struct cD`'s union — wasi-sdk's wasm32 `long
+  double` is 16-aligned in the C99 LUAI_MAXALIGN; corrected from the plan's first guess of 8,
+  verified against the oracle), `!n` cap = that same 16, MAXINTSIZE 16.
 - 5.5.1 `math.random` details: `random(0)` → full 64-bit integer (5.5 feature), `random(a,b)`
   via `project` (Mersenne rejection), `>2` args → `"wrong number of arguments"`, empty
   interval → argcheck 1 `"interval is empty"` (the only interval text);
@@ -292,9 +293,13 @@ thread semantics).
    delta, the U5 row just loses the item.)
 3. **math.frexp/ldexp stay** despite Appendix B's removal list — the oracle registers and
    tests them (D6).
-4. **Float printing stays Go-dialect (D7 at U5)** — the gate files' float asserts are
-   dialect-tolerant by construction (§1); `string.format`'s internal rendering is C-parity
-   regardless.
+4. **Float printing stays Go-dialect (D7 at U5)** — ~~stays~~ **superseded at U3i (ledger
+   row 70d)**: math.lua:1122's numeral round-trip asserts `tostring(1.0) == "1.0"`, so the
+   stock tostringbuffFloat spelling (`LNumber.String()` → numberToStringStock) moved into
+   U3. Safe for the differential harness: PrintArg→NumRepr (%.14g) normalizes number print
+   args identically on both engine families, so the spelling surfaces only via string values
+   (tostring/concat results), where both engines are stock. The U5 D7 item reduces to any
+   remaining format-verb audits.
 5. **The D5 host-RNG shim is retired at U3b** (both interp engine and rt flavor): with the
    interp speaking stock xoshiro from the makeseed=0 pin, the shim is the only
    non-xoshiro stream left; retiring it turns math.random into an all-engine
@@ -320,3 +325,39 @@ thread semantics).
 - **2026-09-28** — plan written; ground truth gathered (two exploration reports: the
   official-gate-file inventory; the C reference extract for lstrlib metatables/pack,
   lmathlib, ltablib, lcorolib, lbaselib, lutf8lib). U3a started.
+- **2026-09-28** — U3a done (row 63): contextual `global`, attribute/named-vararg acceptance,
+  the K-overflow fallback; the five gate files compile. U3b done (row 64): mathlib on the
+  stock surface, xoshiro + the makeseed pin, D5 shim retired everywhere, argerror name
+  resolution. U3d+U3e done (row 65): table lib (move/create/checktab model), utf8 lib.
+- **2026-09-29..30** — U3c (row 66: string-metatable arithmetic, row 58 closes — strmt.go,
+  the VM fast paths die), U3f (row 67: string.format, formatlib.go, %a full modifiers),
+  U3g (row 68: pack family, packlib.go, the wasm32 size model — §1's align correction:
+  default maxalign 16), U3h (row 69: io.read/lines, print/tolstring checks, warn,
+  coroutine.close) implemented.
+- **2026-09-30** — U3i done (row 70): `_u3` corpus + both gates green (TestU3Gate 9/9,
+  TestU3OfficialSuite 5/5 — math.lua required four gating re-pins: order-error positions,
+  the strtod mantissa contract, the b_str2int tonumber-base port, and the D7 float-tostring
+  pull-forward recorded in §4.4). The varinfo hints landed ahead of the U5/U7 schedule
+  (row 62's deferral closes; lazy carriers after the eager form cost a 3.4x interp
+  slowdown — 75s→259s on TestSelfDiffLua51Tests); 45 oracle skips dropped. §4.4 superseded.
+- **2026-09-30 (closeout tail)** — row 71 + the matrix stdlib grid. The hints broke the
+  four wasm-family gates (the seam's CClosure frames carry no proto → hint-less raises):
+  ruled as a harness contract — `DiffLogs(a, b, seam)` strips the six varinfo suffix
+  shapes from ERROR lines on pairs with a wasm engine (`seamHintless`); pc10-class cases
+  (PRINTED hint-bearing pcall messages) skip on wasm legs only via
+  `seamHintPrintSkips`/`CorpusSkipsFor`; the durable fix (backend-precomputed findsetreg
+  hints through the rt raise path, an additive ABI v4 extension) sits with the row-60/61
+  seam family at U6. Two stale skips retired with row 70d/U3d: gnf00/gnf01 (both sides
+  print stock now) and `_glua-tests` table.lua (stock surface + re-pinned case). The
+  §3-U3i matrix stdlib slice landed: 63 cases (slm/slt/slu/slp/slf/sls — math incl. the
+  xoshiro anchors, table move/create, utf8, pack, format, string-mt arith), probe-verified
+  interp↔wasm before landing, green on interp↔wasm, interp↔clua55 (TestU2fMatrixOracle),
+  and wazero. `_cli-tests` goldens regenerated (`make refs`: err1.i.out gains the row-70f
+  hint — the only diff) and both legs PASS.
+- **2026-09-30 (exit gate)** — the full `go test ./...` run caught the os surface (row 72):
+  `os.date("*t")`/`os.time` moved to the stock integer shape (integer fields with real
+  yday/wday/isdst, integer returns, the os.time table normalize-back — raw-CLI probe
+  byte-identical to clua55 under TZ=UTC), the root-package unit tests re-pinned to the
+  row-70d stock spelling ("10.0"/"a1.0c"). os is harness-shim-opaque, so the coverage is
+  the unit tests + the probe, not corpora (the standing no-os discipline). U3 exit gate
+  green: `go test ./...` clean.

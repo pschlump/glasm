@@ -1,6 +1,6 @@
 # Upgrading from Lua 5.2 to Lua 5.5
 
-> **Status (2026-09-26): U2 COMPLETE — all six chunks landed (integer value model; 5.3 operators; the 5.5.1 encoding cutover; ABI v4 rt port tranche 1; the wasm backend rewrite; corpora + D7 re-pin + closeout — ledger rows 59–62). Next: U3 (5.3/5.4 stdlib: string.pack, utf8, table.move, math.type family, string-metatable arithmetic, hardwired print, xoshiro math.random).**
+> **Status (2026-09-30): U3 COMPLETE — all nine chunks landed (parse acceptance + K-overflow fallback; math lib stock surface + xoshiro; string-metatable arithmetic closing row 58; table lib; utf8 lib; string.format; string.pack family; io/base/coroutine smalls; corpora + gates + closeout — ledger rows 63–72). The five official gate files green interp↔clua55 (TestU3OfficialSuite); D7's float-tostring re-pin pulled forward from U5 (row 70d); the row-62 varinfo-hint deferral closed early with the lazy-carrier ruling (row 70f) and the wasm seam's hint-blindness ruled with an ERROR-line strip on wasm legs (row 71, durable fix at U6); the exit-gate run moved os.date/os.time onto the stock integer surface (row 72). Next: U4 (5.4 language: `<const>`/`<close>` attributes, `OP_TBC`, `__close`, `os.exit(code, close)`).**
 > Companion research artifacts are saved under `note/conv-from-5.2-to-5.5/` (source tarballs,
 > extracted manual sections, official 5.5 test suite). This document follows the conventions of
 > `Lua-Wasm-Design-and-Test-Plan.md`: design decisions are numbered **D1–D12**, milestones are

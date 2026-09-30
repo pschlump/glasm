@@ -8,12 +8,14 @@ func OpenCoroutine(L *LState) int {
 }
 
 var coFuncs = map[string]LGFunction{
-	"create":  coCreate,
-	"yield":   coYield,
-	"resume":  coResume,
-	"running": coRunning,
-	"status":  coStatus,
-	"wrap":    coWrap,
+	"create":      coCreate,
+	"yield":       coYield,
+	"resume":      coResume,
+	"running":     coRunning,
+	"status":      coStatus,
+	"wrap":        coWrap,
+	"close":       coClose,
+	"isyieldable": coIsYieldable,
 }
 
 func coCreate(L *LState) int {
@@ -81,13 +83,13 @@ func coResume(L *LState) int {
 	return L.GetTop() - top
 }
 
+// coRunning ports 5.3+ coroutine.running: the running thread (the main
+// thread included — 5.1 returned nil for it) plus an is-main flag.
 func coRunning(L *LState) int {
-	if L.G.MainThread == L {
-		L.Push(LNil)
-		return 1
-	}
-	L.Push(L.G.CurrentThread)
-	return 1
+	th := L.G.CurrentThread
+	L.Push(th)
+	L.Push(LBool(th == L.G.MainThread))
+	return 2
 }
 
 func coStatus(L *LState) int {
@@ -106,6 +108,60 @@ func coWrap(L *LState) int {
 	v := L.Get(L.GetTop())
 	L.Pop(1)
 	L.Push(L.NewClosure(wrapaux, v))
+	return 1
+}
+
+// coOptThread: the optional 5.5 coroutine argument — absent means the
+// RUNNING coroutine (close/isyieldable gained the no-arg form).
+func coOptThread(L *LState) *LState {
+	if v := L.Get(1); v != LNil && v.Type() != LTNil {
+		return L.CheckThread(1)
+	}
+	return L
+}
+
+// coClose ports luaB_close (5.4 coroutine.close, 5.5 no-arg extension):
+// dead or suspended coroutines reset — true, or false + the error
+// object the coroutine died with; a normal coroutine errors; the main
+// thread errors. (TBC variables in suspended coroutines get their
+// __close calls at U4; today no TBC exists.)
+func coClose(L *LState) int {
+	th := coOptThread(L)
+	switch L.Status(th) {
+	case "dead":
+		err := th.deadErr
+		th.deadErr = nil // the status is consumed by the first close
+		th.kill()
+		if err != nil {
+			L.Push(LFalse)
+			L.Push(err)
+			return 2
+		}
+		L.Push(LTrue)
+		return 1
+	case "suspended":
+		th.kill()
+		L.Push(LTrue)
+		return 1
+	case "normal":
+		L.RaiseError("cannot close a normal coroutine")
+	default: // running
+		if th == L.G.MainThread {
+			L.RaiseError("cannot close main thread")
+		}
+		// stock terminates the running coroutine itself via
+		// luaD_throwbaselevel (it never returns); the closest fork shape
+		// until the U4 error-path work is the explicit error
+		L.RaiseError("cannot close a running coroutine")
+	}
+	return 0
+}
+
+// coIsYieldable: a coroutine is yieldable iff it is not the main
+// thread (5.5's no-arg form asks about the running one).
+func coIsYieldable(L *LState) int {
+	th := coOptThread(L)
+	L.Push(LBool(th != L.G.MainThread))
 	return 1
 }
 

@@ -1046,7 +1046,7 @@ func (ls *LState) pushCallFrame(cf callFrame, fn LValue, meta bool) { // +inline
 	}
 	if cf.Fn == nil {
 		// U2f re-pin: luaG_typeerror names the callee's type
-		ls.RaiseError("attempt to call a %s value", fn.Type().String())
+		ls.raiseCallError(fn)
 	}
 	if ls.stack.IsFull() {
 		ls.RaiseError("stack overflow")
@@ -1087,7 +1087,13 @@ func (ls *LState) callR(nargs, nret, rbase int) {
 	}
 }
 
-func (ls *LState) getField(obj LValue, key LValue) LValue {
+// getField and friends take the varinfo hint of the OBJECT operand
+// (row 62): stock luaV_finishget/luaV_finishset raise luaG_typeerror on
+// the table at the FIRST level of the __index/__newindex chain — the
+// only level whose value lives in a register (or, for GETTABUP/
+// SETTABUP, an upvalue cell), so the hint applies at i == 0 only.
+
+func (ls *LState) getField(obj LValue, key LValue, hint varinfoHint) LValue {
 	curobj := obj
 	for i := 0; i < MaxTableGetLoop; i++ {
 		tb, istable := curobj.(*LTable)
@@ -1100,7 +1106,11 @@ func (ls *LState) getField(obj LValue, key LValue) LValue {
 		metaindex := ls.metaOp1(curobj, "__index")
 		if metaindex == LNil {
 			if !istable {
-				ls.RaiseError("attempt to index a %s value", curobj.Type().String())
+				h := ""
+				if i == 0 {
+					h = hint.resolve(ls)
+				}
+				ls.RaiseError("attempt to index a %s value%s", curobj.Type().String(), h)
 			}
 			return LNil
 		}
@@ -1118,7 +1128,7 @@ func (ls *LState) getField(obj LValue, key LValue) LValue {
 	return nil
 }
 
-func (ls *LState) getFieldString(obj LValue, key string) LValue {
+func (ls *LState) getFieldString(obj LValue, key string, hint varinfoHint) LValue {
 	curobj := obj
 	for i := 0; i < MaxTableGetLoop; i++ {
 		tb, istable := curobj.(*LTable)
@@ -1131,7 +1141,11 @@ func (ls *LState) getFieldString(obj LValue, key string) LValue {
 		metaindex := ls.metaOp1(curobj, "__index")
 		if metaindex == LNil {
 			if !istable {
-				ls.RaiseError("attempt to index a %s value", curobj.Type().String())
+				h := ""
+				if i == 0 {
+					h = hint.resolve(ls)
+				}
+				ls.RaiseError("attempt to index a %s value%s", curobj.Type().String(), h)
 			}
 			return LNil
 		}
@@ -1149,7 +1163,7 @@ func (ls *LState) getFieldString(obj LValue, key string) LValue {
 	return nil
 }
 
-func (ls *LState) setField(obj LValue, key LValue, value LValue) {
+func (ls *LState) setField(obj LValue, key LValue, value LValue, hint varinfoHint) {
 	curobj := obj
 	for i := 0; i < MaxTableGetLoop; i++ {
 		tb, istable := curobj.(*LTable)
@@ -1162,7 +1176,11 @@ func (ls *LState) setField(obj LValue, key LValue, value LValue) {
 		metaindex := ls.metaOp1(curobj, "__newindex")
 		if metaindex == LNil {
 			if !istable {
-				ls.RaiseError("attempt to index a %s value", curobj.Type().String())
+				h := ""
+				if i == 0 {
+					h = hint.resolve(ls)
+				}
+				ls.RaiseError("attempt to index a %s value%s", curobj.Type().String(), h)
 			}
 			ls.RawSet(tb, key, value)
 			return
@@ -1181,7 +1199,7 @@ func (ls *LState) setField(obj LValue, key LValue, value LValue) {
 	ls.RaiseError("too many recursions in settable")
 }
 
-func (ls *LState) setFieldString(obj LValue, key string, value LValue) {
+func (ls *LState) setFieldString(obj LValue, key string, value LValue, hint varinfoHint) {
 	curobj := obj
 	for i := 0; i < MaxTableGetLoop; i++ {
 		tb, istable := curobj.(*LTable)
@@ -1194,7 +1212,11 @@ func (ls *LState) setFieldString(obj LValue, key string, value LValue) {
 		metaindex := ls.metaOp1(curobj, "__newindex")
 		if metaindex == LNil {
 			if !istable {
-				ls.RaiseError("attempt to index a %s value", curobj.Type().String())
+				h := ""
+				if i == 0 {
+					h = hint.resolve(ls)
+				}
+				ls.RaiseError("attempt to index a %s value%s", curobj.Type().String(), h)
 			}
 			tb.RawSetString(key, value)
 			return
@@ -1758,11 +1780,11 @@ func (ls *LState) RawGetInt(tb *LTable, key int) LValue {
 }
 
 func (ls *LState) GetField(obj LValue, skey string) LValue {
-	return ls.getFieldString(obj, skey)
+	return ls.getFieldString(obj, skey, varinfoHint{})
 }
 
 func (ls *LState) GetTable(obj LValue, key LValue) LValue {
-	return ls.getField(obj, key)
+	return ls.getField(obj, key, varinfoHint{})
 }
 
 func (ls *LState) RawSet(tb *LTable, key LValue, value LValue) {
@@ -1779,11 +1801,11 @@ func (ls *LState) RawSetInt(tb *LTable, key int, value LValue) {
 }
 
 func (ls *LState) SetField(obj LValue, key string, value LValue) {
-	ls.setFieldString(obj, key, value)
+	ls.setFieldString(obj, key, value, varinfoHint{})
 }
 
 func (ls *LState) SetTable(obj LValue, key LValue, value LValue) {
-	ls.setField(obj, key, value)
+	ls.setField(obj, key, value, varinfoHint{})
 }
 
 func (ls *LState) ForEach(tb *LTable, cb func(LValue, LValue)) {
@@ -1837,7 +1859,7 @@ func (ls *LState) Concat(values ...LValue) string {
 	for _, value := range values {
 		ls.reg.Push(value)
 	}
-	ret := stringConcat(ls, len(values), ls.reg.Top()-1)
+	ret := stringConcat(ls, len(values), ls.reg.Top()-1, nil)
 	ls.reg.SetTop(top)
 	return LVAsString(ret)
 }

@@ -147,11 +147,12 @@ func (st LString) Format(f fmt.State, c rune) {
 	}
 }
 
+// String is the engine-wide float spelling: the stock tostringbuffFloat
+// (%.15g, re-read, %.17g, ".0" on integer-looking results — U3i, the D7
+// re-pin pulled forward because math.lua's numeral round-trip asserts
+// tostring(1.0) == "1.0"). The old Go dialect printed "1" there.
 func (nm LNumber) String() string {
-	if isInteger(nm) {
-		return fmt.Sprint(int64(nm))
-	}
-	return fmt.Sprint(float64(nm))
+	return numberToStringStock(float64(nm))
 }
 
 func (nm LNumber) Type() LValueType { return LTNumber }
@@ -237,6 +238,10 @@ type LState struct {
 	mainLoop     func(*LState, *callFrame)
 	ctx          context.Context
 	ctxCancelFn  context.CancelFunc
+	// deadErr records the error object a coroutine died with (U3h:
+	// coroutine.close returns it as false+err for an error-dead
+	// coroutine, stock lua_closethread's status).
+	deadErr LValue
 }
 
 func (ls *LState) String() string   { return fmt.Sprintf("thread: %p", ls) }

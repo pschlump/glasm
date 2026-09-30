@@ -1,0 +1,13 @@
+-- U3c: string-metatable arithmetic (row 58).
+print("10" + 1, "2" * "3.5", "0x10" + 0, math.type("10" + 1))
+print(-" 3.5 ", "7" // "2", math.type("7" // "2"))
+print(2 + "3", 2.5 * "2")
+local ok, e = pcall(function() return "x" + 1 end)
+print(not ok and e:find("attempt to add a 'string' with a 'number'") ~= nil)
+local ok, e = pcall(function() return -"x" end)
+print(not ok and e:find("attempt to unm a 'string' with a 'string'") ~= nil)
+local t = setmetatable({}, {__add = function(a, b) return "mm" end})
+print("x" + t, t + "y")
+local ok, e = pcall(function() return "3" & 5 end)
+print(ok, e)
+print(getmetatable("").__index == string, getmetatable("").__add ~= nil)
