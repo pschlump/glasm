@@ -837,6 +837,12 @@ type Lexer struct {
 	// lookahead — U3a). Zero when empty.
 	pushed    ast.Token
 	hasPushed bool
+	// forNames: between a `for` and its '='/'in' — the for-header
+	// name-list dispatch (U4; see Lex).
+	forNames bool
+	// funcName: between `function` and the '(' opening the body — the
+	// "'(' expected" dispatch (U4; see Lex).
+	funcName bool
 }
 
 func (lx *Lexer) Lex(lval *yySymType) int {
@@ -875,6 +881,53 @@ func (lx *Lexer) Lex(lval *yySymType) int {
 		lx.Token = tok
 		return 0
 	}
+	// U4: stock's for-header dispatch, worded the yacc way otherwise.
+	// forstat reads the control names by hand and checks the token after
+	// each: after the FIRST name '=' (fornum), ',' or 'in' (forlist) are
+	// accepted — anything else (the `for i <const>` attribute shape, EOS)
+	// is "'=' or 'in' expected"; after any LATER name only ',' or 'in'
+	// continue the list — anything else is "'in' expected" (the
+	// `for k, v <const> in` shape). Peek the token after each for-header
+	// name here (one-token pushback — the `global` mechanism — so the
+	// accepted spellings reach the grammar untouched); forNames tracks
+	// being between a `for` and its '='/'in'.
+	if tok.Type == TIdent && lx.forNames {
+		first := lx.Token.Type == TFor
+		nxt, err := lx.scanner.Scan(lx)
+		if err != nil {
+			panic(err)
+		}
+		if nxt.Type == ',' || nxt.Type == TIn || (first && nxt.Type == '=') {
+			lx.pushed, lx.hasPushed = nxt, true
+		} else {
+			lx.Token = nxt
+			msg := "'in' expected"
+			if first {
+				msg = "'=' or 'in' expected"
+			}
+			e := lx.scanner.TokenError(nxt, msg)
+			if nxt.Pos.Line == EOF || nxt.Type == EOF {
+				e.NearEOF = true
+			}
+			panic(e)
+		}
+	}
+	lx.forNames = tok.Type == TFor || ((tok.Type == TIdent || tok.Type == ',') && lx.forNames)
+	// U4: stock's funcname/funcbody seam — body() opens with
+	// checknext('('), so whatever follows the (local) function name chain
+	// that is not a name continuation or '(' is "'(' expected" (the
+	// `function t.f <const>()` attribute shape; matches `local function
+	// f <const>()` too, same checknext). funcName tracks being between
+	// `function` and the '(' that opens the body.
+	if lx.funcName && tok.Type != TIdent && tok.Type != '.' && tok.Type != ':' && tok.Type != '(' {
+		lx.Token = tok
+		e := lx.scanner.TokenError(tok, "'(' expected")
+		if tok.Pos.Line == EOF || tok.Type == EOF {
+			e.NearEOF = true
+		}
+		panic(e)
+	}
+	lx.funcName = tok.Type == TFunction || ((tok.Type == TIdent || tok.Type == '.' || tok.Type == ':') && lx.funcName)
 	lval.token = tok
 	lx.Token = tok
 	return int(tok.Type)

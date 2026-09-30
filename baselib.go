@@ -636,32 +636,45 @@ func loRequire(L *LState) int {
 	}
 	loaders, ok := L.GetField(L.Get(RegistryIndex), "_LOADERS").(*LTable)
 	if !ok {
-		L.RaiseError("package.loaders must be a table")
+		L.RaiseError("'package.searchers' must be a table")
 	}
-	messages := []string{}
+	// U4g re-pin (attrib.lua:67, stock findloader): each searcher is
+	// called for TWO results — (loader, loader-data) or its message —
+	// and the not-found error is "module 'name' not found:" followed by
+	// "\n\t" + the messages joined by "\n\t" (stock builds "\n\t" +
+	// msg1 + "\n\t" + msg2 ... and trims the trailing prefix).
 	var modasfunc LValue
+	var loaderData LValue = LNil
+	messages := []string{}
 	for i := 1; ; i++ {
 		loader := L.RawGetInt(loaders, i)
 		if loader == LNil {
-			L.RaiseError("module %s not found:\n\t%s, ", name, strings.Join(messages, "\n\t"))
+			detail := ""
+			if len(messages) > 0 {
+				detail = "\n\t" + strings.Join(messages, "\n\t")
+			}
+			L.RaiseError("module '%s' not found:%s", name, detail)
 		}
 		L.Push(loader)
 		L.Push(LString(name))
-		L.Call(1, 1)
-		ret := L.reg.Pop()
-		switch retv := ret.(type) {
-		case *LFunction:
-			modasfunc = retv
-			goto loopbreak
-		case LString:
-			messages = append(messages, string(retv))
+		L.Call(1, 2)
+		ret := L.Get(-2)
+		if fn, ok := ret.(*LFunction); ok {
+			modasfunc = fn
+			loaderData = L.Get(-1)
+			L.Pop(2)
+			break
 		}
+		if s, ok := ret.(LString); ok {
+			messages = append(messages, string(s))
+		}
+		L.Pop(2)
 	}
-loopbreak:
 	L.SetField(loaded, name, loopdetection)
 	L.Push(modasfunc)
 	L.Push(LString(name))
-	L.Call(1, 1)
+	L.Push(loaderData)
+	L.Call(2, 1)
 	ret := L.reg.Pop()
 	modv := L.GetField(loaded, name)
 	if ret != LNil && modv == loopdetection {

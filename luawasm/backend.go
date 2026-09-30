@@ -202,6 +202,7 @@ func (b *backend) declareImports() {
 		"rt_name_put":      m.ImportFunc("rt", "rt_name_put", ii, i32v),
 		"rt_tbc":           m.ImportFunc("rt", "rt_tbc", iii, i32v),
 		"rt_close":         m.ImportFunc("rt", "rt_close", i32v, i32v),
+		"rt_close_err":     m.ImportFunc("rt", "rt_close_err", i32v, nil),
 		"rt_tail_stage":    m.ImportFunc("rt", "rt_tail_stage", iiii, i32v),
 		"rt_tail_clidx":    m.ImportFunc("rt", "rt_tail_clidx", nil, i32v),
 		"rt_tail_nargs":    m.ImportFunc("rt", "rt_tail_nargs", nil, i32v),
@@ -378,10 +379,24 @@ func (b *backend) emitDispatch() {
 // survive the entry). Main runs cl=0 (row 53): its _ENV is the globals
 // table, and GETTABUP/SETTABUP on the main proto lower to
 // rt_getglobal/rt_setglobal for exactly that reason.
+//
+// U4g: lua_main calls the dispatcher DIRECTLY — the main chunk has no C
+// trampoline, so rt_wasm_trampoline's error arms (the rt_close_err
+// boundary close, row 75) never run for its dying frames. On a staged
+// error run the protected close at the main frame level here: main-chunk
+// tbc cells are ≥ frame, the 2-arg __close fold runs under rt_close_err's
+// per-entry protection (a failing close REPLACES the staged object), and
+// a no-entry call re-stages the original untouched (its `had` path).
 func (b *backend) emitMain() {
 	f := b.m.NewFunction([]wasm.ValueType{wasm.I32}, []wasm.ValueType{wasm.I32})
+	f.Local(wasm.I32) // 1: the dispatch status
 	f.I32Const(0).LocalGet(0).I32Const(0).I32Const(0).I32Const(-1).
 		Call(b.dispatchFn)
+	f.LocalSet(1)
+	f.LocalGet(1).I32Const(-1).I32Eq().If(wasm.Void)
+	f.LocalGet(0).Call(b.imp("rt_close_err"))
+	f.End()
+	f.LocalGet(1)
 	f.End()
 	f.Export("lua_main")
 }

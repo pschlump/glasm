@@ -410,8 +410,35 @@ re-port + searchpath, U4d error(nil)/os surface, U4e mirror removal, U4f seam en
   ErrorSuites + wazero legs, root, CLua55/CLua conformance, U1/U2
   gates, U2f oracles, WasmGluaFull, `_cli-tests` make
   ×{wasmtime, WAZERO=1}.
-- U4g next — `_u4` corpus slices; `_wasm-err-tests` TBC-in-error-path
-  additions (all engines); `u4_test.go` (TestU4Gate + TestU4OfficialSuite
-  with the errors.lua light-udata and coroutine row-22 skips);
-  attrib.lua's searchpath message re-pin (loadlib.go); delete
-  `testdiff/u4probe_test.go` + `_u3/dev/`; ledger/docs/memory closeout.
+- **U4g DONE — U4 COMPLETE.** Corpus + gates: `_u4/{cst01,tbc01,tbc02,
+  goto01,le01}.lua` (TestU4Gate 5/5 byte-exact interp↔clua55) and
+  `_wasm-err-tests/tb00–tb04` (TestWasmErrorSuite 92/92 ×{wasmtime,
+  wazero}; tb02 strips the row-60 position prefix and compares the core
+  text). TestU4OfficialSuite: attrib.lua + events.lua GREEN; errors.lua
+  skips to U5 (light userdata, the sethook precedent) and coroutine.lua
+  rides row 22 (:236-326's pcall-vs-close battery — the panic half IS
+  fixed, see below). En route, four fixes: (1) **require/searchpath
+  re-pinned to stock 5.5.1** (loadlib.go/baselib.go — the searcher set,
+  2-result protocol, miss trails, and `module '%s' not found:` —
+  byte-IDENTICAL to the oracle; attrib.lua's :33 battery was the last
+  failing block); (2) **the multiple-assignment miscompile** exposed by
+  attrib.lua:505 — stock's check_conflict was missing, the local
+  direct-write path lacked a table-operand-aliasing guard, and the
+  ecTable value path's register propagation desynchronized the reverse
+  store loop (now K-fold only, the new PropagateK) — three latent fork
+  compiler bugs, stock-exact after; (3) **the stock for-header/funcbody
+  error wordings** in parse/lexer.go (`'=' or 'in' expected`, `'in'
+  expected`, `'(' expected` — the forNames/funcName dispatch over goyacc's
+  generic "unexpected symbol"); (4) **the row-22 panic half + lua_main's
+  error arm**: a yield unwinding past the thread's base frames no longer
+  leaves the zombie state that crashed the next resume (callGFunction +
+  doReturn arms → clean `cannot resume dead coroutine`; covered by
+  TestYieldPastBaseFrame), and lua_main now runs rt_close_err on a
+  staged error so MAIN-CHUNK tbc vars close on uncaught errors (blob
+  rebuild: rt_close_err exported). Ledger rows 76 (U4a-c, the row commit
+  8430230 owed) + 77 (U4g). Full battery green on the rebuilt blob +
+  `go clean -testcache`: root, U1/U2/U3/U4 gates, WasmFullMatrix/
+  ErrorSuite/GluaFull ×{wasmtime, wazero}, U2f oracles, CLua55/CLua
+  conformance. Next: U5 (the `global` declarations + RDKCTC promotion,
+  vararg rework, light userdata, error/EH marker seam, row-22
+  continuations; exit gate: the full official suite ≥95%).

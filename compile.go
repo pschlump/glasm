@@ -259,6 +259,24 @@ func (cd *codeStore) PropagateMV(top int, save *int, reg *int, inc int) {
 	*reg = *reg + inc
 }
 
+// PropagateK is PropagateKMV's constant-only form: it pops a trailing
+// scratch LOADK (K index within the 8-bit RKC range) so the constant
+// folds into the consuming instruction's k-flag operand, but never
+// propagates a register — the value stays materialized in the window
+// (stock luaK_exp2rk; see compileAssignStmtRight).
+func (cd *codeStore) PropagateK(top int, save *int) bool {
+	lastinst := cd.Last()
+	if opGetArgA(lastinst) >= top && opGetOpCode(lastinst) == OP_LOADK {
+		cindex := opGetArgBx(lastinst)
+		if cindex <= opMaxIndexK {
+			cd.Pop()
+			*save = opRkAsk(cindex)
+			return true
+		}
+	}
+	return false
+}
+
 func (cd *codeStore) SetOpCode(pc int, v int) {
 	opSetOpCode(&cd.codes[pc], v)
 }
@@ -1049,6 +1067,34 @@ func compileAssignStmtLeft(context *funcContext, stmt *ast.AssignStmt) (int, []*
 				context.Upvalues.RegisterUnique(st.Value)
 			case ecLocal:
 				ec.reg = context.FindLocalVar(st.Value)
+				// U4g (attrib.lua:505): stock check_conflict, the table
+				// arm — a field target parsed BEFORE this one may have its
+				// table operand aliasing this local's register (KMV
+				// propagation pops the operand's MOVE and uses the local
+				// in place). Stores run right-to-left, so this target's
+				// MOVE executes before that SETTABLE and the store would
+				// index the clobbered value. Snapshot every conflicting
+				// table into one fresh temp here — before the RHS and the
+				// stores, stock's "assignment will use safe copy". (The
+				// index arm is moot: fork keys always land in fresh temps,
+				// and upvalue tables too — GETUPVAL is never propagated —
+				// so only this propagated-local-table case can alias.)
+				conflict := false
+				for _, prev := range acs {
+					if prev.ec.ctype == ecTable && prev.ec.reg == ec.reg {
+						conflict = true
+						prev.ec.reg = reg
+					} else if prev.ec.ctype == ecGlobal && prev.envLocalIdx == ec.reg {
+						// the shadowed-_ENV global write SETFIELDs this
+						// local's register (stock's VINDEXSTR table arm)
+						conflict = true
+						prev.envLocalIdx = reg
+					}
+				}
+				if conflict {
+					context.Code.AddABC(OP_MOVE, reg, ec.reg, 0, sline(st))
+					reg++
+				}
 			}
 			acs = append(acs, ac)
 		case *ast.AttrGetExpr:
@@ -1114,7 +1160,7 @@ func compileAssignStmtRight(context *funcContext, stmt *ast.AssignStmt, reg int,
 			expr = stmt.Rhs[namesassigned]
 		}
 		idx := reg
-		if ec.ctype == ecLocal && localAssignNeedsTemp(stmt, namesassigned) {
+		if ec.ctype == ecLocal && (localAssignNeedsTemp(stmt, namesassigned) || tableOperandAliasesLocal(acs, namesassigned)) {
 			// Multiple assignment is simultaneous (Lua 5.1: all RHS
 			// expressions are evaluated before any assignment is
 			// performed). Compiling the RHS straight into the target
@@ -1134,8 +1180,14 @@ func compileAssignStmtRight(context *funcContext, stmt *ast.AssignStmt, reg int,
 		} else {
 			reginc := compileExpr(context, reg, expr, ec)
 			if ec.ctype == ecTable {
-				if _, ok := expr.(*ast.LogicalOpExpr); !ok {
-					context.Code.PropagateKMV(context.RegTop(), &ac.valuerk, &reg, reginc)
+				if _, ok := expr.(*ast.LogicalOpExpr); !ok && context.Code.PropagateK(context.RegTop(), &ac.valuerk) {
+					// constant folded into the K operand (no register
+					// consumed) — U4g: a REGISTER value never propagates
+					// (stock exp2rk materializes non-constants into the
+					// window; attrib.lua:505 — a propagated local consumed
+					// no window slot while the reverse store loop's reg
+					// descent still counted it, misaligning every store
+					// below it in a mixed window)
 				} else {
 					ac.valuerk = idx
 					reg += reginc
@@ -1160,6 +1212,27 @@ func compileAssignStmtRight(context *funcContext, stmt *ast.AssignStmt, reg int,
 	}
 	return rightreg, acs
 } // }}}
+
+// tableOperandAliasesLocal (U4g, attrib.lua:505): the local target at
+// index i's register is aliased by a field target's table operand (or a
+// shadowed-_ENV global write). The direct RHS write into the local's
+// register would clobber that table before the stores read it — stock
+// never direct-writes (its check_conflict snapshot covers the
+// parsed-before direction, reverse store order the rest); this arm gives
+// the fork's direct-write optimization the same protection.
+func tableOperandAliasesLocal(acs []*assigncontext, i int) bool {
+	reg := acs[i].ec.reg
+	for j, ac := range acs {
+		if j == i {
+			continue
+		}
+		if (ac.ec.ctype == ecTable && ac.ec.reg == reg) ||
+			(ac.ec.ctype == ecGlobal && ac.envLocalIdx == reg) {
+			return true
+		}
+	}
+	return false
+}
 
 // localAssignNeedsTemp reports whether the local target at index i of a
 // multiple assignment must not be direct-written: a later RHS expression

@@ -136,6 +136,24 @@ func callGFunction(L *LState, tailcall bool) bool {
 		return true
 	}
 
+	if L.Parent == nil && L.stack.Sp() == 1 && L != L.G.MainThread && !L.Dead {
+		// U4g (row 22's seam, the panic half): a yield unwound past this
+		// base G frame — switchToParentThread nil'd Parent when the resume
+		// returned the yield values, and the frame's Go-side continuation
+		// (a pcall body whose nested Call was surgically "returned") is
+		// unrecoverable. The body completing now must END the thread here
+		// instead of popping the base frame into the zombie state (empty
+		// stack, not started, not dead) that crashed the next resume with
+		// a nil base frame. No delivery: the suspended resume already
+		// handed the yield values to the parent; the stock continuation
+		// semantics (resuming re-enters foo inside pcall) need the U5
+		// continuation work.
+		L.stack.Pop()
+		L.currentFrame = nil
+		L.kill()
+		return true
+	}
+
 	// +inline-call L.reg.CopyRange frame.ReturnBase L.reg.Top()-gfnret -1 wantret
 	L.stack.Pop()
 	L.currentFrame = L.stack.Last()
@@ -1481,6 +1499,18 @@ func doReturn(L *LState, cf *callFrame, baseframe *callFrame, RA, nres, b int) i
 	// +inline-call copyReturnValues L cf.ReturnBase RA n b
 	L.currentFrame = L.stack.Last()
 	if islast || L.currentFrame == nil || L.currentFrame.Fn.IsG {
+		if L.currentFrame == nil && L.stack.IsEmpty() && L.Parent == nil && L != L.G.MainThread && !L.Dead {
+			// U4g (row 22's seam, the panic half — callGFunction's arm
+			// for the G-body shape): a yield unwound past this base frame
+			// (switchToParentThread nil'd Parent when the resume returned
+			// the yield values), so the suspended resume already delivered
+			// and this return has nowhere to go. The stock continuation
+			// (resuming re-enters at the yield point) needs the U5
+			// continuation work; killing here keeps the thread out of the
+			// zombie state (empty stack, not started, not dead) whose next
+			// resume crashed on a nil base frame.
+			L.kill()
+		}
 		return 1
 	}
 	return 0
