@@ -463,10 +463,12 @@ func (fe *funcEmitter) kcellFn(i int) func() *wasm.Function {
 func (fe *funcEmitter) emitCall(A, B, C, pc int, tail bool) {
 	f := fe.f
 	if tail {
-		// the interpreter closes this frame's upvalues before a tailcall
-		// (_vm.go OP_TAILCALL) — the frame is not coming back
+		// the interpreter closes this frame before a tailcall (_vm.go
+		// OP_TAILCALL: upvalues + the tbc list at lbase — U4f) — the frame
+		// is not coming back
 		f.LocalGet(0)
-		f.Call(fe.b.imp("rt_close_upvals"))
+		f.Call(fe.b.imp("rt_close"))
+		fe.checkStatus()
 	}
 	// nargs
 	if B == 0 {
@@ -548,13 +550,15 @@ func (fe *funcEmitter) scratchDyn0Cell() func() *wasm.Function {
 	return func() *wasm.Function { return fe.scratchDyn0() }
 }
 
-// emitReturn: results at R(A); B==0 → up to top. The frame's open
-// upvalues close first (the interpreter's doReturn closes at LocalBase —
-// here frame base). nret results stage at frame+0.. for the trampoline.
+// emitReturn: results at R(A); B==0 → up to top. The frame's open upvalues
+// and to-be-closed variables close first (the interpreter's doReturn closes
+// both at LocalBase — here frame base; U4f). nret results stage at
+// frame+0.. for the trampoline.
 func (fe *funcEmitter) emitReturn(A, B int) {
 	f := fe.f
 	f.LocalGet(0)
-	f.Call(fe.b.imp("rt_close_upvals"))
+	f.Call(fe.b.imp("rt_close"))
+	fe.checkStatus()
 	if B >= 2 {
 		n := B - 1
 		for i := 0; i < n; i++ {

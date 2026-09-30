@@ -102,6 +102,8 @@ RT_EXPORTS="$EXPORTS \
   -Wl,--export=rt_wasm_count -Wl,--export=rt_newclosure \
   -Wl,--export=rt_getupval -Wl,--export=rt_setupval \
   -Wl,--export=rt_close_upvals -Wl,--export=rt_clidx \
+  -Wl,--export=rt_name_put -Wl,--export=rt_tbc \
+  -Wl,--export=rt_close \
   -Wl,--export=rt_wasm_push_frame -Wl,--export=rt_frame_cursor \
   -Wl,--export=rt_frame_restore \
   -Wl,--export=rt_tail_stage -Wl,--export=rt_tail_clidx \

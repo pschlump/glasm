@@ -54,6 +54,9 @@ type protoInfo struct {
 	proto *lua.FunctionProto
 	koff  int // global constant-pool index of Constants[0]
 	nc    int // len(Constants)
+	// tbcIdx maps an OP_TBC's pc to its name-table index (U4f; nil when
+	// the proto has no to-be-closed sites)
+	tbcIdx map[int]int
 }
 
 // Compile emits a wasm module for the FunctionProto tree rooted at main.
@@ -65,6 +68,7 @@ func Compile(main *lua.FunctionProto, chunkName string) ([]byte, error) {
 	// callers carry (U1 ChunkID convention) before registering it
 	b := &backend{m: wasm.NewModule(), main: main, chunkName: strings.TrimPrefix(chunkName, "@")}
 	b.layoutProtos(protos)
+	b.collectTBCNames()
 	b.declareImports()
 	b.emitInit()
 	for _, pi := range b.protos {
@@ -95,6 +99,9 @@ type backend struct {
 	protoIdx   map[*lua.FunctionProto]int // proto → dispatch index
 	protoFuncs []*wasm.Function           // dispatch idx → wasm function
 	dispatchFn uint32                     // lua_dispatch's function index
+	// tbcNames (U4f): the OP_TBC variable names, init-registered via
+	// rt_name_put in this order — the OP_TBC lowering embeds the index
+	tbcNames []string
 }
 
 func (b *backend) imp(name string) uint32 { return b.imports[name] }
@@ -111,6 +118,33 @@ func (b *backend) layoutProtos(protos []*lua.FunctionProto) {
 		b.protos = append(b.protos, pi)
 		b.protoIdx[p] = i
 		off += pi.nc
+	}
+}
+
+// collectTBCNames (U4f) walks every proto's code for OP_TBC sites and
+// builds the name table the runtime's non-closable raise reads. The interp
+// answers the name from the proto's debug locals at run time
+// (registerTBC → localNameAt(proto, A+1, pc)); the backend precomputes the
+// same answer at compile time and registers the bytes at init, keeping the
+// rt side debug-info-free. "?" is the interp's fallback for a missing
+// debug name.
+func (b *backend) collectTBCNames() {
+	for i := range b.protos {
+		pi := &b.protos[i]
+		for pc, inst := range pi.proto.Code {
+			if lua.OpGetOpCode(inst) != lua.OP_TBC {
+				continue
+			}
+			name := "?"
+			if nm, ok := lua.LocalNameAt(pi.proto, int(lua.OpGetArgA(inst))+1, pc); ok {
+				name = nm
+			}
+			if pi.tbcIdx == nil {
+				pi.tbcIdx = make(map[int]int)
+			}
+			pi.tbcIdx[pc] = len(b.tbcNames)
+			b.tbcNames = append(b.tbcNames, name)
+		}
 	}
 }
 
@@ -165,6 +199,9 @@ func (b *backend) declareImports() {
 		"rt_getupval":      m.ImportFunc("rt", "rt_getupval", iii, nil),
 		"rt_setupval":      m.ImportFunc("rt", "rt_setupval", iii, nil),
 		"rt_close_upvals":  m.ImportFunc("rt", "rt_close_upvals", i32v, nil),
+		"rt_name_put":      m.ImportFunc("rt", "rt_name_put", ii, i32v),
+		"rt_tbc":           m.ImportFunc("rt", "rt_tbc", iii, i32v),
+		"rt_close":         m.ImportFunc("rt", "rt_close", i32v, i32v),
 		"rt_tail_stage":    m.ImportFunc("rt", "rt_tail_stage", iiii, i32v),
 		"rt_tail_clidx":    m.ImportFunc("rt", "rt_tail_clidx", nil, i32v),
 		"rt_tail_nargs":    m.ImportFunc("rt", "rt_tail_nargs", nil, i32v),
@@ -200,6 +237,9 @@ func (b *backend) emitInit() {
 			}
 		}
 	}
+	for _, nm := range b.tbcNames { // U4f: the OP_TBC name table
+		strBytes += len(nm)
+	}
 
 	f.I32Const(int32(strBytes)).Call(b.imp("rt_frame_alloc")).LocalSet(lS)
 	f.I32Const(int32(cellSize * total)).Call(b.imp("rt_frame_alloc")).LocalSet(lK)
@@ -215,6 +255,15 @@ func (b *backend) emitInit() {
 	// 0, so the bytes start exactly at lS)
 	writeStrBytes(f, lS, lC, b.chunkName)
 	f.LocalGet(lS).I32Const(int32(len(b.chunkName))).Call(b.imp("rt_set_chunkname"))
+
+	// the OP_TBC name table (U4f): names written and registered in order —
+	// rt_name_put's return IS the position, which the OP_TBC lowering
+	// embeds as an immediate
+	for _, nm := range b.tbcNames {
+		writeStrBytes(f, lS, lC, nm)
+		f.LocalGet(lS).LocalGet(lC).I32Const(int32(len(nm))).I32Sub().I32Add()
+		f.I32Const(int32(len(nm))).Call(b.imp("rt_name_put")).Drop()
+	}
 
 	for _, pi := range b.protos {
 		for i, cv := range pi.proto.Constants {

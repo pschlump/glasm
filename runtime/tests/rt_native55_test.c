@@ -47,11 +47,21 @@ enum {
   IDX_SUM = 10,     /* frame[0] = frame[0] + frame[1] via rt_arith */
   IDX_FAIL = 11,    /* rt_arith on booleans -> staged error, -1 */
   IDX_TAIL = 12,    /* tailcall into IDX_SUM via rt_tail_stage, -2 */
-  IDX_RECURSE = 13  /* rt_call itself forever -> a stack-overflow family */
+  IDX_RECURSE = 13, /* rt_call itself forever -> a stack-overflow family */
+  IDX_CLOSEOK = 14, /* a __close metamethod that records its args, succeeds */
+  IDX_CLOSEBAD = 15,/* a __close that raises error("a-bad") via rt_call, like
+                       the backend's lowering (luaB_error's level-1 where()
+                       sees a C frame over the wasm closure — the position
+                       comes from rt_run's line parameter) */
+  IDX_TBCRAISE = 16 /* register two tbc cells (ok at [1], failing at [0]),
+                       then raise — mirrors a compiled body that errors */
 };
 
 static TValue g_sum_closure;    /* CClosures over IDX_SUM / IDX_RECURSE */
 static TValue g_recurse_closure;
+static TValue g_closeok_err;    /* the errobj the last IDX_CLOSEOK saw */
+static int g_closeok_runs;
+static int32_t g_nameidx_v;     /* "v" in the rt name table (IDX_TBCRAISE) */
 
 int32_t wasm_dispatch_host(int32_t idx, rt_addr frame, rt_addr cl,
                            int32_t nargs, int32_t want) {
@@ -91,6 +101,29 @@ int32_t wasm_dispatch_host(int32_t idx, rt_addr frame, rt_addr cl,
     return rt_call(cell_of(&g_recurse_closure), frame, 1, 1, 0) == RT_OK
                ? 0
                : -1;
+  }
+  case IDX_CLOSEOK:
+    g_closeok_err = f[1]; /* the 2-arg form's errobj (nil on normal paths) */
+    g_closeok_runs++;
+    return 0;
+  case IDX_CLOSEBAD: {
+    /* error("a-bad") exactly as the backend lowers it: rt_call the global
+       with the call's line — rt_run's catch builds the position prefix */
+    TValue k, ef, arg;
+    rt_intern(cell_of(&k), (rt_addr)(uintptr_t)"error", 5);
+    if (rt_getglobal(cell_of(&ef), cell_of(&k), 0) != RT_OK) return -1;
+    rt_intern(cell_of(&arg), (rt_addr)(uintptr_t)"a-bad", 5);
+    if (rt_call(cell_of(&ef), cell_of(&arg), 1, 1, 4) != RT_OK) return -1;
+    return 0;
+  }
+  case IDX_TBCRAISE: {
+    /* two tbc cells: [0] fails on close (closed LAST), [1] ok (closed
+       FIRST — innermost), then the body raises at line 9 */
+    if (rt_tbc(frame, g_nameidx_v, 12) != RT_OK) return -1;
+    if (rt_tbc(frame + (rt_addr)sizeof(TValue), g_nameidx_v, 12) != RT_OK)
+      return -1;
+    rt_error((rt_addr)(uintptr_t)"orig", 4, 9);
+    return -1;
   }
   default:
     return RTW_REFUSED;
@@ -683,7 +716,121 @@ int main(void) {
     rt_err_clear();
   }
 
-  CHECK(rt_wasm_count() == IDX_RECURSE + 1);
+  /* ---- U4f: the rt-owned tbc registry + error-path closes ---- */
+  {
+    TValue fcell, okobj, badobj;
+    const char *msg;
+
+    /* the name-table entry the non-closable raise reads */
+    g_nameidx_v = rt_name_put((rt_addr)(uintptr_t)"v", 1);
+    CHECK(g_nameidx_v == 0);
+
+    /* three protos: the __close pair + the raising body */
+    CHECK(rt_wasm_proto(IDX_CLOSEOK, 2, 0, 0, 8) == RT_OK);
+    CHECK(rt_wasm_proto(IDX_CLOSEBAD, 2, 0, 0, 8) == RT_OK);
+    CHECK(rt_wasm_proto(IDX_TBCRAISE, 2, 0, 0, 8) == RT_OK);
+
+    /* build the two objects: setmetatable({}, {__close = <wasm closure>}) */
+    {
+      const char *src =
+          "return function(cf) return setmetatable({}, {__close = cf}) end";
+      TValue mk;
+      CHECK(luaL_loadbuffer(L, src, strlen(src), "=mk") == 0);
+      CHECK(lua_pcall(L, 0, 1, 0) == 0);
+      mk = *s2v(L->top.p - 1);
+
+      /* ok object: __close = the IDX_CLOSEOK closure */
+      CHECK(rt_newclosure(cell_of(&fcell), IDX_CLOSEOK, 0, 0, 1) == RT_OK);
+      luaD_checkstack(L, 2);
+      setobj2s(L, L->top.p, &mk);
+      L->top.p++;
+      setobj2s(L, L->top.p, &fcell);
+      L->top.p++;
+      CHECK(lua_pcall(L, 1, 1, 0) == 0);
+      okobj = *s2v(L->top.p - 1);
+      L->top.p--;
+
+      /* failing object: __close = the IDX_CLOSEBAD closure */
+      CHECK(rt_newclosure(cell_of(&fcell), IDX_CLOSEBAD, 0, 0, 1) == RT_OK);
+      luaD_checkstack(L, 2);
+      setobj2s(L, L->top.p, &mk);
+      L->top.p++;
+      setobj2s(L, L->top.p, &fcell);
+      L->top.p++;
+      CHECK(lua_pcall(L, 1, 1, 0) == 0);
+      badobj = *s2v(L->top.p - 1);
+      L->top.p--;
+    }
+
+    /* normal-path close: register both, rt_close at the frame base —
+       innermost (highest cell) first, both dispatch, registry drains */
+    {
+      TValue cells[2];
+      cells[0] = badobj;
+      cells[1] = okobj;
+      g_closeok_runs = 0;
+      CHECK(rt_tbc(cell_of(&cells[0]), g_nameidx_v, 12) == RT_OK);
+      CHECK(rt_tbc(cell_of(&cells[1]), g_nameidx_v, 12) == RT_OK);
+      CHECK(rt_tbc_count() == 2);
+      /* the failing __close makes rt_close stage + RT_ERR, remaining
+       * entries stay linked (stock luaF_close's posture) */
+      CHECK(rt_close(cell_of(&cells[0])) == RT_ERR);
+      CHECK(rt_tbc_count() == 0);
+      CHECK(g_closeok_runs == 1); /* the ok close ran (innermost first) */
+      CHECK(err_ends_with("script:4: a-bad"));
+      rt_err_clear();
+    }
+
+    /* error-path close through the trampoline: the raising body's
+       dispatch stages "script:9: orig", the boundary's rt_close_err
+       runs both closes with the 2-arg form, and the failing __close's
+       error REPLACES the in-flight object — position and all */
+    {
+      /* the stub registers frame[0]/frame[1] itself (its params — the
+         two objects handed in as call args) and then raises */
+      CHECK(rt_newclosure(cell_of(&fcell), IDX_TBCRAISE, 0, 0, 1) == RT_OK);
+      g_closeok_runs = 0;
+      luaD_checkstack(L, 3);
+      setobj2s(L, L->top.p, &fcell);
+      L->top.p++;
+      setobj2s(L, L->top.p, &badobj);
+      L->top.p++;
+      setobj2s(L, L->top.p, &okobj);
+      L->top.p++;
+      CHECK(lua_pcall(L, 2, 0, 0) != 0);
+      {
+        const char *e = lua_tostring(L, -1);
+        CHECK(e != NULL && strcmp(e, "script:4: a-bad") == 0);
+      }
+      CHECK(g_closeok_runs == 1);
+      CHECK(ttisstring(&g_closeok_err) &&
+            strcmp(getstr(tsvalue(&g_closeok_err)), "script:9: orig") == 0);
+      lua_pop(L, 1);
+      CHECK(rt_err_pending() == 0);
+      CHECK(rt_tbc_count() == 0);
+    }
+
+    /* non-closable raise: a plain table has no __close */
+    {
+      TValue plain;
+      CHECK(rt_newtable(cell_of(&plain), 0, 0) == RT_OK);
+      CHECK(rt_tbc(cell_of(&plain), g_nameidx_v, 33) == RT_ERR);
+      CHECK(err_ends_with("script:33: variable 'v' got a non-closable value"));
+      rt_err_clear();
+    }
+
+    /* false/nil never register */
+    {
+      TValue cells[1];
+      rt_mknil(cell_of(&cells[0]));
+      CHECK(rt_tbc(cell_of(&cells[0]), g_nameidx_v, 34) == RT_OK);
+      rt_mkbool(cell_of(&cells[0]), 0);
+      CHECK(rt_tbc(cell_of(&cells[0]), g_nameidx_v, 34) == RT_OK);
+      CHECK(rt_tbc_count() == 0);
+    }
+  }
+
+  CHECK(rt_wasm_count() == IDX_TBCRAISE + 1);
   CHECK(rt_wasm_proto(-1, 0, 0, 0, 0) == RT_ERR);
 
   if (failures == 0) printf("RT-NATIVE55 PASS\n");

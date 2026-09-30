@@ -378,6 +378,40 @@ re-port + searchpath, U4d error(nil)/os surface, U4e mirror removal, U4f seam en
   GluaFull, CLua55Conformance, U2f oracles, WasmFullMatrix/ErrorSuite
   ×wasmtime/wazero, full -short ./...). Official triage unchanged:
   attrib:33 → U4g, errors:264 → U4g skip, coroutine:283 → row 22.
-- U4f next — wasm backend OP_TBC/OP_CLOSE lowering (the luawasm/emit.go
-  panic list), rt_tbc/rt_close ABI entries on the v4 blob, blob rebuild
-  + `go clean -testcache` + runtime/tests coverage.
+- **U4f DONE (2026-09-30, row 75)** — wasm backend + rt ABI TBC. The rt
+  keeps an rt-OWNED tbc registry (address-keyed descending list, same
+  zero-patch discipline as the upvalue registry — never L->tbclist):
+  rt_tbc = luaF_newtbcupval + checkclosemth (false/nil exempt; the
+  non-closable raise names the variable from a backend-registered name
+  table via LocalNameAt — `variable 'v' got a non-closable value`, the
+  position from rt_run's line); rt_close = the OP_CLOSE/return/tailcall
+  close (upvalues first, 1-arg __close innermost-first, a failure keeps
+  remaining entries linked like stock's failing luaF_close). Backend:
+  OP_TBC→rt_tbc, OP_CLOSE→rt_close, RETURN/TAILCALL close the frame
+  first. The trampoline's two error arms run rt_close_err (stock
+  luaD_closeprotected: 2-arg `__close(obj, errobj)`, last-error-wins
+  replacement) BEFORE rt_frame_restore — cells stay allocated while
+  __close dispatches. TWO runtime bugs found + fixed en route: (1) the
+  staging must be CLEARED while error-path closes dispatch (rt_run_raw,
+  new): rt_run's err_pending gate was silently refusing each
+  metamethod's first protected op — half the closes aborted mid-body;
+  (2) err_prefixed is recomputed per staging (reset before detection —
+  latent until U4f's back-to-back stagings): a stale flag suppressed
+  the position prefix on the first failing close's message. ERRMEM/
+  ERRERR on the guarded arm downgrade to LUA_ERRRUN through the loop
+  (stock's own closeprotected catch). Ruled: error(msg, 0) inside
+  __close keeps the row-60 seam (corpora use level-1 — byte-exact);
+  `_cli-tests/calc.lua` fixed for 5.4's const generic-for control
+  variable (U4a's check_readonly, matches stock). Verified: RT-NATIVE55
+  ×{plain,ASan,UBSan} (normal/error-path/non-closable/exempt battery);
+  a three-engine level-1 probe battery byte-IDENTICAL (incl. tbc×upvalue
+  interplay); blob rebuilt + `go clean -testcache`; full battery green —
+  TestWasmFullMatrix 1497/1497 (0 diffs, 4 ledgered skips),
+  ErrorSuites + wazero legs, root, CLua55/CLua conformance, U1/U2
+  gates, U2f oracles, WasmGluaFull, `_cli-tests` make
+  ×{wasmtime, WAZERO=1}.
+- U4g next — `_u4` corpus slices; `_wasm-err-tests` TBC-in-error-path
+  additions (all engines); `u4_test.go` (TestU4Gate + TestU4OfficialSuite
+  with the errors.lua light-udata and coroutine row-22 skips);
+  attrib.lua's searchpath message re-pin (loadlib.go); delete
+  `testdiff/u4probe_test.go` + `_u3/dev/`; ledger/docs/memory closeout.

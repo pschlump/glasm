@@ -674,9 +674,24 @@ func (fe *funcEmitter) emitBlockBody(start, end int) {
 			fe.f.Call(fe.b.imp("rt_concat"))
 			fe.checkStatus()
 			fe.bumpTop(A + 1)
+		case lua.OP_TBC:
+			// U4f: register the variable's cell in the rt tbc registry
+			// (false/nil exempt; a non-closable value raises with the
+			// variable's name from the init-registered name table; the
+			// line gives the raise its "chunk:line: " position — the
+			// interp raises at the OP_TBC's own position)
+			fe.cellAddr(A)
+			fe.f.I32Const(int32(fe.pi.tbcIdx[pc]))
+			fe.f.I32Const(fe.line(pc))
+			fe.f.Call(fe.b.imp("rt_tbc"))
+			fe.checkStatus()
 		case lua.OP_CLOSE:
+			// U4f: the tbc-aware close (upvalues first, then 1-arg
+			// __close over the registry entries >= frame+16*A — the
+			// interp's OP_CLOSE = closeUpvalues(RA) + closeTBC(RA))
 			fe.f.LocalGet(0).I32Const(int32(cellSize * A)).I32Add()
-			fe.f.Call(fe.b.imp("rt_close_upvals"))
+			fe.f.Call(fe.b.imp("rt_close"))
+			fe.checkStatus()
 		case lua.OP_JMP:
 			fe.setBlk(fe.blockOf(fe.jumpTarget(pc)))
 			terminal = true
@@ -771,7 +786,7 @@ func (fe *funcEmitter) emitBlockBody(start, end int) {
 		case lua.OP_EXTRAARG:
 			// consumed by its primary (LOADKX/NEWTABLE/SETLIST)
 			panic("luawasm: EXTRAARG reached as real code (pairing bug)")
-		case lua.OP_TBC, lua.OP_GETVARG, lua.OP_ERRNNIL:
+		case lua.OP_GETVARG, lua.OP_ERRNNIL:
 			panic(fmt.Sprintf("luawasm: opcode %d never compiles until U5", op))
 		default:
 			panic(fmt.Sprintf("luawasm: unhandled opcode %d", op))

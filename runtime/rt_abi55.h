@@ -211,6 +211,22 @@ void rt_setupval(rt_addr cl, int32_t idx, rt_addr cell);
 void rt_close_upvals(rt_addr level);
 int32_t rt_clidx(rt_addr funcell);
 
+/* to-be-closed variables (U4f) — the rt-owned registry keyed by frame-cell
+   address (stock threads L->tbclist through the Lua stack slots; compiled
+   frames' registers live in the wasm frame region instead). rt_name_put
+   registers one variable-name blob at init (index = position, embedded in
+   the OP_TBC lowering); rt_tbc registers a cell (false/nil exempt, __close
+   checked — the non-closable raise names the variable from that table);
+   rt_close is the OP_CLOSE/return close (upvalues first, then 1-arg
+   __close, a failure staged as RT_ERR like every rt entry). rt_close_err
+   and rt_tbc_count are C-internal surfaces (the trampoline's unwind + the
+   native ABI tests) — NOT wasm imports. */
+int32_t rt_name_put(rt_addr ptr, int32_t len);
+int32_t rt_tbc(rt_addr celladdr, int32_t nameidx, int32_t line);
+int32_t rt_close(rt_addr level);
+void rt_close_err(rt_addr level);
+int32_t rt_tbc_count(void);
+
 /* frame stack (chunked bump region; args copied at push) */
 rt_addr rt_wasm_push_frame(void *L, void *base, int mdidx, int nargs);
 rt_addr rt_frame_cursor(void);

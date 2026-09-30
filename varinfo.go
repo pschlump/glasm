@@ -193,6 +193,13 @@ func localNameAt(p *FunctionProto, localnum, pc int) (string, bool) {
 	return "", false
 }
 
+// LocalNameAt is localNameAt exported for the wasm backend's OP_TBC
+// lowering (U4f): the non-closable raise names the variable, and the
+// backend precomputes the interp's DbgLocals answer at compile time.
+func LocalNameAt(p *FunctionProto, localnum, pc int) (string, bool) {
+	return localNameAt(p, localnum, pc)
+}
+
 // upvalName — stock upvalname ("?" for unnamed captures).
 func upvalName(p *FunctionProto, uv int) string {
 	if uv >= 0 && uv < len(p.Upvalues) && p.Upvalues[uv].Name != "" {

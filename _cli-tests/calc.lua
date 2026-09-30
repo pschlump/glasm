@@ -199,8 +199,8 @@ if arg[1] == "-f" then
         print("calc: " .. arg[2] .. ": No such file or directory")
         return
     end
-    for line in f:lines() do
-        line = string.gsub(line, "%s+$", "")
+    for raw in f:lines() do
+        local line = string.gsub(raw, "%s+$", "")
         if #line > 0 and string.sub(line, 1, 1) ~= "#" then
             exprs[#exprs + 1] = line
         end

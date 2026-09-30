@@ -108,10 +108,11 @@ static void stage_err_line(int line) {
   }
 }
 
-static void stage_error(void) {
-  const TValue *ev = s2v(curL->top.p - 1);
+/* stage_tvalue fills value/buf/prefixed from a TValue (NOT pending — the
+   callers decide; U4f's error-path close loop re-stages a replaced object
+   through it with the same prefix rules) */
+static void stage_tvalue(const TValue *ev) {
   err_value = *ev;
-  curL->top.p--;
   err_buf_len = 0;
   err_buf[0] = '\0';
   if (ttisstring(ev)) {
@@ -125,7 +126,13 @@ static void stage_error(void) {
        this chunk's position prefix — error() built it, or a nested
        rt_run re-raise staged it — must not gain another prefix at every
        level (stock never re-prefixes; v3 needed the dialect line-stack
-       for this, the zero-patch tree detects the prefix instead). */
+       for this, the zero-patch tree detects the prefix instead).
+       err_prefixed is a property of THIS value, recomputed per staging:
+       the tbc error path stages several objects back-to-back without an
+       rt_err_clear between them (the in-flight error, then a failing
+       __close's replacement), so a stale flag from the previous staging
+       would suppress the position on the next one (U4f). */
+    err_prefixed = 0;
     if (chunk_name_len > 0 && err_buf_len > chunk_name_len &&
         memcmp(err_buf, chunk_name, (size_t)chunk_name_len) == 0 &&
         err_buf[chunk_name_len] == ':')
@@ -133,6 +140,12 @@ static void stage_error(void) {
   } else {
     err_prefixed = 1; /* non-string: the engine renders the value */
   }
+}
+
+static void stage_error(void) {
+  const TValue *ev = s2v(curL->top.p - 1);
+  stage_tvalue(ev);
+  curL->top.p--;
   err_pending = 1;
 }
 
@@ -210,13 +223,22 @@ static void protect_trampoline(lua_State *L, void *ud) {
   cur_body();
 }
 
+/* rt_run_raw is the protection without rt_run's err_pending gate, staging
+   or prefixing (U4f): bodies that must run while an error is already
+   staged — the error-path close loop — fold failures themselves. */
+static int rt_run_raw(body_fn fn) {
+  TStatus status;
+  cur_body = fn;
+  lua_lock(curL);
+  status = luaD_rawrunprotected(curL, protect_trampoline, NULL);
+  lua_unlock(curL);
+  return (int)status;
+}
+
 static int rt_run(body_fn fn, int32_t line) {
   int prefixed;
   if (err_pending) return RT_ERR;
-  cur_body = fn;
-  lua_lock(curL);
-  TStatus status = luaD_rawrunprotected(curL, protect_trampoline, NULL);
-  lua_unlock(curL);
+  TStatus status = (TStatus)rt_run_raw(fn);
   if (status != LUA_OK) {
     if (status == LUA_ERRMEM || status == LUA_ERRERR)
       stage_c_error(status); /* no stack value: stage the literal */
@@ -888,6 +910,222 @@ void rt_close_upvals(rt_addr level) {
   }
 }
 
+/* ---- the rt-owned to-be-closed registry (U4f) --------------------------
+**
+** Stock threads L->tbclist through the Lua stack slots (luaF_newtbcupval);
+** compiled frames' registers live in the wasm frame region instead, so the
+** rt keeps its own address-keyed list — same discipline as the upvalue
+** registry above (never L->tbclist: stock's poptbclist/prepcallclosemth
+** would dereference wasm cell addresses as StkIds). Innermost = highest
+** cell = closed first, like both stock's list and the interp's LState
+** tbclist.
+*/
+
+struct rt_tbclink {
+  struct rt_tbclink *next;
+  rt_addr v; /* the variable's cell */
+};
+static struct rt_tbclink *rt_tbclist;
+
+/* the variable-name table the backend registers at init: the non-closable
+   raise names the variable (the interp answers from the proto's debug
+   locals at run time; the backend precomputed the same name and passes its
+   table index — the rt side stays debug-info-free). The bytes live in the
+   never-freed rt_frame_alloc string buffer, like the chunk name. */
+struct rt_name {
+  const char *ptr;
+  int32_t len;
+};
+static struct rt_name *rt_names;
+static int rt_names_n, rt_names_cap;
+
+int32_t rt_name_put(rt_addr ptr, int32_t len) {
+  if (rt_names_n == rt_names_cap) {
+    int ncap = rt_names_cap ? rt_names_cap * 2 : 8;
+    struct rt_name *nn =
+        (struct rt_name *)realloc(rt_names, (size_t)ncap * sizeof *nn);
+    if (nn == NULL) return -1;
+    rt_names = nn;
+    rt_names_cap = ncap;
+  }
+  rt_names[rt_names_n].ptr = (const char *)(size_t)ptr;
+  rt_names[rt_names_n].len = len;
+  return rt_names_n++;
+}
+
+static const char *rt_name_get(int32_t idx, int32_t *len) {
+  if (idx < 0 || idx >= rt_names_n) {
+    *len = 1;
+    return "?";
+  }
+  *len = rt_names[idx].len;
+  return rt_names[idx].ptr;
+}
+
+/* registration (OP_TBC; stock luaF_newtbcupval + checkclosemth): false/nil
+   exempt; anything else needs a __close metamethod AT REGISTRATION TIME,
+   else the variable-name error. luaG_runerror over the trampoline's C
+   frame adds no position (isLua(ci) is false), so rt_run's line parameter
+   builds the "chunk:line: " prefix — matching the interp's raise at the
+   OP_TBC position (stock lvm.c luaG_runerror at the running frame). */
+static rt_addr tbc_cell;
+static int32_t tbc_nameidx;
+
+static void tbc_body(void) {
+  TValue *obj = (TValue *)(size_t)tbc_cell;
+  const TValue *tm;
+  struct rt_tbclink *e;
+  if (l_isfalse(obj)) return;
+  tm = luaT_gettmbyobj(curL, obj, TM_CLOSE);
+  if (ttisnil(tm)) {
+    int32_t nlen;
+    const char *nm = rt_name_get(tbc_nameidx, &nlen);
+    char buf[160];
+    snprintf(buf, sizeof buf, "variable '%.*s' got a non-closable value",
+             (int)nlen, nm);
+    luaG_runerror(curL, "%s", buf);
+    return; /* unreachable (noret) */
+  }
+  e = (struct rt_tbclink *)malloc(sizeof *e);
+  if (e == NULL) {
+    luaG_runerror(curL, "not enough memory");
+    return;
+  }
+  e->v = tbc_cell;
+  e->next = rt_tbclist;
+  rt_tbclist = e;
+}
+
+int32_t rt_tbc(rt_addr celladdr, int32_t nameidx, int32_t line) {
+  tbc_cell = celladdr;
+  tbc_nameidx = nameidx;
+  return rt_run(tbc_body, line);
+}
+
+int32_t rt_tbc_count(void) {
+  int32_t n = 0;
+  struct rt_tbclink *e;
+  for (e = rt_tbclist; e != NULL; e = e->next) n++;
+  return n;
+}
+
+/* the __close call (stock callclosemethod): push tm, obj and, on error
+   paths, the in-flight errobj; luaD_callnoyield with 0 results. The tm is
+   looked up fresh (stock does the same — a metatable edit between
+   registration and close means stock calls whatever it finds, nil
+   included). Statics are (re)set immediately before each protected call,
+   so a __close that re-enters compiled code through the trampoline sees
+   its own values (the reentrancy law). */
+static TValue cl_obj, cl_err;
+static int cl_twoarg;
+
+static void close_body(void) {
+  const TValue *tm = luaT_gettmbyobj(curL, &cl_obj, TM_CLOSE);
+  StkId func = curL->top.p;
+  luaD_checkstack(curL, 3);
+  setobj2s(curL, func, tm);
+  setobj2s(curL, func + 1, &cl_obj);
+  if (cl_twoarg) setobj2s(curL, func + 2, &cl_err);
+  curL->top.p = func + 2 + cl_twoarg;
+  luaD_callnoyield(curL, func, 0);
+}
+
+/* call __close under raw protection; returns the TStatus. LUA_ERRRUN
+   failures leave the new error at top-1 (the raiser pushed it before
+   luaD_throw — the staging discipline's invariant); ERRMEM/ERRERR leave
+   nothing on the stack. */
+static int rt_close_call(TValue *obj, TValue *err) {
+  cl_obj = *obj;
+  if (err != NULL) {
+    cl_err = *err;
+    cl_twoarg = 1;
+  } else {
+    cl_twoarg = 0;
+  }
+  return rt_run_raw(close_body);
+}
+
+/* rt_close is the OP_CLOSE/return-path close (stock luaF_close at status
+   LUA_OK): upvalues first, then the tbc loop with the 1-arg __close(obj).
+   A __close failure propagates immediately (stock luaD_callnoyield under
+   OP_CLOSE): it is staged, RT_ERR returned, and the REMAINING entries stay
+   linked — the unwinding boundary's rt_close_err finishes them with the
+   error-path form, exactly as stock's failing luaF_close leaves the rest
+   of L->tbclist for luaD_closeprotected at the pcall. */
+int32_t rt_close(rt_addr level) {
+  rt_close_upvals(level);
+  while (rt_tbclist != NULL && rt_tbclist->v >= level) {
+    struct rt_tbclink *e = rt_tbclist;
+    TValue *obj;
+    int st;
+    rt_tbclist = e->next;
+    obj = (TValue *)(size_t)e->v;
+    free(e);
+    if (l_isfalse(obj)) continue; /* defensive: false/nil never register */
+    st = rt_close_call(obj, NULL);
+    if (st != LUA_OK) {
+      if (st == LUA_ERRMEM || st == LUA_ERRERR)
+        stage_c_error(st); /* nothing on the stack: stage the literal */
+      else
+        stage_error();
+      return RT_ERR;
+    }
+  }
+  return RT_OK;
+}
+
+/* rt_close_err is the unwinding boundary's close (stock
+   luaD_closeprotected over the tbc list; called from the trampoline's
+   error paths only). The in-flight error is the staged err_value; every
+   entry >= level closes with the 2-arg __close(obj, errobj) under
+   per-entry raw protection, a failing close only REPLACES the in-flight
+   object, and closing continues until the list is clean — the LAST raised
+   error wins (stock's status replacement; there is no special "error in
+   __close" text). The final object is re-staged for rtw_reraise.
+
+   The staging is CLEARED while the closes dispatch: stock hands the
+   in-flight object to __close as an ARGUMENT, never as ambient state, so
+   the metamethod's body is an ordinary call — leaving err_pending set
+   would make rt_run refuse its first protected op (concat, tostring, a
+   nested call) and the close would abort silently. had remembers whether
+   an error was in flight at entry: a nested (empty) rt_close_err must
+   not resurrect a stale value, and the no-tbc path stays untouched. */
+void rt_close_err(rt_addr level) {
+  int had = err_pending;
+  int save_line = err_line, save_line_set = err_line_set;
+  TValue errobj = err_value; /* snapshot: reentrant dispatches re-stage */
+  int failed = 0;
+  err_pending = 0;
+  while (rt_tbclist != NULL && rt_tbclist->v >= level) {
+    struct rt_tbclink *e = rt_tbclist;
+    TValue *obj;
+    int st;
+    rt_tbclist = e->next;
+    obj = (TValue *)(size_t)e->v;
+    free(e);
+    if (l_isfalse(obj)) continue;
+    st = rt_close_call(obj, &errobj);
+    if (st != LUA_OK) {
+      failed = 1;
+      if (st == LUA_ERRMEM || st == LUA_ERRERR) {
+        stage_c_error(st);
+        errobj = err_value;
+      } else {
+        errobj = *s2v(curL->top.p - 1);
+        curL->top.p--;
+      }
+    }
+  }
+  if (failed || had) {
+    stage_tvalue(&errobj);
+    err_pending = 1;
+    if (had && !err_line_set) {
+      err_line = save_line; /* the raise line belongs to the original error */
+      err_line_set = save_line_set;
+    }
+  }
+}
+
 /* the globals-table TValue (registry[LUA_RIDX_GLOBALS]) — read through
    the public API under protection (allocation-free but runs no code) */
 static TValue nc_gt, *nc_gtdst;
@@ -1176,11 +1414,33 @@ static int rt_wasm_trampoline(lua_State *L) {
     /* a deeper luaD_throw crossed the boundary (a C-side throw inside
        the dispatch — e.g. the result copy's checkstack): restore this
        level and re-raise. The error object stays wherever the thrower
-       left it; luaD_seterrorobj reads it there (v3 posture). */
+       left it; luaD_seterrorobj reads it there (v3 posture).
+       U4f: when this dispatch's dying frames hold to-be-closed variables,
+       the boundary must run the protected closes FIRST (stock luaD_pcall:
+       closeprotected, then seterrorobj) — the staged object folds into
+       the 2-arg __close calls and a failing close replaces it (last
+       error wins). Cells must stay allocated while __close runs (its
+       dispatches push frames above the cursor), so the close precedes
+       rt_frame_restore; guarded on pending entries so the no-tbc posture
+       is byte-identical to before (an ERRMEM/ERRERR status re-raises as
+       LUA_ERRRUN on this arm only). */
+    if (rt_tbclist != NULL && rt_tbclist->v >= saved_cursor) {
+      if (status == LUA_ERRMEM || status == LUA_ERRERR)
+        stage_c_error(status); /* no stack value: stage the literal */
+      else
+        stage_error();
+      rt_close_err(saved_cursor);
+      rt_frame_restore(saved_cursor);
+      rtw_reraise(L);
+    }
     rt_frame_restore(saved_cursor);
     luaD_throw(L, status);
   }
   if (ctx.nret == RTW_ERR) {
+    /* U4f: the dispatch staged the error — close this dispatch's dying
+       frames with the error-path form BEFORE the region goes away (see
+       the arm above), then re-raise the (possibly replaced) object */
+    rt_close_err(saved_cursor);
     rt_frame_restore(saved_cursor);
     rtw_reraise(L);
   }
