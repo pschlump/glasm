@@ -1318,12 +1318,17 @@ func init() {
 					}
 				}
 			}
+			// U4: upvalues first, then to-be-closed (stock luaF_close);
+			// a __close error propagates as a normal error
+			L.closeTBC(RA)
 			return 0
 		},
 		func(L *LState, inst uint32, baseframe *callFrame) int { //OP_TBC
-			// to-be-closed variables arrive with U5 (<close>); the
-			// compiler never emits OP_TBC yet
-			L.RaiseError("OP_TBC not supported until U5")
+			cf := L.currentFrame
+			lbase := cf.LocalBase
+			A := int(inst>>7) & 0xff //GETA
+			RA := lbase + A
+			L.registerTBC(RA, A+1)
 			return 0
 		},
 		func(L *LState, inst uint32, baseframe *callFrame) int { //OP_JMP
@@ -1583,6 +1588,11 @@ func init() {
 					}
 				}
 			}
+			// U4: close this frame's <close> variables before the frame
+			// is reused (stock TAILCALL k / CLOSEKTOP; the compiler
+			// suppresses the promotion inside a tbc scope, this is the
+			// safety net)
+			L.closeTBC(lbase)
 			if callable.IsG {
 				luaframe := cf
 				L.pushCallFrame(callFrame{
@@ -2993,6 +3003,10 @@ func doReturn(L *LState, cf *callFrame, baseframe *callFrame, RA, nres, b int) i
 			}
 		}
 	}
+	// U4: the frame's to-be-closed variables close at return too (stock
+	// RETURN k / luaF_close(base, CLOSEKTOP) — unconditional here: the
+	// list is empty when the function declared no <close>)
+	L.closeTBC(lbase)
 	n := cf.NRet
 	if cf.NRet == MultRet {
 		n = nres

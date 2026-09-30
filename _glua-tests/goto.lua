@@ -12,14 +12,14 @@ errmsg([[ ::l1:: ::l1:: ]], "label 'l1'")
 
 
 -- undefined label
-errmsg([[ goto l1; local aa ::l1:: ::l2:: print(3) ]], "local 'aa'")
+errmsg([[ goto l1; local aa ::l1:: ::l2:: print(3) ]], "scope of 'aa'")
 
 -- jumping over variable definition
 errmsg([[
 do local bb, cc; goto l1; end
 local aa
 ::l1:: print(3)
-]], "local 'aa'")
+]], "scope of 'aa'")
 
 -- jumping into a block
 errmsg([[ do ::l1:: end goto l1 ]], "label 'l1'")
@@ -32,7 +32,7 @@ errmsg([[
     local xuxu = 10
     ::cont::
   until xuxu < x
-]], "local 'xuxu'")
+]], "scope of 'xuxu'")
 
 -- simple gotos
 local x
@@ -62,8 +62,14 @@ do
   assert(assert(load(prog))() == 31)
 end
 
--- goto to correct label when nested
-do goto l3; ::l3:: end   -- does not loop jumping to previous label 'l3'
+-- 5.5: a label cannot shadow an ACTIVE outer label (checkrepeated is
+-- function-wide over active labels; the outer ::l3:: above line 45 is
+-- still active here, so this whole shape is an error now)
+errmsg([[
+::l3::
+do goto l3; ::l3:: end
+]], "already defined")
+
 
 -- ok to jump over local dec. to end of block
 do

@@ -29,6 +29,10 @@ type Error struct {
 	Token   string
 	// NearEOF: report "near <eof>" (unquoted) instead of "near '<token>'".
 	NearEOF bool
+	// Sem: a luaK_semerror-class error — stock zeroes the token before
+	// luaX_syntaxerror, so the message carries no "near" part at all
+	// (attribute/const/label errors; U4).
+	Sem bool
 	// EOFLine is the last real line number, used when Pos.Line == EOF
 	// (stock reports the current line, never a sentinel, at EOZ).
 	EOFLine int
@@ -37,11 +41,24 @@ type Error struct {
 func (e *Error) Error() string {
 	pos := e.Pos
 	src := ChunkID(pos.Source)
+	if e.Sem {
+		return fmt.Sprintf("%s:%d: %s", src, semErrorLine(e), e.Message)
+	}
 	if e.NearEOF || pos.Line == EOF {
 		return fmt.Sprintf("%s:%d: %s near <eof>", src, e.EOFLine, e.Message)
 	} else {
 		return fmt.Sprintf("%s:%d: %s near '%s'", src, pos.Line, e.Message, e.Token)
 	}
+}
+
+// semErrorLine is the line a semerror reports: the current token's line,
+// falling back to the last real line at end-of-input (stock's ls->linenumber
+// never advances past the final token).
+func semErrorLine(e *Error) int {
+	if e.Pos.Line == EOF {
+		return e.EOFLine
+	}
+	return e.Pos.Line
 }
 
 // ChunkID renders a source name the way stock Lua's luaO_chunkid does
@@ -902,6 +919,17 @@ func (lx *Lexer) SyntaxErrorAtNext() {
 
 func (lx *Lexer) TokenError(tok ast.Token, message string) {
 	panic(lx.scanner.TokenError(tok, message))
+}
+
+// SemError raises a luaK_semerror-class error (U4): stock wording with no
+// "near '<token>'" suffix, reported at the current line — the lexer is
+// positioned on the lookahead when grammar actions run, matching stock's
+// ls->linenumber at the semerror. Used for the attribute/const checks the
+// stock parser raises mid-parse.
+func (lx *Lexer) SemError(message string) {
+	e := lx.scanner.TokenError(lx.Token, message)
+	e.Sem = true
+	panic(e)
 }
 
 func Parse(reader io.Reader, name string) (chunk []ast.Stmt, err error) {

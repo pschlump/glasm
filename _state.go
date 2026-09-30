@@ -871,6 +871,54 @@ func (ls *LState) closeUpvalues(idx int) { // +inline-start
 	}
 } // +inline-end
 
+// registerTBC is the OP_TBC body (U4; stock luaF_newtbcupval): false/nil
+// values are exempt — no entry, no metamethod check; anything else must
+// have a __close metamethod AT REGISTRATION TIME, else the
+// variable-name error (luaG_findlocal over the frame's debug info;
+// regnum is the 1-based register offset, pc the running instruction).
+func (ls *LState) registerTBC(idx int, regnum int) {
+	lv := ls.reg.Get(idx)
+	if LVIsFalse(lv) {
+		return
+	}
+	if op := ls.metaOp1(lv, "__close"); op.Type() != LTFunction {
+		name := "?"
+		if cf := ls.currentFrame; cf != nil && cf.Fn != nil && !cf.Fn.IsG && cf.Fn.Proto != nil {
+			if pc := cf.Pc - 1; pc >= 0 && pc < len(cf.Fn.Proto.Code) {
+				if n, ok := localNameAt(cf.Fn.Proto, regnum, pc); ok {
+					name = n
+				}
+			}
+		}
+		ls.RaiseError("variable '%s' got a non-closable value", name)
+	}
+	ls.tbclist = &tbcEntry{idx: idx, prev: ls.tbclist}
+}
+
+// closeTBC closes the to-be-closed variables at or above the register
+// level (U4; stock luaF_close's tbclist loop): innermost first — the
+// list is stack-ordered — with __close(obj) as the single argument (the
+// 2-argument error-path form is closeTBCProtected, U4d). A __close
+// error propagates as a normal error. The entry is unlinked before the
+// metamethod call (stock poptbclist ordering), so a __close that runs
+// more Lua never re-closes it; reentrant registrations land above the
+// dying frame and are closed by their own returns.
+func (ls *LState) closeTBC(level int) {
+	for ls.tbclist != nil && ls.tbclist.idx >= level {
+		e := ls.tbclist
+		ls.tbclist = e.prev
+		lv := ls.reg.Get(e.idx)
+		if LVIsFalse(lv) {
+			continue // defensive: false/nil never register
+		}
+		if op := ls.metaOp1(lv, "__close"); op.Type() == LTFunction {
+			ls.reg.Push(op)
+			ls.reg.Push(lv)
+			ls.Call(1, 0)
+		}
+	}
+}
+
 func (ls *LState) findUpvalue(idx int) *Upvalue {
 	var prev *Upvalue
 	var next *Upvalue

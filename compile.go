@@ -145,6 +145,10 @@ type gotoLabelDesc struct { // {{{
 	Pc                 int
 	Line               int
 	NumActiveLocalVars int
+	// NeedClose (stock Labeldesc.close): the goto was hoisted out of a
+	// block with upvalues/tbc while escaping some variable's scope — its
+	// CLOSE placeholder is required when the goto resolves.
+	NeedClose bool
 }
 
 func newLabelDesc(id int, name string, pc, line, n int) *gotoLabelDesc {
@@ -155,10 +159,6 @@ func newLabelDesc(id int, name string, pc, line, n int) *gotoLabelDesc {
 		Line:               line,
 		NumActiveLocalVars: n,
 	}
-}
-
-func (l *gotoLabelDesc) SetNumActiveLocalVars(n int) {
-	l.NumActiveLocalVars = n
 } // }}}
 
 type CompileError struct { // {{{
@@ -334,12 +334,17 @@ type varNamePoolValue struct {
 }
 
 type varNamePool struct {
-	names  []string
+	names []string
+	// kinds holds the variable kind per name (U4; stock lparser.h VDK*/
+	// Vardesc kinds — see the varKind* constants). Parallel to names;
+	// separate per block, so sibling-block locals sharing a register
+	// never share a kind.
+	kinds  []int
 	offset int
 }
 
 func newVarNamePool(offset int) *varNamePool {
-	return &varNamePool{make([]string, 0, 16), offset}
+	return &varNamePool{make([]string, 0, 16), make([]int, 0, 16), offset}
 }
 
 func (vp *varNamePool) Names() []string {
@@ -378,7 +383,54 @@ func (vp *varNamePool) RegisterUnique(name string) int {
 
 func (vp *varNamePool) Register(name string) int {
 	vp.names = append(vp.names, name)
+	vp.kinds = append(vp.kinds, varKindReg)
 	return len(vp.names) - 1 + vp.offset
+}
+
+// RegisterKind is Register with an explicit variable kind (U4 attributes).
+func (vp *varNamePool) RegisterKind(name string, kind int) int {
+	vp.names = append(vp.names, name)
+	vp.kinds = append(vp.kinds, kind)
+	return len(vp.names) - 1 + vp.offset
+}
+
+// kindAt is the kind of the local at global (function-wide) index.
+func (vp *varNamePool) kindAt(index int) int {
+	return vp.kinds[index-vp.offset]
+}
+
+// countKind counts the locals of a kind declared in this block's pool.
+func (vp *varNamePool) countKind(kind int) int {
+	n := 0
+	for _, k := range vp.kinds {
+		if k == kind {
+			n++
+		}
+	}
+	return n
+}
+
+/*
+	Local variable kinds (U4; stock lparser.h's VDK* numbers — only the
+
+three the fork models at U4: the RDKCTC compile-time constants and the
+GDK* global-declaration kinds arrive with U5's resolver).
+*/
+const (
+	varKindReg   = 0 // VDKREG — a regular local
+	varKindConst = 1 // RDKCONST — <const>: assignment-locked
+	varKindTBC   = 3 // RDKTOCLOSE — <close>: assignment-locked + OP_TBC
+)
+
+// attribToKind maps an AST attribute string to a variable kind.
+func attribToKind(attrib string) int {
+	switch attrib {
+	case "const":
+		return varKindConst
+	case "close":
+		return varKindTBC
+	}
+	return varKindReg
 }
 
 /* }}} VarNamePool */
@@ -386,38 +438,32 @@ func (vp *varNamePool) Register(name string) int {
 /* FuncContext {{{ */
 
 type codeBlock struct {
-	LocalVars      *varNamePool
-	BreakLabel     int
-	Parent         *codeBlock
-	RefUpvalue     bool
-	LineStart      int
-	LastLine       int
-	labels         map[string]*gotoLabelDesc
-	firstGotoIndex int
+	LocalVars  *varNamePool
+	BreakLabel int
+	Parent     *codeBlock
+	RefUpvalue bool
+	LineStart  int
+	LastLine   int
+	// firstLabelIndex / firstGotoIndex (stock BlockCnt.firstlabel /
+	// firstgoto): indexes into the function-wide active-label and pending-
+	// goto lists captured at block entry. A block's solveGotos matches only
+	// its own labels (>= firstLabelIndex) and only its own gotos (>=
+	// firstGotoIndex); everything else hoists outward.
+	firstLabelIndex int
+	firstGotoIndex  int
+	// entryNactvar is the active-local count at block entry (stock
+	// bl->nactvar) — the level a hoisted goto drops to, and the level a
+	// last-statement label's scope is pinned to.
+	entryNactvar int
 }
 
-func newCodeBlock(localvars *varNamePool, blabel int, parent *codeBlock, pos ast.PositionHolder, firstGotoIndex int) *codeBlock {
-	bl := &codeBlock{localvars, blabel, parent, false, 0, 0, map[string]*gotoLabelDesc{}, firstGotoIndex}
+func newCodeBlock(localvars *varNamePool, blabel int, parent *codeBlock, pos ast.PositionHolder, firstLabelIndex, firstGotoIndex, entryNactvar int) *codeBlock {
+	bl := &codeBlock{localvars, blabel, parent, false, 0, 0, firstLabelIndex, firstGotoIndex, entryNactvar}
 	if pos != nil {
 		bl.LineStart = pos.Line()
 		bl.LastLine = pos.LastLine()
 	}
 	return bl
-}
-
-func (b *codeBlock) AddLabel(label *gotoLabelDesc) *gotoLabelDesc {
-	if old, ok := b.labels[label.Name]; ok {
-		return old
-	}
-	b.labels[label.Name] = label
-	return nil
-}
-
-func (b *codeBlock) GetLabel(label string) *gotoLabelDesc {
-	if v, ok := b.labels[label]; ok {
-		return v
-	}
-	return nil
 }
 
 func (b *codeBlock) LocalVarsCount() int {
@@ -429,109 +475,125 @@ func (b *codeBlock) LocalVarsCount() int {
 }
 
 type funcContext struct {
-	Proto           *FunctionProto
-	Code            *codeStore
-	Parent          *funcContext
-	Upvalues        *varNamePool
-	Block           *codeBlock
-	Blocks          []*codeBlock
-	regTop          int
-	labelId         int
-	labelPc         map[int]int
-	gotosCount      int
-	unresolvedGotos map[int]*gotoLabelDesc
+	Proto    *FunctionProto
+	Code     *codeStore
+	Parent   *funcContext
+	Upvalues *varNamePool
+	Block    *codeBlock
+	Blocks   []*codeBlock
+	regTop   int
+	labelId  int
+	labelPc  map[int]int
+	// labels (stock ls->dyd->label, per function): the ACTIVE labels,
+	// block-truncated at LeaveBlock — a label is visible only while its
+	// block is open. gotos (ls->dyd->gt): pending gotos, order-preserving,
+	// removed as they resolve; both lists share one desc type.
+	labels []*gotoLabelDesc
+	gotos  []*gotoLabelDesc
+	// NeedsClose (stock fs->needclose): this function's frames can hold
+	// open upvalues or to-be-closed variables at return — the RETURN
+	// k bit / RETURN0→RETURN rewrite in compileReturnStmt.
+	NeedsClose bool
+	// tbcActive is stock's insidetbc, time-ordered: it counts <close>
+	// declarations compiled but not yet closed (decremented when the
+	// owning block leaves). OP_TAILCALL promotion is suppressed while
+	// set — the frame's closes must not be skipped.
+	tbcActive int
 }
 
 func newFuncContext(sourcename string, parent *funcContext) *funcContext {
 	fc := &funcContext{
-		Proto:           newFunctionProto(sourcename),
-		Code:            &codeStore{make([]uint32, 0, 1024), make([]int, 0, 1024), 0},
-		Parent:          parent,
-		Upvalues:        newVarNamePool(0),
-		Block:           newCodeBlock(newVarNamePool(0), labelNoJump, nil, nil, 0),
-		regTop:          0,
-		labelId:         1,
-		labelPc:         map[int]int{},
-		gotosCount:      0,
-		unresolvedGotos: map[int]*gotoLabelDesc{},
+		Proto:    newFunctionProto(sourcename),
+		Code:     &codeStore{make([]uint32, 0, 1024), make([]int, 0, 1024), 0},
+		Parent:   parent,
+		Upvalues: newVarNamePool(0),
+		Block:    newCodeBlock(newVarNamePool(0), labelNoJump, nil, nil, 0, 0, 0),
+		regTop:   0,
+		labelId:  1,
+		labelPc:  map[int]int{},
 	}
 	fc.Blocks = []*codeBlock{fc.Block}
 	return fc
 }
 
-func (fc *funcContext) CheckUnresolvedGoto() {
-	for i := fc.Block.firstGotoIndex; i < fc.gotosCount; i++ {
-		gotoLabel, ok := fc.unresolvedGotos[i]
-		if !ok {
-			continue
+// findActiveLabel (stock findlabel): the first active label named name at
+// or after list index ilb.
+func (fc *funcContext) findActiveLabel(name string, ilb int) *gotoLabelDesc {
+	for i := ilb; i < len(fc.labels); i++ {
+		if fc.labels[i].Name == name {
+			return fc.labels[i]
 		}
-		raiseCompileError(fc, fc.Proto.LastLineDefined, "no visible label '%s' for <goto> at line %d", gotoLabel.Name, gotoLabel.Line)
 	}
+	return nil
 }
 
-func (fc *funcContext) AddUnresolvedGoto(label *gotoLabelDesc) {
-	fc.unresolvedGotos[fc.gotosCount] = label
-	fc.gotosCount++
-}
-
-func (fc *funcContext) AddNamedLabel(label *gotoLabelDesc) {
-	if old := fc.Block.AddLabel(label); old != nil {
-		raiseCompileError(fc, label.Line+1, "label '%s' already defined on line %d", label.Name, old.Line)
+// localNameAtCount is the name of the local at function-wide active count
+// (stock getlocalvardesc(fs, nactvar)) — the variable whose scope a goto
+// would have to enter.
+func (fc *funcContext) localNameAtCount(count int) string {
+	var chain []*codeBlock
+	for block := fc.Block; block != nil; block = block.Parent {
+		chain = append(chain, block)
 	}
-	fc.SetLabelPc(label.Id, label.Pc)
-}
-
-func (fc *funcContext) GetNamedLabel(name string) *gotoLabelDesc {
-	return fc.Block.GetLabel(name)
-}
-
-func (fc *funcContext) ResolveGoto(from, to *gotoLabelDesc, index int) {
-	if from.NumActiveLocalVars < to.NumActiveLocalVars {
-		varName := fc.Block.LocalVars.Names()[len(fc.Block.LocalVars.Names())-1]
-		raiseCompileError(fc, to.Line+1, "<goto %s> at line %d jumps into the scope of local '%s'", to.Name, from.Line, varName)
-	}
-	fc.Code.SetSJ(from.Pc, to.Id)
-	delete(fc.unresolvedGotos, index)
-}
-
-func (fc *funcContext) FindLabel(block *codeBlock, gotoLabel *gotoLabelDesc, i int) bool {
-	target := block.GetLabel(gotoLabel.Name)
-	if target != nil {
-		if gotoLabel.NumActiveLocalVars > target.NumActiveLocalVars && block.RefUpvalue {
-			fc.Code.SetA(gotoLabel.Pc-1, target.NumActiveLocalVars)
-		}
-		fc.ResolveGoto(gotoLabel, target, i)
-		return true
-	}
-	return false
-}
-
-func (fc *funcContext) ResolveCurrentBlockGotosWithParentBlock() {
-	blockActiveLocalVars := fc.Block.Parent.LocalVarsCount()
-	for i := fc.Block.firstGotoIndex; i < fc.gotosCount; i++ {
-		gotoLabel, ok := fc.unresolvedGotos[i]
-		if !ok {
-			continue
-		}
-		if gotoLabel.NumActiveLocalVars > blockActiveLocalVars {
-			if fc.Block.RefUpvalue {
-				fc.Code.SetA(gotoLabel.Pc-1, blockActiveLocalVars)
+	for i := len(chain) - 1; i >= 0; i-- {
+		for _, name := range chain[i].LocalVars.Names() {
+			if count == 0 {
+				return name
 			}
-			gotoLabel.SetNumActiveLocalVars(blockActiveLocalVars)
+			count--
 		}
-		fc.FindLabel(fc.Block.Parent, gotoLabel, i)
 	}
+	return "?"
 }
 
-func (fc *funcContext) ResolveForwardGoto(target *gotoLabelDesc) {
-	for i := fc.Block.firstGotoIndex; i <= fc.gotosCount; i++ {
-		gotoLabel, ok := fc.unresolvedGotos[i]
-		if !ok {
-			continue
+// closeGoto (stock closegoto): resolve gotos[g] against label; bup is the
+// finishing block's upvalue flag. A goto's code is [JMP][dead CLOSE]
+// (newgotoentry's placeholder); when the jump needs a close the pair
+// SWAPS so the CLOSE runs first, at the label's variable level.
+func (fc *funcContext) closeGoto(g int, label *gotoLabelDesc, bup bool) {
+	gt := fc.gotos[g]
+	if gt.NumActiveLocalVars < label.NumActiveLocalVars {
+		raiseCompileError(fc, label.Line+1, "<goto %s> at line %d jumps into the scope of '%s'",
+			gt.Name, gt.Line, fc.localNameAtCount(gt.NumActiveLocalVars))
+	}
+	if gt.NeedClose || (label.NumActiveLocalVars < gt.NumActiveLocalVars && bup) {
+		code := fc.Code
+		code.codes[gt.Pc+1] = code.codes[gt.Pc] // jump moves after the close
+		code.codes[gt.Pc] = opCreateABC(OP_CLOSE, label.NumActiveLocalVars, 0, 0)
+		gt.Pc++
+	}
+	fc.Code.SetSJ(gt.Pc, label.Id)
+	fc.gotos = append(fc.gotos[:g], fc.gotos[g+1:]...)
+}
+
+// solveGotos (stock solvegotos at leaveblock): each pending goto of THIS
+// block matches a label of THIS block (>= firstLabelIndex); the rest hoist
+// to the block's entry level — dropping out of a variable's scope in a
+// block with upvalues marks them for a close. The block's labels retire.
+func (fc *funcContext) solveGotos() {
+	bl := fc.Block
+	for igt := bl.firstGotoIndex; igt < len(fc.gotos); {
+		gt := fc.gotos[igt]
+		if lb := fc.findActiveLabel(gt.Name, bl.firstLabelIndex); lb != nil {
+			fc.closeGoto(igt, lb, bl.RefUpvalue)
+		} else {
+			if bl.RefUpvalue && gt.NumActiveLocalVars > bl.entryNactvar {
+				gt.NeedClose = true
+			}
+			gt.NumActiveLocalVars = bl.entryNactvar
+			igt++
 		}
-		if gotoLabel.Name == target.Name {
-			fc.ResolveGoto(gotoLabel, target, i)
-		}
+	}
+	fc.labels = fc.labels[:bl.firstLabelIndex]
+}
+
+// finishFunctionGotos is the function-root arm of stock leaveblock: the
+// root block's gotos resolve, and any still pending is the error.
+func (fc *funcContext) finishFunctionGotos() {
+	fc.solveGotos()
+	if len(fc.gotos) > 0 {
+		gt := fc.gotos[0]
+		raiseCompileError(fc, fc.Proto.LastLineDefined, "no visible label '%s' for <goto> at line %d", gt.Name, gt.Line)
 	}
 }
 
@@ -625,6 +687,49 @@ func (fc *funcContext) RegisterLocalVar(name string) int {
 	return ret
 }
 
+// RegisterLocalVarKind is RegisterLocalVar with a variable kind (U4
+// attributes: <const>/<close> locals; for-loop control variables declare
+// varKindConst like stock lparser.c).
+func (fc *funcContext) RegisterLocalVarKind(name string, kind int) int {
+	ret := fc.Block.LocalVars.RegisterKind(name, kind)
+	fc.Proto.DbgLocals = append(fc.Proto.DbgLocals, &DbgLocalInfo{Name: name, StartPc: fc.Code.LastPC() + 1})
+	fc.SetRegTop(fc.RegTop() + 1)
+	return ret
+}
+
+// checkReadOnlyLocal raises stock's const-assignment error (check_readonly,
+// lparser.c) when name resolves to a const or to-be-closed local of this
+// function, or to a const local of an enclosing function reached through
+// the upvalue chain. Line is the assignment's (the LHS name's).
+func checkReadOnlyLocal(context *funcContext, name string, line int) {
+	if idx, block := context.FindLocalVarAndBlock(name); idx > -1 {
+		if block.LocalVars.kindAt(idx) != varKindReg {
+			raiseCompileError(context, line, "attempt to assign to const variable '%s'", name)
+		}
+		return
+	}
+	if capturedUpvalueKind(context, name) != varKindReg {
+		raiseCompileError(context, line, "attempt to assign to const variable '%s'", name)
+	}
+}
+
+// capturedUpvalueKind resolves the variable kind behind a name this
+// function captures from an enclosing one (stock's Upvaldesc.kind,
+// computed by walking the chain — the capture descriptors are appended
+// after the child body compiles, so the descriptors themselves are not
+// readable yet; the walk always terminates at some ancestor's local).
+func capturedUpvalueKind(context *funcContext, name string) int {
+	for fn := context.Parent; fn != nil; fn = fn.Parent {
+		if idx, block := fn.FindLocalVarAndBlock(name); idx > -1 {
+			return block.LocalVars.kindAt(idx)
+		}
+		if fn.Upvalues.Find(name) > -1 {
+			continue // passthrough capture: keep walking
+		}
+	}
+	return varKindReg
+}
+
 func (fc *funcContext) FindLocalVarAndBlock(name string) (int, *codeBlock) {
 	for block := fc.Block; block != nil; block = block.Parent {
 		if index := block.LocalVars.Find(name); index > -1 {
@@ -648,7 +753,8 @@ func (fc *funcContext) LocalVars() []varNamePoolValue {
 }
 
 func (fc *funcContext) EnterBlock(blabel int, pos ast.PositionHolder) {
-	fc.Block = newCodeBlock(newVarNamePool(fc.RegTop()), blabel, fc.Block, pos, fc.gotosCount)
+	entryNactvar := fc.BlockLocalVarsCount()
+	fc.Block = newCodeBlock(newVarNamePool(fc.RegTop()), blabel, fc.Block, pos, len(fc.labels), len(fc.gotos), entryNactvar)
 	fc.Blocks = append(fc.Blocks, fc.Block)
 }
 
@@ -665,9 +771,15 @@ func (fc *funcContext) LeaveBlock() int {
 	closed := fc.CloseUpvalues()
 	fc.EndScope()
 
-	if fc.Block.Parent != nil {
-		fc.ResolveCurrentBlockGotosWithParentBlock()
-	}
+	// U4: the block's <close> declarations are closed by its OP_CLOSE /
+	// the enclosing return — tailcall promotion is allowed again below
+	// them (stock leaveblock releasing bl->insidetbc).
+	fc.tbcActive -= fc.Block.LocalVars.countKind(varKindTBC)
+
+	// U4c (stock solvegotos at leaveblock): resolve this block's gotos
+	// against its labels, hoist the rest, retire the labels
+	fc.solveGotos()
+
 	fc.Block = fc.Block.Parent
 	fc.SetRegTop(fc.Block.LocalVars.LastIndex())
 	return closed
@@ -914,6 +1026,9 @@ func compileAssignStmtLeft(context *funcContext, stmt *ast.AssignStmt) (int, []*
 		switch st := lhs.(type) {
 		case *ast.IdentExpr:
 			identtype := getIdentRefType(context, context, st)
+			// U4: stock restassign's check_readonly — const/tbc locals
+			// and const upvalues are assignment targets no longer.
+			checkReadOnlyLocal(context, st.Value, sline(st))
 			ec := &expcontext{identtype, regNotDefined, 0}
 			ac := &assigncontext{ec: ec, envLocalIdx: -1}
 			switch identtype {
@@ -1214,15 +1329,45 @@ func compileLocalAssignStmt(context *funcContext, stmt *ast.LocalAssignStmt) { /
 	reg := context.RegTop()
 	if len(stmt.Names) == 1 && len(stmt.Exprs) == 1 {
 		if _, ok := stmt.Exprs[0].(*ast.FunctionExpr); ok {
-			context.RegisterLocalVar(stmt.Names[0])
+			context.RegisterLocalVarKind(stmt.Names[0], localStmtAttrib(stmt, 0))
 			compileRegAssignment(context, stmt.Names, stmt.Exprs, reg, len(stmt.Names), sline(stmt))
+			compileStmtTBC(context, stmt)
 			return
 		}
 	}
 
 	compileRegAssignment(context, stmt.Names, stmt.Exprs, reg, len(stmt.Names), sline(stmt))
-	for _, name := range stmt.Names {
-		context.RegisterLocalVar(name)
+	for i, name := range stmt.Names {
+		context.RegisterLocalVarKind(name, localStmtAttrib(stmt, i))
+	}
+	compileStmtTBC(context, stmt)
+}
+
+// localStmtAttrib is stmt.Attribs[i] as a variable kind ("" names —
+// plain locals — keep varKindReg).
+func localStmtAttrib(stmt *ast.LocalAssignStmt, i int) int {
+	if stmt.Attribs == nil || i >= len(stmt.Attribs) {
+		return varKindReg
+	}
+	return attribToKind(stmt.Attribs[i])
+}
+
+// compileStmtTBC registers a statement's <close> local (at most one — the
+// parser enforces it) AFTER its initializers evaluated (stock localstat's
+// checktoclose tail): OP_TBC A = the variable's register; the owning
+// block gains RefUpvalue so block-exit/break/goto CLOSE fires like a
+// captured local's would, and the function is marked NeedsClose for the
+// RETURN k bit.
+func compileStmtTBC(context *funcContext, stmt *ast.LocalAssignStmt) {
+	for i, name := range stmt.Names {
+		if localStmtAttrib(stmt, i) != varKindTBC {
+			continue
+		}
+		reg := context.FindLocalVar(name)
+		context.Code.AddABC(OP_TBC, reg, 0, 0, sline(stmt))
+		context.Block.RefUpvalue = true
+		context.NeedsClose = true
+		context.tbcActive++
 	}
 } // }}}
 
@@ -1231,26 +1376,45 @@ func compileReturnStmt(context *funcContext, stmt *ast.ReturnStmt) { // {{{
 	code := context.Code
 	reg := context.RegTop()
 	a := reg
+	// U4 (stock luaK_finish): a function marked for closing signals it on
+	// its returns — RETURN/TAILCALL get the k bit; the simple RETURN0/1
+	// become RETURN (the only return opcode that closes). B keeps the
+	// fork's fixed-results convention (B = nres+1), so the rewritten
+	// RETURN0/1 forms carry B=1/B=2.
+	kc := 0
+	if context.NeedsClose {
+		kc = 1
+	}
 
 	if lenexprs == 0 {
-		code.AddABC(OP_RETURN0, 0, 0, 0, sline(stmt))
+		if kc != 0 {
+			code.AddABCk(OP_RETURN, 0, 1, 0, 1, sline(stmt))
+		} else {
+			code.AddABC(OP_RETURN0, 0, 0, 0, sline(stmt))
+		}
 		return
 	}
 	if lenexprs == 1 {
 		switch ex := stmt.Exprs[0].(type) {
 		case *ast.IdentExpr:
 			if idx := context.FindLocalVar(ex.Value); idx > -1 {
-				code.AddABC(OP_RETURN1, idx, 0, 0, sline(stmt))
+				if kc != 0 {
+					code.AddABCk(OP_RETURN, idx, 2, 0, 1, sline(stmt))
+				} else {
+					code.AddABC(OP_RETURN1, idx, 0, 0, sline(stmt))
+				}
 				return
 			}
 		case *ast.FuncCallExpr:
 			if ex.AdjustRet { // return (func())
 				reg += compileExpr(context, reg, ex, ecnone(0))
-				code.AddABC(OP_RETURN, a, 0, 0, sline(stmt))
+				code.AddABCk(OP_RETURN, a, 0, 0, kc, sline(stmt))
 			} else {
 				reg += compileExpr(context, reg, ex, ecnone(-2))
-				code.SetOpCode(code.LastPC(), OP_TAILCALL)
-				code.AddABC(OP_RETURN, a, 0, 0, sline(stmt))
+				if context.tbcActive == 0 { // stock insidetbc: no tailcall over an open <close>
+					code.SetOpCode(code.LastPC(), OP_TAILCALL)
+				}
+				code.AddABCk(OP_RETURN, a, 0, 0, kc, sline(stmt))
 			}
 			return
 		}
@@ -1269,7 +1433,7 @@ func compileReturnStmt(context *funcContext, stmt *ast.ReturnStmt) { // {{{
 	if lastisvaarg {
 		count = 0
 	}
-	context.Code.AddABC(OP_RETURN, a, count, 0, sline(stmt))
+	context.Code.AddABCk(OP_RETURN, a, count, 0, kc, sline(stmt))
 } // }}}
 
 func compileIfStmt(context *funcContext, stmt *ast.IfStmt) { // {{{
@@ -1461,7 +1625,9 @@ func compileNumberForStmt(context *funcContext, stmt *ast.NumberForStmt) { // {{
 	ecupdate(ec, ecLocal, rfor+2, 0)
 	compileExpr(context, reg, stmt.Step, ec)
 
-	context.RegisterLocalVar(stmt.Name)
+	// U4: the control variable is RDKCONST (stock lparser.c) — the loop
+	// steps it internally, user code cannot assign it.
+	context.RegisterLocalVarKind(stmt.Name, varKindConst)
 
 	code.AddABx(OP_FORPREP, rfor, 0, sline(stmt))
 	preppc := code.LastPC()
@@ -1503,8 +1669,9 @@ func compileGenericForStmt(context *funcContext, stmt *ast.GenericForStmt) { // 
 	preppc := code.LastPC()
 	bodypc := code.LastPC() + 1
 
+	// U4: the loop names are RDKCONST (stock lparser.c)
 	for _, name := range stmt.Names {
-		context.RegisterLocalVar(name)
+		context.RegisterLocalVarKind(name, varKindConst)
 	}
 	compileChunk(context, stmt.Stmts, false)
 
@@ -1522,22 +1689,34 @@ func compileGenericForStmt(context *funcContext, stmt *ast.GenericForStmt) { // 
 	}
 } // }}}
 
+// compileLabelStmt (stock labelstat: checkrepeated + createlabel). A
+// label is only visible while its block is open; duplicates are checked
+// against every ACTIVE label of the function (nested-block repeats are
+// errors, sibling-block repeats are not — the retired label is gone by
+// then). A last-statement label sits outside the block's locals.
 func compileLabelStmt(context *funcContext, stmt *ast.LabelStmt, isLastStmt bool) { // {{{
-	labelId := context.NewLabel()
-	label := newLabelDesc(labelId, stmt.Name, context.Code.LastPC(), sline(stmt), context.BlockLocalVarsCount())
-	context.AddNamedLabel(label)
-	if isLastStmt {
-		label.SetNumActiveLocalVars(context.Block.Parent.LocalVarsCount())
+	if old := context.findActiveLabel(stmt.Name, 0); old != nil {
+		raiseCompileError(context, sline(stmt), "label '%s' already defined on line %d", stmt.Name, old.Line)
 	}
-	context.ResolveForwardGoto(label)
+	label := newLabelDesc(context.NewLabel(), stmt.Name, context.Code.LastPC(), sline(stmt), context.BlockLocalVarsCount())
+	if isLastStmt {
+		label.NumActiveLocalVars = context.Block.entryNactvar
+	}
+	context.labels = append(context.labels, label)
+	context.SetLabelPc(label.Id, label.Pc)
 } // }}}
 
+// compileGotoStmt (stock gotostat + newgotoentry): a jump plus a DEAD
+// CLOSE placeholder after it (B=1 marks it dead). Resolution happens at
+// block exit (solveGotos/closeGoto); if the jump turns out to need a
+// close, the pair swaps so the CLOSE runs before the jump. The goto never
+// searches backward for a label at creation — backward and forward gotos
+// resolve identically at leaveblock.
 func compileGotoStmt(context *funcContext, stmt *ast.GotoStmt) { // {{{
-	context.Code.AddABC(OP_CLOSE, 0, 0, 0, sline(stmt))
 	context.Code.AddSJ(OP_JMP, labelNoJump, sline(stmt))
-	label := newLabelDesc(-1, stmt.Label, context.Code.LastPC(), sline(stmt), context.BlockLocalVarsCount())
-	context.AddUnresolvedGoto(label)
-	context.FindLabel(context.Block, label, context.gotosCount-1)
+	context.Code.AddABC(OP_CLOSE, 0, 1, 0, sline(stmt)) // dead placeholder
+	label := newLabelDesc(-1, stmt.Label, context.Code.LastPC()-1, sline(stmt), context.BlockLocalVarsCount())
+	context.gotos = append(context.gotos, label)
 } // }}}
 
 func compileExpr(context *funcContext, reg int, expr ast.Expr, ec *expcontext) int { // {{{
@@ -1673,6 +1852,8 @@ func compileExpr(context *funcContext, reg int, expr ast.Expr, ec *expcontext) i
 				childcontext.Proto.Upvalues = append(childcontext.Proto.Upvalues,
 					Upvaldesc{InStack: true, Idx: uint8(localidx), Name: upvalue.Name})
 				block.RefUpvalue = true
+				// stock markupval sets fs->needclose alongside bl->upval
+				context.NeedsClose = true
 			} else {
 				upvalueidx := context.Upvalues.Find(upvalue.Name)
 				if upvalueidx < 0 {
@@ -1853,12 +2034,14 @@ func compileFunctionExpr(context *funcContext, funcexpr *ast.FunctionExpr, ec *e
 	if context.Proto.IsVarArg != 0 {
 		context.Code.AddABC(OP_VARARGPREP, int(context.Proto.NumParameters), 0, 0, context.Proto.LineDefined)
 	}
+	// the root block's entry level: parameters (+ compat 'arg') only
+	context.Block.entryNactvar = context.BlockLocalVarsCount()
 
 	compileChunk(context, funcexpr.Stmts, false)
 
 	context.Code.AddABC(OP_RETURN0, 0, 0, 0, eline(funcexpr))
 	context.EndScope()
-	context.CheckUnresolvedGoto()
+	context.finishFunctionGotos()
 	context.Proto.Code = context.Code.List()
 	context.Proto.DbgSourcePositions = context.Code.PosList()
 	context.Proto.DbgUpvalues = context.Upvalues.Names()

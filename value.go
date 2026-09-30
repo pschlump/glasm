@@ -242,6 +242,19 @@ type LState struct {
 	// coroutine.close returns it as false+err for an error-dead
 	// coroutine, stock lua_closethread's status).
 	deadErr LValue
+	// tbclist is the to-be-closed stack (U4, stock L->tbclist): entries
+	// keyed by the same absolute register indexes the upvalue registry
+	// uses, innermost (highest) first, so cross-frame ordering holds and
+	// closeTBC(level) reaches exactly the entries a block/function owns.
+	tbclist *tbcEntry
+}
+
+// tbcEntry is one to-be-closed variable registration (U4). The value
+// lives in the register slot; it is read at close time (assignment to a
+// <close> local is a compile error, so the slot is stable).
+type tbcEntry struct {
+	idx  int
+	prev *tbcEntry
 }
 
 func (ls *LState) String() string   { return fmt.Sprintf("thread: %p", ls) }

@@ -22,7 +22,12 @@ type LocalAssignStmt struct {
 	StmtBase
 
 	Names []string
-	Exprs []Expr
+	// Attribs carries the 5.4 variable attributes (U4): either nil (no
+	// attribute anywhere in the statement) or parallel to Names, with ""
+	// for plain names, "const", "close". The list-wide prefix attribute is
+	// already applied at parse (a postfix attribute overrides it per name).
+	Attribs []string
+	Exprs   []Expr
 }
 
 type FuncCallStmt struct {

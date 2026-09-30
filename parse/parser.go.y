@@ -4,6 +4,76 @@ package parse
 import (
   "github.com/pschlump/golua55/ast"
 )
+
+// attribname is one name of a local/global declaration with its effective
+// 5.4 attribute ("" | "const" | "close") — the list-wide prefix already
+// applied for names without a postfix attribute of their own.
+type attribname struct {
+	Name   string
+	Attrib string
+}
+
+// attriblist is an attnamelist in flight: def is the list-wide prefix
+// attribute (stock localstat/globalstat's defkind), items the declared
+// names with their effective attributes.
+type attriblist struct {
+	def   string
+	items []attribname
+}
+
+// checkClose raises stock's "multiple to-be-closed variables in local
+// list" (localstat) when the last name makes a second effective <close>.
+func (al attriblist) checkClose(lx *Lexer) {
+	last := al.items[len(al.items)-1]
+	if last.Attrib != "close" {
+		return
+	}
+	for _, it := range al.items[:len(al.items)-1] {
+		if it.Attrib == "close" {
+			lx.SemError("multiple to-be-closed variables in local list")
+		}
+	}
+}
+
+// checkGlobal raises stock's "global variables cannot be to-be-closed"
+// (globalstat — the prefix attribute is validated before any name, then
+// each name's effective attribute).
+func (al attriblist) checkGlobal(lx *Lexer) {
+	if al.def == "close" {
+		lx.SemError("global variables cannot be to-be-closed")
+	}
+	for _, it := range al.items {
+		if it.Attrib == "close" {
+			lx.SemError("global variables cannot be to-be-closed")
+		}
+	}
+}
+
+// attribs returns the parallel attribute slice for the AST, nil when no
+// name carries an attribute.
+func (al attriblist) attribs() []string {
+	attrs := make([]string, len(al.items))
+	any := false
+	for i, it := range al.items {
+		attrs[i] = it.Attrib
+		if it.Attrib != "" {
+			any = true
+		}
+	}
+	if !any {
+		return nil
+	}
+	return attrs
+}
+
+// names returns the declared names.
+func (al attriblist) names() []string {
+	names := make([]string, len(al.items))
+	for i, it := range al.items {
+		names[i] = it.Name
+	}
+	return names
+}
 %}
 %type<stmts> chunk
 %type<stmts> chunk1
@@ -16,7 +86,7 @@ import (
 %type<exprlist> varlist
 %type<expr> var
 %type<namelist> namelist
-%type<namelist> attnamelist
+%type<attnames> attnamelist
 %type<attrib> attrib
 %type<exprlist> exprlist
 %type<expr> expr
@@ -50,6 +120,7 @@ import (
   fieldsep  string
 
   namelist []string
+  attnames attriblist
   attrib   string
   parlist  *ast.ParList
 }
@@ -195,15 +266,15 @@ stat:
             $$.SetLine($1.Pos.Line)
             $$.SetLastLine($4.LastLine())
         } |
-        /* U3a: attnamelist carries optional attributes (<const>/<close>)
-           in either grammar position; they parse and are IGNORED — the
-           real attribute semantics are U4 (ledger row). */
+        /* U4: attnamelist threads the attributes into the AST (the
+           list-wide prefix applied at parse; semantic errors raised in
+           the attnamelist/attrib rules like stock localstat). */
         TLocal attnamelist '=' exprlist {
-            $$ = &ast.LocalAssignStmt{Names: $2, Exprs:$4}
+            $$ = &ast.LocalAssignStmt{Names: $2.names(), Attribs: $2.attribs(), Exprs:$4}
             $$.SetLine($1.Pos.Line)
         } |
         TLocal attnamelist {
-            $$ = &ast.LocalAssignStmt{Names: $2, Exprs:[]ast.Expr{}}
+            $$ = &ast.LocalAssignStmt{Names: $2.names(), Attribs: $2.attribs(), Exprs:[]ast.Expr{}}
             $$.SetLine($1.Pos.Line)
         } |
         /* U3a: the 5.5 global declaration, accepted-as-no-op (a reserved
@@ -213,9 +284,10 @@ stat:
            `global *` / `global <attrib> *` change only the (absent)
            declaration checking — nothing. */
         TGlobal attnamelist '=' exprlist {
-            lhs := make([]ast.Expr, 0, len($2))
-            for i, name := range $2 {
-                ident := &ast.IdentExpr{Value: name}
+            $2.checkGlobal(yylex.(*Lexer))
+            lhs := make([]ast.Expr, 0, len($2.items))
+            for i, item := range $2.items {
+                ident := &ast.IdentExpr{Value: item.Name}
                 ident.SetLine($1.Pos.Line + i)
                 lhs = append(lhs, ident)
             }
@@ -223,6 +295,7 @@ stat:
             $$.SetLine($1.Pos.Line)
         } |
         TGlobal attnamelist {
+            $2.checkGlobal(yylex.(*Lexer))
             $$ = &ast.DoBlockStmt{}
             $$.SetLine($1.Pos.Line)
         } |
@@ -238,6 +311,9 @@ stat:
             $$.SetLine($1.Pos.Line)
         } |
         TGlobal attrib '*' {
+            if $2 == "close" {
+                yylex.(*Lexer).SemError("global variables cannot be to-be-closed")
+            }
             $$ = &ast.DoBlockStmt{}
             $$.SetLine($1.Pos.Line)
         } |
@@ -329,32 +405,40 @@ namelist:
             $$ = append($1, $3.Str)
         }
 
-/* U3a: the 5.5 attnamelist — an attribute may prefix the first name
+/* U4: the 5.5 attnamelist — an attribute may prefix the first name
    (list-wide in stock's localstat: `local <const> a, b` makes both const)
-   or follow any name. The attribute text parses and is discarded; real
-   <const>/<close> semantics are U4. */
+   or follow any name (overriding the prefix for that name). Attributes
+   reach the AST normalized; the parser-level semantic errors match stock
+   localstat/globalstat. */
 attnamelist:
         TIdent {
-            $$ = []string{$1.Str}
+            $$ = attriblist{items: []attribname{{Name: $1.Str}}}
         } |
         TIdent attrib {
-            $$ = []string{$1.Str}
+            $$ = attriblist{items: []attribname{{Name: $1.Str, Attrib: $2}}}
         } |
         attrib TIdent {
-            $$ = []string{$2.Str}
+            $$ = attriblist{def: $1, items: []attribname{{Name: $2.Str, Attrib: $1}}}
         } |
         attrib TIdent attrib {
-            $$ = []string{$2.Str}
+            $$ = attriblist{def: $1, items: []attribname{{Name: $2.Str, Attrib: $3}}}
         } |
         attnamelist ',' TIdent {
-            $$ = append($1, $3.Str)
+            $$ = $1
+            $$.items = append($$.items, attribname{Name: $3.Str, Attrib: $1.def})
+            $$.checkClose(yylex.(*Lexer))
         } |
         attnamelist ',' TIdent attrib {
-            $$ = append($1, $3.Str)
+            $$ = $1
+            $$.items = append($$.items, attribname{Name: $3.Str, Attrib: $4})
+            $$.checkClose(yylex.(*Lexer))
         }
 
 attrib:
         '<' TIdent '>' {
+            if $2.Str != "const" && $2.Str != "close" {
+                yylex.(*Lexer).SemError("unknown attribute '" + $2.Str + "'")
+            }
             $$ = $2.Str
         }
 
