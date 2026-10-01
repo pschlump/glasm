@@ -73,9 +73,40 @@ func baseAssert(L *LState) int {
 	return 0
 }
 
+// baseCollectGarbage ports stock luaB_collectgarbage's option surface:
+// "count" reports the synthetic accounting (gcMemBytes), the mode knobs
+// are accepted as no-ops with stock result shapes, and an unknown option
+// is luaL_checkoption's "invalid option '%s'". The GC itself is the host
+// runtime's — the deep surface (step granularity, param, real
+// generational mode) is row 79 / U5c territory.
+// gcMode tracks the reported collector mode ("incremental" default —
+// pushmode's oldmode protocol; the fork has no real mode machinery).
+var gcMode = "incremental"
+
 func baseCollectGarbage(L *LState) int {
-	runtime.GC()
-	return 0
+	switch opt := L.OptString(1, "collect"); opt {
+	case "count":
+		L.Push(LNumber(float64(gcMemBytes) / 1024))
+		return 1
+	case "collect":
+		runtime.GC()
+		L.Push(LInteger(0))
+	case "stop", "restart":
+		L.Push(LInteger(0))
+	case "step":
+		L.Push(LFalse) // no cycle was in progress to finish
+	case "isrunning":
+		L.Push(LTrue)
+	case "generational", "incremental":
+		// pushmode: report the previous mode and switch the tracking
+		// (gc.lua:15-17's oldmode battery) — the collection itself is
+		// the host runtime's
+		L.Push(LString(gcMode))
+		gcMode = opt
+	default:
+		L.RaiseError("invalid option '%s'", opt)
+	}
+	return 1
 }
 
 func baseDoFile(L *LState) int {
@@ -110,20 +141,24 @@ func baseGetMetatable(L *LState) int {
 	return 1
 }
 
+// ipairsaux ports stock 5.5 ipairsaux (lbaselib.c:304): i+1 with integer
+// wrap-around (nextvar.lua:119 — maxinteger steps to mininteger, the
+// iterator then finds the {[mininteger]=…} entry); t[i] reads through
+// lua_geti — __index-aware, not raw (nextvar.lua:925's __index battery) —
+// and the nil case returns 1 value, the pushed nil itself, so the control
+// value reads as nil and the loop (and a direct call's first assignee)
+// sees k == nil.
 func ipairsaux(L *LState) int {
-	tb := L.CheckTable(1)
-	i := L.CheckInt(2)
+	L.CheckAny(1)
+	i := int64(L.CheckInt(2))
 	i++
-	v := tb.RawGetInt(i)
+	L.Push(LInteger(i))
+	v := L.GetTable(L.Get(1), LInteger(i))
+	L.Push(v)
 	if v == LNil {
-		return 0
-	} else {
-		L.Pop(1)
-		L.Push(LNumber(i))
-		L.Push(LNumber(i))
-		L.Push(v)
-		return 2
+		return 1
 	}
+	return 2
 }
 
 func baseIpairs(L *LState) int {
@@ -188,6 +223,13 @@ func baseLoad(L *LState) int {
 	case LString:
 		reader = strings.NewReader(string(lv))
 		chunkname = L.OptString(2, string(lv))
+		// stock's luaL_optstring yields a C string: the name (the chunk
+		// text itself by default) truncates at its first NUL —
+		// load("\0=1") reports `[string ""]` (literals.lua:127's battery).
+		// The chunk BODY keeps its NULs (luaL_checklstring carries length).
+		if i := strings.IndexByte(chunkname, 0); i >= 0 {
+			chunkname = chunkname[:i]
+		}
 	case *LFunction:
 		fn := lv
 		chunkname = L.OptString(2, "=(load)")
@@ -305,12 +347,24 @@ func pairsaux(L *LState) int {
 	}
 }
 
+// basePairs ports stock 5.5 luaB_pairs: with a __pairs metamethod it is
+// called with the object and yields EXACTLY 4 results (the 4th is the
+// loop's to-be-closed value — nextvar.lua:908); without one the results
+// are (next, t, nil, nil) — the nil tbc slot included, so a generic-for
+// always stages a 4th control slot.
 func basePairs(L *LState) int {
-	tb := L.CheckTable(1)
+	L.CheckAny(1)
+	if mm := L.GetMetaField(L.Get(1), "__pairs"); mm != LNil {
+		L.Push(mm)
+		L.Push(L.Get(1))
+		L.Call(1, 4)
+		return 4
+	}
 	L.Push(L.Get(UpvalueIndex(1)))
-	L.Push(tb)
+	L.Push(L.Get(1))
 	L.Push(LNil)
-	return 3
+	L.Push(LNil)
+	return 4
 }
 
 func basePCall(L *LState) int {

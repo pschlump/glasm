@@ -171,6 +171,7 @@ const (
 	opBrace
 	opNumber
 	opFrontier // 5.2 %f(set): empty-width frontier match
+	opPanic    // malformed item: always errors when reached (stock lstrlib raises at match time)
 )
 
 type inst struct {
@@ -196,6 +197,18 @@ type frontierPattern struct {
 	Class class
 }
 
+// badClass is a malformed construct that stock only rejects when the
+// match REACHES it (lstrlib has no parse phase): an unterminated set or
+// a trailing '%'. It compiles like any class and errors in Matches,
+// with stock's text and no position suffix (pm.lua:394's battery).
+type badClass struct {
+	Msg string
+}
+
+func (pn *badClass) Matches(ch int) bool {
+	panic(newError(_UNKNOWN, "%s", pn.Msg))
+}
+
 type dotClass struct{}
 
 func (pn *dotClass) Matches(ch int) bool { return true }
@@ -219,6 +232,10 @@ func (pn *singleClass) Matches(ch int) bool {
 		ret = (0x00 <= ch && ch <= 0x1F) || ch == 0x7F
 	case 'd', 'D':
 		ret = '0' <= ch && ch <= '9'
+	case 'g', 'G':
+		// stock match_class 'g' = isgraph: printable except space
+		// (lctype ISGRAPH covers 0x21..0x7E; pm.lua:56's "%g%g%g+" battery)
+		ret = 0x21 <= ch && ch <= 0x7E
 	case 'l', 'L':
 		ret = 'a' <= ch && ch <= 'z'
 	case 'p', 'P':
@@ -314,6 +331,13 @@ type bracePattern struct {
 	End   int
 }
 
+// badPattern is a malformed ITEM (not class) that stock rejects only
+// when the match reaches it: compiles to opPanic, which raises the
+// message with no position suffix.
+type badPattern struct {
+	Msg string
+}
+
 // }}}
 
 /* parse {{{ */
@@ -322,7 +346,11 @@ func parseClass(sc *scanner, allowset bool) class {
 	ch := sc.Next()
 	switch ch {
 	case '%':
-		return &singleClass{sc.Next()}
+		c := sc.Next()
+		if c == EOS {
+			return &badClass{"malformed pattern (ends with '%')"}
+		}
+		return &singleClass{c}
 	case '.':
 		if allowset {
 			return &dotClass{}
@@ -342,50 +370,58 @@ func parseClass(sc *scanner, allowset bool) class {
 	}
 }
 
+// parseClassSet ports stock matchbracketclass's scan: a '-' is a range
+// separator only when it follows a single literal-char member and
+// precedes a non-']' item (stock's *(p+1) == '-' test); the range end is
+// always a literal char; any other '-' is a literal member — so
+// "[a-b-c]" is {a..b, '-', c} and "[a-]" is {a, '-'}.
 func parseClassSet(sc *scanner) class {
 	set := &setClass{false, []class{}}
 	if sc.Peek() == '^' {
 		set.IsNot = true
 		sc.Next()
 	}
-	isrange := false
+	prevChar := false // the previous member is a single literal char
 	for {
 		ch := sc.Peek()
-		switch ch {
-		// case '[':
-		// 	panic(newError(sc.CurrentPos(), "'[' can not be nested"))
-		case EOS:
-			panic(newError(sc.CurrentPos(), "unexpected EOS"))
-		case ']':
-			if len(set.Classes) > 0 {
-				sc.Next()
-				goto exit
-			}
-			fallthrough
-		case '-':
-			if len(set.Classes) > 0 {
-				sc.Next()
-				isrange = true
+		switch {
+		case ch == EOS:
+			return &badClass{"malformed pattern (missing ']')"}
+		case ch == ']' && len(set.Classes) > 0:
+			sc.Next()
+			return set
+		case ch == '-' && prevChar:
+			sc.Next() // consume '-'
+			if nx := sc.Peek(); nx == ']' || nx == EOS {
+				set.Classes = append(set.Classes, &charClass{'-'})
+				prevChar = true
 				continue
 			}
-			fallthrough
+			begin := set.Classes[len(set.Classes)-1]
+			set.Classes = set.Classes[:len(set.Classes)-1]
+			set.Classes = append(set.Classes, &rangeClass{begin, &charClass{sc.Next()}})
+			prevChar = false
 		default:
-			set.Classes = append(set.Classes, parseClass(sc, false))
-		}
-		if isrange {
-			begin := set.Classes[len(set.Classes)-2]
-			end := set.Classes[len(set.Classes)-1]
-			set.Classes = set.Classes[0 : len(set.Classes)-2]
-			set.Classes = append(set.Classes, &rangeClass{begin, end})
-			isrange = false
+			_, wasChar := parseClassPeek(sc, set)
+			prevChar = wasChar
 		}
 	}
-exit:
-	if isrange {
-		set.Classes = append(set.Classes, &charClass{'-'})
-	}
+}
 
-	return set
+// parseClassPeek appends the next member to the set and reports whether
+// it was a single literal char (a range-start candidate).
+func parseClassPeek(sc *scanner, set *setClass) (class, bool) {
+	ch := sc.Peek()
+	if ch == ']' || ch == '-' || ch == EOS {
+		// first-position ']' or '-' is a literal member
+		sc.Next()
+		set.Classes = append(set.Classes, &charClass{ch})
+		return &charClass{ch}, true
+	}
+	c := parseClass(sc, false)
+	set.Classes = append(set.Classes, c)
+	_, isChar := c.(*charClass)
+	return c, isChar
 }
 
 func parsePattern(sc *scanner, toplevel bool) *seqPattern {
@@ -404,19 +440,32 @@ func parsePattern(sc *scanner, toplevel bool) *seqPattern {
 			sc.Next()
 			switch sc.Peek() {
 			case '0':
-				panic(newError(sc.CurrentPos(), "invalid capture index"))
+				// stock check_capture rejects a pattern-side '%0' when the
+				// match reaches it — opNumber's range check raises
+				// "invalid capture index %0" (pm.lua:256)
+				sc.Next()
+				pat.Patterns = append(pat.Patterns, &numberPattern{0})
 			case '1', '2', '3', '4', '5', '6', '7', '8', '9':
 				pat.Patterns = append(pat.Patterns, &numberPattern{sc.Next() - 48})
 			case 'b':
 				sc.Next()
-				pat.Patterns = append(pat.Patterns, &bracePattern{sc.Next(), sc.Next()})
+				b1, b2 := sc.Next(), sc.Next()
+				if b1 == EOS || b2 == EOS {
+					// stock matchbalance: "malformed pattern (missing
+					// arguments to '%b')" when the item is reached
+					pat.Patterns = append(pat.Patterns, &badPattern{"malformed pattern (missing arguments to '%b')"})
+				} else {
+					pat.Patterns = append(pat.Patterns, &bracePattern{b1, b2})
+				}
 			case 'f': // 5.2 frontier pattern: %f[set]
 				sc.Next()
 				chk := sc.Next()
 				if chk != '[' {
-					panic(newError(sc.CurrentPos(), "missing '[' after %%f in pattern"))
+					// stock raises when the match reaches the item
+					pat.Patterns = append(pat.Patterns, &badPattern{"missing '[' after '%f' in pattern"})
+				} else {
+					pat.Patterns = append(pat.Patterns, &frontierPattern{parseClassSet(sc)})
 				}
-				pat.Patterns = append(pat.Patterns, &frontierPattern{parseClassSet(sc)})
 			default:
 				sc.Restore()
 				pat.Patterns = append(pat.Patterns, &singlePattern{parseClass(sc, true)})
@@ -427,9 +476,13 @@ func parsePattern(sc *scanner, toplevel bool) *seqPattern {
 		//	panic(newError(sc.CurrentPos(), "invalid ']'"))
 		case ')':
 			if toplevel {
-				panic(newError(sc.CurrentPos(), "invalid ')'"))
+				// stock end_capture raises "invalid pattern capture" when
+				// the match reaches the ')' item (pm.lua:392)
+				pat.Patterns = append(pat.Patterns, &badPattern{"invalid pattern capture"})
+				sc.Next()
+			} else {
+				return pat
 			}
-			return pat
 		case '(':
 			sc.Next()
 			if sc.Peek() == ')' {
@@ -438,7 +491,7 @@ func parsePattern(sc *scanner, toplevel bool) *seqPattern {
 			} else {
 				ret := &capPattern{parsePattern(sc, false)}
 				if sc.Peek() != ')' {
-					panic(newError(sc.CurrentPos(), "unfinished capture"))
+					panic(newError(_UNKNOWN, "unfinished capture"))
 				}
 				sc.Next()
 				pat.Patterns = append(pat.Patterns, ret)
@@ -478,6 +531,14 @@ type iptr struct {
 	capture int
 }
 
+// internPanic registers a badPattern/badClass message for an opPanic
+// operand (compile-time).
+func internPanic(msg string) int {
+	id := len(panicMsgs)
+	panicMsgs = append(panicMsgs, msg)
+	return id
+}
+
 func compilePattern(p pattern, ps ...*iptr) []inst {
 	var ptr *iptr
 	toplevel := false
@@ -489,7 +550,13 @@ func compilePattern(p pattern, ps ...*iptr) []inst {
 	}
 	switch pat := p.(type) {
 	case *singlePattern:
-		ptr.insts = append(ptr.insts, inst{opChar, pat.Class, -1, -1})
+		if bc, ok := pat.Class.(*badClass); ok {
+			// opChar short-circuits at end-of-subject; stock's class_end
+			// rejects the malformed escape whenever the ITEM runs
+			ptr.insts = append(ptr.insts, inst{opPanic, nil, internPanic(bc.Msg), -1})
+		} else {
+			ptr.insts = append(ptr.insts, inst{opChar, pat.Class, -1, -1})
+		}
 	case *seqPattern:
 		for _, cp := range pat.Patterns {
 			compilePattern(cp, ptr)
@@ -531,6 +598,8 @@ func compilePattern(p pattern, ps ...*iptr) []inst {
 		ptr.insts = append(ptr.insts, inst{opBrace, nil, pat.Begin, pat.End})
 	case *numberPattern:
 		ptr.insts = append(ptr.insts, inst{opNumber, nil, pat.N, -1})
+	case *badPattern:
+		ptr.insts = append(ptr.insts, inst{opPanic, nil, internPanic(pat.Msg), -1})
 	}
 	if toplevel {
 		if p.(*seqPattern).MustTail {
@@ -544,6 +613,9 @@ func compilePattern(p pattern, ps ...*iptr) []inst {
 /* }}} parse */
 
 /* VM {{{ */
+
+// panicMsgs interns badPattern messages for the opPanic operand.
+var panicMsgs []string
 
 // Simple recursive virtual machine based on the
 // "Regular Expression Matching: the Virtual Machine Approach" (https://swtch.com/~rsc/regexp/regexp2.html)
@@ -627,10 +699,16 @@ redo:
 		}
 		pc++
 		goto redo
+	case opPanic:
+		panic(newError(_UNKNOWN, "%s", panicMsgs[inst.Operand1]))
 	case opNumber:
 		idx := inst.Operand1 * 2
-		if idx >= m.CaptureLength()-1 {
-			panic(newError(_UNKNOWN, "invalid capture index"))
+		// stock check_capture: '%0' is never a back reference; an
+		// unfinished/absent capture is "invalid capture index %n"
+		if inst.Operand1 == 0 || idx >= m.CaptureLength()-1 {
+			// stock check_capture names the digit: "invalid capture
+			// index %1" for an unfinished/absent capture (pm.lua:257)
+			panic(newError(_UNKNOWN, "invalid capture index %%%d", inst.Operand1))
 		}
 		capture := src[m.Capture(idx):m.Capture(idx+1)]
 		for i := 0; i < len(capture); i++ {
@@ -662,16 +740,26 @@ func Find(p string, src []byte, offset, limit int) (matches []*MatchData, err er
 	pat := parsePattern(newScanner([]byte(p)), true)
 	insts := compilePattern(pat)
 	matches = []*MatchData{}
-	for sp := offset; sp <= len(src); {
+	// 5.3.3+ empty-match discipline (lstrlib str_gsub/gmatch_aux): a match
+	// ending exactly where the last ACCEPTED match ended is rejected, and
+	// the scan then advances one character — so " *" over "a b cd" yields
+	// -a-b-c-d- (5 matches), never a second empty match at a previous
+	// match's end position (pm.lua:186's battery). lastmatch = -1 means
+	// none yet (a first match is always accepted).
+	lastmatch := -1
+	for sp := offset; sp <= len(src) && limit != len(matches); {
 		ok, nsp, ms := recursiveVM(src, insts, 0, sp, 0)
-		sp++
-		if ok {
-			if sp < nsp {
-				sp = nsp
-			}
+		if ok && nsp != lastmatch {
 			matches = append(matches, ms)
+			lastmatch = nsp
+			sp = nsp
+			if pat.MustHead {
+				break
+			}
+			continue // retry at the match end (an empty match there is rejected)
 		}
-		if len(matches) == limit || pat.MustHead {
+		sp++
+		if pat.MustHead {
 			break
 		}
 	}

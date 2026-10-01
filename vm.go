@@ -2133,9 +2133,9 @@ func init() {
 			A := int(inst>>7) & 0xff //GETA
 			RA := lbase + A
 			Bx := int(inst>>15) & 0x1ffff //GETBX
-			// swap the control (RA+3) and closing (RA+2) variables; the
-			// closing value's to-be-closed registration is U5 work (the
-			// compiler passes only nil closings until then)
+			// swap the control (RA+3) and closing (RA+2) variables, then
+			// register the closing value to-be-closed (U5a; stock
+			// luaF_newtbcupval(ra+2) — nil/false exempt inside registerTBC)
 			tmp := reg.Get(RA + 3)
 			// this section is inlined by go-inline
 			// source function is 'func (rg *registry) Set(regi int, vali LValue) ' in '_state.go'
@@ -2177,6 +2177,7 @@ func init() {
 					rg.top = regi + 1
 				}
 			}
+			L.registerTBC(RA+2, A+3)
 			cf.Pc += Bx
 			return 0
 		},
@@ -2436,7 +2437,7 @@ func init() {
 						name = string(s)
 					}
 				}
-				L.RaiseError("attempt to assign to global '%s' (global is not declared)", name)
+				L.RaiseError("global '%s' already defined", name)
 			}
 			return 0
 		},

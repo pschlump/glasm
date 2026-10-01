@@ -14,8 +14,11 @@ import (
 )
 
 const EOF = -1
-const whitespace1 = 1<<'\t' | 1<<' '
-const whitespace2 = 1<<'\t' | 1<<'\n' | 1<<'\r' | 1<<' '
+// whitespace masks: stock llex's lisspace covers the full C isspace set —
+// '\t', '\n', '\v', '\f', '\r', ' ' (literals.lua:11's `x \v\f = \t\r ...`
+// chunk must load). The fork used to skip only the four common ones.
+const whitespace1 = 1<<'\t' | 1<<'\v' | 1<<'\f' | 1<<' '
+const whitespace2 = 1<<'\t' | 1<<'\n' | 1<<'\v' | 1<<'\f' | 1<<'\r' | 1<<' '
 
 // Error is a lexer/parser error. U1 re-pins its rendering to stock Lua's
 // shape — "<source>:<line>: <message> near '<token>'" — so parse failures
@@ -812,6 +815,17 @@ redo:
 			tok.Type = ch
 			tok.Str = string(rune(ch))
 		default:
+			if ch == 0 {
+				// a NUL byte is a single-char token in stock (TK_EOS is a
+				// high token number); goyacc's token 0 is $end, which made
+				// "\0..." load as an EMPTY chunk. Reject it with the
+				// parser's wording instead: stock's lexerror drops the
+				// "near" part when the token value is 0 (`if (token)`),
+				// so the message is bare "unexpected symbol"
+				// (literals.lua:127's per-byte battery).
+				err = &Error{Pos: sc.Pos, Message: "unexpected symbol", Sem: true, EOFLine: sc.lastLine}
+				goto finally
+			}
 			// stock llex has no invalid-character error: any other char
 			// becomes a single-char token and the parser rejects it with
 			// "unexpected symbol" (U2 adds the real bitwise operators)
@@ -821,8 +835,30 @@ redo:
 	}
 
 finally:
+	if tok.Type == TString {
+		tok.Str = lexer.anchorString(tok.Str)
+	}
 	tok.Name = TokenName(int(tok.Type))
 	return tok, err
+}
+
+// anchorString is stock's per-compilation string anchoring (llex.c
+// anchorstr — "internalizes long strings, ensuring there is only one copy
+// of each unique string" within one compilation): every equal literal in
+// one compilation maps to ONE string value, sharing its backing array.
+// string.format("%p", s) then reports equal literals equal and
+// runtime-created strings (concat results) distinct — the exact invariant
+// literals.lua's "reuse of long strings" battery pins (stock interning:
+// short strings globally, long strings per compilation).
+func (lx *Lexer) anchorString(s string) string {
+	if lx.strAnchors == nil {
+		lx.strAnchors = make(map[string]string)
+	}
+	if v, ok := lx.strAnchors[s]; ok {
+		return v
+	}
+	lx.strAnchors[s] = s
+	return s
 }
 
 // yacc interface {{{
@@ -843,6 +879,8 @@ type Lexer struct {
 	// funcName: between `function` and the '(' opening the body — the
 	// "'(' expected" dispatch (U4; see Lex).
 	funcName bool
+	// strAnchors: the per-compilation string anchor table (anchorString).
+	strAnchors map[string]string
 }
 
 func (lx *Lexer) Lex(lval *yySymType) int {

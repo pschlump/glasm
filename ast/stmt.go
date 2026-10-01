@@ -36,6 +36,29 @@ type FuncCallStmt struct {
 	Expr Expr
 }
 
+// GlobalDeclStmt is a 5.5 global declaration (U5a): `global a`,
+// `global a <const> = expr`, `global a, b <close>` (close rejected at
+// parse), or the collective `global *` / `global <const> *` (IsStar,
+// Names empty). Attribs parallels Names when any attribute appears.
+type GlobalDeclStmt struct {
+	StmtBase
+
+	Names   []string
+	Attribs []string
+	Exprs   []Expr
+	IsStar  bool
+}
+
+// GlobalFuncStmt is `global function f() end` (U5a): the name declares
+// before the body compiles (body recursion sees it), the ERRNNIL
+// redefinition check and store follow the body.
+type GlobalFuncStmt struct {
+	StmtBase
+
+	Name string
+	Func *FunctionExpr
+}
+
 type DoBlockStmt struct {
 	StmtBase
 

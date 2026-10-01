@@ -1,7 +1,7 @@
 package lua
 
 import (
-	"sort"
+	"math/rand"
 )
 
 /* table library — the stock 5.5.1 surface (U3d), ported from
@@ -77,10 +77,9 @@ func tabLenOf(L *LState, v LValue) int64 {
 		if iv, ok := toIntegerX(ret); ok {
 			return iv
 		}
-		if isNumberValue(ret) {
-			L.RaiseError("object length is not an integer")
-		}
-		L.RaiseError("object length is not a number")
+		// stock luaL_len: lua_tointegerx failure is always "not an
+		// integer" (a float like 2.5 and a string get the same text)
+		L.RaiseError("object length is not an integer")
 	}
 	if v.Type() == LTTable {
 		return int64(v.(*LTable).Len())
@@ -117,6 +116,12 @@ func tableCreate(L *LState) int {
 	}
 	if sizerest > 1<<31-1 {
 		L.ArgError(2, "out of range")
+	}
+	// stock luaH_resize/setnodevector: an array size above 2^31 or a
+	// hash size whose node count rounds past MAXHBITS (2^30) is
+	// "table overflow" — raised before any allocation (sort.lua:41)
+	if sizeseq > 1<<31 || sizerest > 1<<30 {
+		L.RaiseError("table overflow")
 	}
 	L.Push(L.CreateTable(int(sizeseq), int(sizerest)))
 	return 1
@@ -261,10 +266,14 @@ func tableUnpack(L *LState) int {
 	if i > e {
 		return 0
 	}
-	n := uint64(e) - uint64(i) + 1
-	if n >= 1<<31-1 {
+	// stock: the span is compared BEFORE the +1 (castS2U(e) - castS2U(i),
+	// so a full-range span wraps huge), then lua_checkstack rejects
+	// anything past LUAI_MAXSTACK (1M) — both raise "too many results"
+	n := uint64(e) - uint64(i)
+	if n >= 1<<31-1 || n+1 > 1000000 {
 		L.RaiseError("too many results to unpack")
 	}
+	n++
 	for ; i < e; i++ {
 		L.Push(tabGetI(L, t, i))
 	}
@@ -272,61 +281,138 @@ func tableUnpack(L *LState) int {
 	return int(n)
 }
 
-// tabSorter adapts 1-based metamethod-aware table access to
-// sort.Interface (the old raw-array lValueArraySorter stays in table.go
-// for other users).
-type tabSorter struct {
-	L  *LState
-	Fn *LFunction
-	t  LValue
-	n  int64
-}
-
-func (ts *tabSorter) get(i int64) LValue {
-	return tabGetI(ts.L, ts.t, i)
-}
-
-func (ts *tabSorter) set(i int64, v LValue) {
-	tabSetI(ts.L, ts.t, i, v)
-}
-
-func (ts *tabSorter) Len() int { return int(ts.n) }
-
-func (ts *tabSorter) Less(a, b int) bool {
-	if ts.Fn == nil {
-		return lessThan(ts.L, ts.get(int64(a+1)), ts.get(int64(b+1)))
+// sortComp ports sort_comp: nil comparator = '<' via lessThan (__lt
+// aware); a function's result is lua_toboolean'd.
+func sortComp(L *LState, cmp *LFunction, a, b LValue) bool {
+	if cmp == nil {
+		return lessThan(L, a, b)
 	}
-	ts.L.Push(ts.Fn)
-	ts.L.Push(ts.get(int64(a + 1)))
-	ts.L.Push(ts.get(int64(b + 1)))
-	ts.L.Call(2, 1)
-	return LVAsBool(ts.L.reg.Pop())
+	L.Push(cmp)
+	L.Push(a)
+	L.Push(b)
+	L.Call(2, 1)
+	return LVAsBool(L.reg.Pop())
 }
 
-func (ts *tabSorter) Swap(a, b int) {
-	va := ts.get(int64(a + 1))
-	vb := ts.get(int64(b + 1))
-	ts.set(int64(a+1), vb)
-	ts.set(int64(b+1), va)
+// tabPartition ports stock partition: Hoare sweep with the pivot VALUE
+// fixed. Both invariant violations — a[up-1] claimed less than itself,
+// or a[j] > P at j < i contradicting the i-loop's exit — raise
+// "invalid order function for sorting" (sort.lua:243's battery).
+func tabPartition(L *LState, t LValue, cmp *LFunction, lo, up int64, P LValue) int64 {
+	i, j := lo, up-1 // both pre-adjusted before first use
+	for {
+		for { // repeat ++i while a[i] < P
+			i++
+			if !sortComp(L, cmp, tabGetI(L, t, i), P) {
+				break
+			}
+			if i == up-1 { // a[up-1] < P == a[up-1]
+				L.RaiseError("invalid order function for sorting")
+			}
+		}
+		for { // repeat --j while P < a[j]
+			j--
+			if !sortComp(L, cmp, P, tabGetI(L, t, j)) {
+				break
+			}
+			if j < i { // a[j] > P contradicts the i-loop's exit
+				L.RaiseError("invalid order function for sorting")
+			}
+		}
+		if j < i { // no elements out of place
+			// swap pivot (a[up-1]) with a[i] to satisfy the postcondition
+			tabSetI(L, t, up-1, tabGetI(L, t, i))
+			tabSetI(L, t, i, P)
+			return i
+		}
+		ai, aj := tabGetI(L, t, i), tabGetI(L, t, j)
+		tabSetI(L, t, i, aj)
+		tabSetI(L, t, j, ai)
+	}
 }
 
-// tableSort: the fork's Go sort over the metamethod-aware accessors
-// with stock's error surface (comparator errors propagate as the sort's
-// error; stock's "invalid order function for sorting" fires on
-// inconsistent comparators — the corpus avoids relying on either
-// engine's equal-key order, which stays engine-specific: stock's pivot
-// randomization is makeseed-pinned and hash-order-dependent, the interp
-// uses sort.Stable).
+// tabAuxSort ports stock auxsort (5.5.1 ltablib.c): median-of-three
+// presort, the pivot parked at a[up-1], recursion into the smaller
+// interval with a tail loop over the larger, and a randomized pivot for
+// intervals past RANLIMIT once a partition comes out too imbalanced.
+// Only the final order is observable between engines (equal-key order
+// stays engine-specific — stock's l_randomizePivot is RNG-seeded; the
+// fork uses Go's math/rand).
+func tabAuxSort(L *LState, t LValue, cmp *LFunction, lo, up int64) {
+	rnd := uint32(0) // 0 = deterministic middle pivot, like stock's start
+	for lo < up {
+		// sort elements a[lo], a[p], a[up]
+		alo, aup := tabGetI(L, t, lo), tabGetI(L, t, up)
+		if sortComp(L, cmp, aup, alo) { // a[up] < a[lo]?
+			tabSetI(L, t, lo, aup)
+			tabSetI(L, t, up, alo)
+		}
+		if up-lo == 1 { // only 2 elements
+			return
+		}
+		var p int64
+		if up-lo < 100 || rnd == 0 { // small interval or no randomize
+			p = (lo + up) / 2
+		} else { // random pivot (choosePivot)
+			r4 := (up - lo) / 4
+			p = lo + r4 + int64(rnd%uint32(2*r4))
+		}
+		ap, alo2 := tabGetI(L, t, p), tabGetI(L, t, lo)
+		if sortComp(L, cmp, ap, alo2) { // a[p] < a[lo]?
+			tabSetI(L, t, p, alo2)
+			tabSetI(L, t, lo, ap)
+		} else {
+			aup2 := tabGetI(L, t, up)
+			if sortComp(L, cmp, aup2, ap) { // a[up] < a[p]?
+				tabSetI(L, t, p, aup2)
+				tabSetI(L, t, up, ap)
+			}
+		}
+		if up-lo == 2 { // only 3 elements
+			return
+		}
+		// park the pivot at a[up-1]
+		pivot := tabGetI(L, t, p)
+		tabSetI(L, t, p, tabGetI(L, t, up-1))
+		tabSetI(L, t, up-1, pivot)
+		p = tabPartition(L, t, cmp, lo, up, pivot)
+		var nsmall int64 // size of the recursed (smaller) interval
+		if p-lo < up-p {
+			tabAuxSort(L, t, cmp, lo, p-1)
+			nsmall = p - lo
+			lo = p + 1
+		} else {
+			tabAuxSort(L, t, cmp, p+1, up)
+			nsmall = up - p
+			up = p - 1
+		}
+		if (up-lo)/128 > nsmall { // partition too imbalanced
+			rnd = rand.Uint32()
+		}
+	}
+}
+
+// tableSort ports stock sort: the checks (array-too-big, comparator
+// type) run only for a non-trivial interval; n <= 1 is a no-op that
+// accepts any second argument.
 func tableSort(L *LState) int {
 	t := L.Get(1)
 	n := tabAuxGetN(L, 1, tabRead|tabWrite)
-	if n >= 1<<31-1 {
-		L.ArgError(1, "array too big")
+	if n > 1 {
+		if n >= 1<<31-1 {
+			L.ArgError(1, "array too big")
+		}
+		var cmp *LFunction
+		if L.GetTop() >= 2 {
+			if v := L.Get(2); v != LNil {
+				fn, ok := v.(*LFunction)
+				if !ok {
+					L.TypeError(2, LTFunction)
+				}
+				cmp = fn
+			}
+		}
+		tabAuxSort(L, t, cmp, 1, n)
 	}
-	var cmp *LFunction
-	if L.GetTop() != 1 {
-		cmp = L.CheckFunction(2)
-	}
-	sort.Stable(&tabSorter{L: L, Fn: cmp, t: t, n: n})
 	return 0
 }

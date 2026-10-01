@@ -24,6 +24,14 @@ const RegistryIndex = -10000
 const EnvironIndex = -10001
 const GlobalsIndex = -10002
 
+// errorFrameReserve is the fork's ERRORSTACKSIZE analog (stock ldo.c
+// luaD_growstack reserves extra frames before raising "stack overflow" so
+// the error message AND the message handler have room; a second overflow
+// inside that reserve is luaD_errerr's "error in error handling"). The
+// fork's fixed frame array cannot grow — PCall's errfunc arm unwinds this
+// many dying frames instead (U5a; divergence ledger row).
+const errorFrameReserve = 16
+
 /* ApiError {{{ */
 
 type ApiError struct {
@@ -792,7 +800,13 @@ func (ls *LState) findLocal(frame *callFrame, no int) string {
 		return ""
 	}
 	if top-frame.LocalBase >= no {
-		return "(*temporary)"
+		// U5a (stock 5.5.1 luaG_findlocal): a valid slot past the named
+		// locals is "(temporary)" — 5.5 dropped 5.4's asterisk — and a
+		// C frame's is "(C temporary)"
+		if fn.IsG {
+			return "(C temporary)"
+		}
+		return "(temporary)"
 	}
 	return ""
 }
@@ -871,6 +885,11 @@ func (ls *LState) formattedFrameFuncName(fr *callFrame) string {
 	if ischunk {
 		return name
 	}
+	// U5a: VM-dispatched frames (metamethods, for iterators) render
+	// stock's namewhat form ("in metamethod 'close'"), not "function '...'"
+	if strings.HasPrefix(name, "metamethod '") || name == "for iterator" {
+		return name
+	}
 	if name[0] != '(' && name[0] != '<' {
 		return fmt.Sprintf("function '%s'", name)
 	}
@@ -879,6 +898,12 @@ func (ls *LState) formattedFrameFuncName(fr *callFrame) string {
 
 func (ls *LState) rawFrameFuncName(fr *callFrame) string {
 	name, _ := ls.frameFuncName(fr)
+	// U5a: debug.getinfo 'n' names the event itself (stock
+	// funcnamefromcall: name "close", namewhat "metamethod") — the
+	// decorated form is the traceback's rendering only
+	if strings.HasPrefix(name, "metamethod '") {
+		return name[len("metamethod '") : len(name)-1]
+	}
 	return name
 }
 
@@ -911,6 +936,21 @@ func (ls *LState) frameFuncNameFull(fr *callFrame) (string, bool, bool) {
 		}
 	}
 	if !fr.Fn.IsG {
+		// U5a (stock funcnamefromcall's funcnamefromcode arm): no call-site
+		// entry means the frame's function was dispatched BY the VM — a
+		// metamethod (__close at a CLOSE/RETURN instruction, __index,
+		// __newindex, an MMBIN slow path, ...) or a for-loop iterator
+		// (TFORCALL) — and stock names it from the CALLER's current
+		// instruction (locals.lua:544's `in metamethod 'close'`). Call-site
+		// pcs and metamethod-dispatch pcs are disjoint, so reaching here
+		// with a CALL instruction is not possible.
+		if !frame.Fn.IsG {
+			if kind, name := funcNameFromCode(frame.Fn.Proto, frame.Pc-1); kind == "metamethod" {
+				return fmt.Sprintf("metamethod '%s'", name), false, false
+			} else if kind == "for iterator" {
+				return "for iterator", false, false
+			}
+		}
 		return fmt.Sprintf("<%v:%v>", parse.ChunkID(fr.Fn.Proto.SourceName), fr.Fn.Proto.LineDefined), false, false
 	}
 	return "(anonymous)", false, false
@@ -1017,11 +1057,16 @@ func (ls *LState) closeTBC(level int) {
 		if LVIsFalse(lv) {
 			continue // defensive: false/nil never register
 		}
-		if op := ls.metaOp1(lv, "__close"); op.Type() == LTFunction {
-			ls.reg.Push(op)
-			ls.reg.Push(lv)
-			ls.Call(1, 0)
-		}
+		// U5a (stock callclosemethod, via prepcallclosemth): the __close
+		// slot is CALLED unconditionally — no notm check at close time (the
+		// registration-time check lives in registerTBC). A metamethod
+		// removed or invalidated after registration surfaces as the CALL
+		// error "attempt to call a X value (metamethod 'close')", named by
+		// the closing instruction (locals.lua:555-562).
+		op := ls.metaOp1(lv, "__close")
+		ls.reg.Push(op)
+		ls.reg.Push(lv)
+		ls.Call(1, 0)
 	}
 }
 
@@ -1073,19 +1118,21 @@ func (ls *LState) closeTBCProtected(level int, errobj LValue) (LValue, bool) {
 		if LVIsFalse(lv) {
 			continue // defensive: false/nil never register
 		}
-		if op := ls.metaOp1(lv, "__close"); op.Type() == LTFunction {
-			ls.reg.Push(op)
-			ls.reg.Push(lv)
-			if errobj != LNil {
-				ls.reg.Push(errobj)
-			}
-			if perr := ls.PCall(1+boolInt(errobj != LNil), 0, nil); perr != nil {
-				failed = true
-				if ae, ok := perr.(*ApiError); ok {
-					errobj = ae.Object
-				} else {
-					errobj = LString(perr.Error())
-				}
+		// U5a: unconditional call as in closeTBC — an invalidated __close
+		// here becomes the in-flight error object ("attempt to call a
+		// number value (metamethod 'close')", locals.lua:564-577)
+		op := ls.metaOp1(lv, "__close")
+		ls.reg.Push(op)
+		ls.reg.Push(lv)
+		if errobj != LNil {
+			ls.reg.Push(errobj)
+		}
+		if perr := ls.PCall(1+boolInt(errobj != LNil), 0, nil); perr != nil {
+			failed = true
+			if ae, ok := perr.(*ApiError); ok {
+				errobj = ae.Object
+			} else {
+				errobj = LString(perr.Error())
 			}
 		}
 	}
@@ -2320,6 +2367,25 @@ func (ls *LState) PCall(nargs, nret int, errfunc *LFunction) (err error) {
 				err = rcv.(*ApiError)
 			}
 			if errfunc != nil {
+				// U5a (stock luaD_growstack's ERRORSTACKSIZE): a frame-stack
+				// overflow leaves the stack FULL, so the message handler call
+				// below would re-raise "stack overflow" and never run. Stock
+				// reallocs to ERRORSTACKSIZE before raising for exactly this;
+				// the fork's fixed frame array cannot grow (VM loops cache
+				// *callFrame pointers into it), so the topmost DYING frames
+				// unwind temporarily instead — their cells stay in the array,
+				// just invisible to the handler's traceback. A handler needing
+				// more than the reserve re-raises where stock reports
+				// luaD_errerr's "error in error handling" (divergence ledger
+				// row). The deferred SetSp(sp) restores the level either way.
+				if ls.stack.IsFull() {
+					drop := ls.stack.Sp() - errorFrameReserve
+					if drop < sp {
+						drop = sp
+					}
+					ls.stack.SetSp(drop)
+					ls.currentFrame = ls.stack.Last()
+				}
 				ls.Push(errfunc)
 				ls.Push(err.(*ApiError).Object)
 				ls.Panic = panicWithoutTraceback
@@ -2343,6 +2409,22 @@ func (ls *LState) PCall(nargs, nret int, errfunc *LFunction) (err error) {
 							err = rcv.(*ApiError)
 							err.(*ApiError).StackTrace = ls.stackTrace(0)
 						}
+						// U5a: restore the CALL STACK before the error-path
+						// closes (stock luaD_pcall's L->ci = old_ci precedes
+						// luaD_closeprotected) — the dying frames must be
+						// off the frame stack when __close metamethods run,
+						// so the metamethod's caller is the recovering
+						// boundary (locals.lua's error-in-__close battery
+						// pins debug.getinfo(2).name == "pcall" inside
+						// them). The REGISTER top stays high: SetTop clears
+						// cells above it and the to-be-closed values still
+						// live there.
+						ls.stack.SetSp(sp)
+						if sp == 0 {
+							ls.currentFrame = nil
+						} else {
+							ls.currentFrame = ls.stack.Last()
+						}
 						ls.closeErrorPath(base, &err)
 						ls.stack.SetSp(sp)
 						ls.currentFrame = ls.stack.Last()
@@ -2353,6 +2435,13 @@ func (ls *LState) PCall(nargs, nret int, errfunc *LFunction) (err error) {
 				err = newApiError(ApiErrorError, ls.Get(-1))
 			} else if len(err.(*ApiError).StackTrace) == 0 {
 				err.(*ApiError).StackTrace = ls.stackTrace(0)
+			}
+			// same call-stack restore before the closes as the errfunc arm
+			ls.stack.SetSp(sp)
+			if sp == 0 {
+				ls.currentFrame = nil
+			} else {
+				ls.currentFrame = ls.stack.Last()
 			}
 			ls.closeErrorPath(base, &err)
 			ls.stack.SetSp(sp)

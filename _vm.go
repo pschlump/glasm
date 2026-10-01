@@ -966,12 +966,13 @@ func init() {
 			A := int(inst>>7) & 0xff //GETA
 			RA := lbase + A
 			Bx := int(inst>>15) & 0x1ffff //GETBX
-			// swap the control (RA+3) and closing (RA+2) variables; the
-			// closing value's to-be-closed registration is U5 work (the
-			// compiler passes only nil closings until then)
+			// swap the control (RA+3) and closing (RA+2) variables, then
+			// register the closing value to-be-closed (U5a; stock
+			// luaF_newtbcupval(ra+2) — nil/false exempt inside registerTBC)
 			tmp := reg.Get(RA + 3)
 			// +inline-call reg.Set RA+3 reg.Get(RA+2)
 			// +inline-call reg.Set RA+2 tmp
+			L.registerTBC(RA+2, A+3)
 			cf.Pc += Bx
 			return 0
 		},
@@ -1087,7 +1088,7 @@ func init() {
 						name = string(s)
 					}
 				}
-				L.RaiseError("attempt to assign to global '%s' (global is not declared)", name)
+				L.RaiseError("global '%s' already defined", name)
 			}
 			return 0
 		},

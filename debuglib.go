@@ -84,6 +84,10 @@ func debugGetLocal(L *LState) int {
 		L.Push(value)
 		return 2
 	}
+	// U5a closeout (stock db_getlocal + lauxlib.h): no such local pushes
+	// FAIL — and the vendored 5.5.1 default maps luaL_pushfail to NIL
+	// (LUA_FAILISFALSE is off; the earlier false was a misread — the
+	// oracle prints nil here, pinned by _glua-tests/db.lua:47)
 	L.Push(LNil)
 	return 1
 }
@@ -102,8 +106,8 @@ func debugGetUpvalue(L *LState) int {
 		L.Push(value)
 		return 2
 	}
-	L.Push(LNil)
-	return 1
+	// U5a (stock auxupvalue): no such upvalue returns ZERO values
+	return 0
 }
 
 func debugSetLocal(L *LState) int {
@@ -139,10 +143,10 @@ func debugSetUpvalue(L *LState) int {
 	name := L.SetUpvalue(fn, idx, value)
 	if len(name) > 0 {
 		L.Push(LString(name))
-	} else {
-		L.Push(LNil)
+		return 1
 	}
-	return 1
+	// U5a (stock auxupvalue): no such upvalue returns ZERO values
+	return 0
 }
 
 func debugTraceback(L *LState) int {

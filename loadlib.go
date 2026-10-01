@@ -82,9 +82,13 @@ func OpenPackage(L *LState) int {
 	L.SetField(packagemod, "searchers", searchers)
 	L.SetField(L.Get(RegistryIndex), "_LOADERS", searchers)
 
-	loaded := L.NewTable()
+	// stock luaopen_package binds package.loaded to the REGISTRY's _LOADED
+	// table (luaL_getsubtable), never a fresh one: replacing it orphaned
+	// the "package" entry RegisterModule had just seeded, and nextvar.lua's
+	// clear-globals loop (keyed on package.loaded) then deleted the package
+	// global itself mid-iteration (nextvar.lua:422).
+	loaded, _ := L.GetField(L.Get(RegistryIndex), "_LOADED").(*LTable)
 	L.SetField(packagemod, "loaded", loaded)
-	L.SetField(L.Get(RegistryIndex), "_LOADED", loaded)
 
 	L.SetField(packagemod, "path", LString(loGetPath(LuaPath, LuaPathDefault)))
 	L.SetField(packagemod, "cpath", emptyLString)

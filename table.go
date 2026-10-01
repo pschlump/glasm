@@ -28,6 +28,16 @@ func (lv lValueArraySorter) Less(i, j int) bool {
 	return lessThan(lv.L, lv.Values[i], lv.Values[j])
 }
 
+// gcMemBytes is the synthetic Lua-heap accounting behind
+// collectgarbage("count"): the fork has no compacting GC to interrogate,
+// so bytes are charged at the big allocation sites (a table's array/hash
+// preallocation). It is monotonic — freed tables are not refunded — and
+// only deltas are observable (sort.lua:19's memdiff battery); the value
+// is never printed by the official suite.
+var gcMemBytes int64
+
+func gcCharge(bytes int64) { gcMemBytes += bytes }
+
 func newLTable(acap int, hcap int) *LTable {
 	if acap < 0 {
 		acap = 0
@@ -43,6 +53,9 @@ func newLTable(acap int, hcap int) *LTable {
 	if hcap != 0 {
 		tb.strdict = make(map[string]LValue, hcap)
 	}
+	// stock charges an LValue cell per array slot (sizeof(TValue)=16)
+	// and a Node per hash slot (~48 with key+value+next)
+	gcCharge(int64(acap)*16 + int64(hcap)*48 + 64)
 	return tb
 }
 
@@ -307,15 +320,13 @@ func (tb *LTable) RawGet(key LValue) LValue {
 }
 
 // RawGetInt returns an LValue at position `key` without __index metamethod.
+// An out-of-array-range key reads the hash part (stock luaH_getint), so a
+// {[math.mininteger]=10} table answers at negative indices too.
 func (tb *LTable) RawGetInt(key int) LValue {
-	if tb.array == nil {
-		return LNil
+	if key >= 1 && key <= len(tb.array) {
+		return tb.array[key-1]
 	}
-	index := int(key) - 1
-	if index >= len(tb.array) || index < 0 {
-		return LNil
-	}
-	return tb.array[index]
+	return tb.RawGetH(LInteger(key))
 }
 
 // RawGet returns an LValue associated with a given key without __index metamethod.

@@ -277,44 +277,33 @@ stat:
             $$ = &ast.LocalAssignStmt{Names: $2.names(), Attribs: $2.attribs(), Exprs:[]ast.Expr{}}
             $$.SetLine($1.Pos.Line)
         } |
-        /* U3a: the 5.5 global declaration, accepted-as-no-op (a reserved
-           word with enforcement at U5 — ledger row). `global namelist`
-           lowers to a plain global assignment when initialized; the
-           declaration itself carries no observable behavior before U5.
-           `global *` / `global <attrib> *` change only the (absent)
-           declaration checking — nothing. */
+        /* U5a: the 5.5 global declaration (real semantics — the resolver
+           lives in compile.go; `global` stays contextual, matching the
+           oracle's default LUA_COMPAT_GLOBAL build). */
         TGlobal attnamelist '=' exprlist {
             $2.checkGlobal(yylex.(*Lexer))
-            lhs := make([]ast.Expr, 0, len($2.items))
-            for i, item := range $2.items {
-                ident := &ast.IdentExpr{Value: item.Name}
-                ident.SetLine($1.Pos.Line + i)
-                lhs = append(lhs, ident)
-            }
-            $$ = &ast.AssignStmt{Lhs: lhs, Rhs: $4}
+            $$ = &ast.GlobalDeclStmt{Names: $2.names(), Attribs: $2.attribs(), Exprs: $4}
             $$.SetLine($1.Pos.Line)
         } |
         TGlobal attnamelist {
             $2.checkGlobal(yylex.(*Lexer))
-            $$ = &ast.DoBlockStmt{}
+            $$ = &ast.GlobalDeclStmt{Names: $2.names(), Attribs: $2.attribs()}
             $$.SetLine($1.Pos.Line)
         } |
         TGlobal TFunction TIdent funcbody {
-            fn := &ast.IdentExpr{Value: $3.Str}
-            fn.SetLine($3.Pos.Line)
-            $$ = &ast.FuncDefStmt{Name: &ast.FuncName{Func: fn}, Func: $4}
+            $$ = &ast.GlobalFuncStmt{Name: $3.Str, Func: $4}
             $$.SetLine($1.Pos.Line)
             $$.SetLastLine($4.LastLine())
         } |
         TGlobal '*' {
-            $$ = &ast.DoBlockStmt{}
+            $$ = &ast.GlobalDeclStmt{IsStar: true}
             $$.SetLine($1.Pos.Line)
         } |
         TGlobal attrib '*' {
             if $2 == "close" {
                 yylex.(*Lexer).SemError("global variables cannot be to-be-closed")
             }
-            $$ = &ast.DoBlockStmt{}
+            $$ = &ast.GlobalDeclStmt{IsStar: true, Attribs: []string{$2}}
             $$.SetLine($1.Pos.Line)
         } |
         T2Colon TIdent T2Colon {

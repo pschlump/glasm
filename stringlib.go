@@ -193,7 +193,7 @@ func strGsub(L *LState) int {
 	}
 	if len(mds) == 0 {
 		L.SetTop(1)
-		L.Push(LNumber(0))
+		L.Push(LInteger(0))
 		return 2
 	}
 	switch lv := repl.(type) {
@@ -204,7 +204,8 @@ func strGsub(L *LState) int {
 	case *LFunction:
 		L.Push(LString(strGsubFunc(L, str, lv, mds)))
 	}
-	L.Push(LNumber(len(mds)))
+	// stock pushes the count as an integer (str_gsub's lua_pushinteger)
+	L.Push(LInteger(int64(len(mds))))
 	return 2
 }
 
@@ -213,12 +214,15 @@ type replaceInfo struct {
 	String   string
 }
 
+// checkCaptureIndex is stock get_onecapture's range check for a
+// replacement-side '%n': out of range errors with the digit as written
+// ("invalid capture index %2"; pm.lua:255).
 func checkCaptureIndex(L *LState, m *pm.MatchData, idx int) {
 	if idx <= 2 {
 		return
 	}
 	if idx >= m.CaptureLength() {
-		L.RaiseError("invalid capture index")
+		L.RaiseError("invalid capture index %%%d", idx/2)
 	}
 }
 
@@ -236,6 +240,11 @@ func capturedString(L *LState, m *pm.MatchData, str string, idx int) string {
 }
 
 func strGsubDoReplace(str string, info []replaceInfo) string {
+	if len(info) == 0 {
+		// stock str_gsub with zero substitutions returns the ORIGINAL
+		// string (same identity — pm.lua:428's string.format("%p") battery)
+		return str
+	}
 	offset := 0
 	buf := []byte(str)
 	for _, replace := range info {
@@ -253,27 +262,40 @@ func strGsubDoReplace(str string, info []replaceInfo) string {
 	return string(buf)
 }
 
+// strGsubStr ports stock add_s: '%%' is one '%', '%0' the whole match,
+// '%1'..'%9' the capture (a %1 with no captures is the whole match —
+// get_onecapture's i==0 case), and anything else after '%' — including a
+// trailing lone '%' — is "invalid use of '%' in replacement string"
+// (pm.lua:258's battery).
 func strGsubStr(L *LState, str string, repl string, matches []*pm.MatchData) string {
 	infoList := make([]replaceInfo, 0, len(matches))
 	for _, match := range matches {
 		start, end := match.Capture(0), match.Capture(1)
-		sc := newFlagScanner('%', "", "", repl)
-		for c, eos := sc.Next(); !eos; c, eos = sc.Next() {
-			if !sc.ChangeFlag {
-				if sc.HasFlag {
-					if c >= '0' && c <= '9' {
-						sc.AppendString(capturedString(L, match, str, 2*(int(c)-48)))
-					} else {
-						sc.AppendChar('%')
-						sc.AppendChar(c)
-					}
-					sc.HasFlag = false
-				} else {
-					sc.AppendChar(c)
-				}
+		buf := make([]byte, 0, len(repl))
+		for i := 0; i < len(repl); i++ {
+			if repl[i] != '%' {
+				buf = append(buf, repl[i])
+				continue
+			}
+			i++
+			c := byte(0) // a trailing lone '%' reads C's NUL: the error arm
+			if i < len(repl) {
+				c = repl[i]
+			}
+			switch {
+			case c == '%':
+				buf = append(buf, '%')
+			case '1' <= c && c <= '9':
+				buf = append(buf, capturedString(L, match, str, 2*(int(c)-48))...)
+			case c == '0':
+				buf = append(buf, str[start:end]...)
+			default:
+				// (the %s form keeps go vet's format check happy — the
+				// message itself contains a literal '%')
+				L.RaiseError("%s", "invalid use of '%' in replacement string")
 			}
 		}
-		infoList = append(infoList, replaceInfo{[]int{start, end}, sc.String()})
+		infoList = append(infoList, replaceInfo{[]int{start, end}, string(buf)})
 	}
 
 	return strGsubDoReplace(str, infoList)
@@ -293,6 +315,12 @@ func strGsubTable(L *LState, str string, repl *LTable, matches []*pm.MatchData) 
 			value = L.GetField(repl, str[match.Capture(idx):match.Capture(idx+1)])
 		}
 		if !LVIsFalse(value) {
+			// stock add_value: a truthy non-string replacement is an error
+			// ("invalid replacement value (a table)"; pm.lua:254) — nil or
+			// false keeps the original match
+			if !LVCanConvToString(value) {
+				L.RaiseError("invalid replacement value (a %s)", value.Type().String())
+			}
 			infoList = append(infoList, replaceInfo{[]int{match.Capture(0), match.Capture(1)}, LVAsString(value)})
 		}
 	}
@@ -321,6 +349,11 @@ func strGsubFunc(L *LState, str string, repl *LFunction, matches []*pm.MatchData
 		L.Call(nargs, 1)
 		ret := L.reg.Pop()
 		if !LVIsFalse(ret) {
+			// stock add_value (the function arm): a truthy non-string
+			// return is an error; nil/false keeps the original match
+			if !LVCanConvToString(ret) {
+				L.RaiseError("invalid replacement value (a %s)", ret.Type().String())
+			}
 			infoList = append(infoList, replaceInfo{[]int{start, end}, LVAsString(ret)})
 		}
 	}

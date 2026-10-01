@@ -205,13 +205,19 @@ func OpenIo(L *LState) int {
 
 var fileMethods = map[string]LGFunction{
 	"__tostring": fileToString,
-	"write":      fileWrite,
-	"close":      fileClose,
-	"flush":      fileFlush,
-	"lines":      fileLines,
-	"read":       fileRead,
-	"seek":       fileSeek,
-	"setvbuf":    fileSetVBuf,
+	// stock's metameth table maps the file __close to f_gc, NOT io_close:
+	// a no-op on an already-closed handle. io.lines(filename) returns the
+	// file as the generic-for's 4th to-be-closed value (U5a — TFORPREP
+	// registers it), and the lines iterator already closed it at EOF by
+	// the time the loop-exit close fires on the same handle.
+	"__close": fileCloseMeta,
+	"write":   fileWrite,
+	"close":   fileClose,
+	"flush":   fileFlush,
+	"lines":   fileLines,
+	"read":    fileRead,
+	"seek":    fileSeek,
+	"setvbuf": fileSetVBuf,
 }
 
 func fileToString(L *LState) int {
@@ -597,6 +603,17 @@ func fileWrite(L *LState) int {
 
 func fileClose(L *LState) int {
 	return fileCloseAux(L, checkFile(L))
+}
+
+// fileCloseMeta is the file metatable's __close (stock f_gc used as
+// __close): close unless already closed — the lines iterator closes at
+// EOF, then the generic-for's loop-exit close fires on the same handle.
+func fileCloseMeta(L *LState) int {
+	file := checkFile(L)
+	if file.closed {
+		return 0
+	}
+	return fileCloseAux(L, file)
 }
 
 func fileFlush(L *LState) int {

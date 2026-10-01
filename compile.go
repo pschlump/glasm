@@ -11,7 +11,17 @@ import (
 
 /* internal constants & structs  {{{ */
 
+// maxRegisters is stock MAXVARS (lparser.c:35): the register level of a
+// function's DECLARED variables — locals and parameters alike, checked as
+// adjustlocalvars assigns each ridx ("too many local variables").
 const maxRegisters = 200
+
+// maxFuncRegisters is stock MAX_FSTACK (lopcodes.h:210 = MAXARG_A, the A
+// field width): the register WINDOW — declared variables plus expression
+// temporaries (luaK_checkstack's maxstacksize). 200 locals plus return-
+// expression temps legitimately need 200 < window <= 255 (goto.lua:411's
+// 200-declaration mixing battery).
+const maxFuncRegisters = opMaxArgsA
 
 type expContextType int
 
@@ -23,6 +33,9 @@ const (
 	ecVararg
 	ecMethod
 	ecNone
+	// ecConst (U5a): the name resolved to an RDKCTC entry — a
+	// register-less compile-time constant folded at its use sites.
+	ecConst
 )
 
 const regNotDefined = opMaxArgsA + 1
@@ -357,12 +370,26 @@ type varNamePool struct {
 	// Vardesc kinds — see the varKind* constants). Parallel to names;
 	// separate per block, so sibling-block locals sharing a register
 	// never share a kind.
-	kinds  []int
+	kinds []int
+	// regs holds the register (stack slot) per entry, parallel to names
+	// (U5a — stock separates fs->nactvar, the scope count, from
+	// luaY_nvarstack, the register level: RDKCTC and global-declaration
+	// entries are active for scoping but never occupy a slot). -1 marks a
+	// register-less entry.
+	regs []int
+	// dbg holds the Proto.DbgLocals entry per name, parallel to names —
+	// nil for register-less kinds (U5a: stock records locvars only for
+	// stack-resident variables; RDKCTC/GDK entries never appear in
+	// debug.getlocal).
+	dbg []*DbgLocalInfo
+	// vals holds the folded constant of a varKindCTC entry (parallel to
+	// names; nil otherwise) — stock keeps the value on the Vardesc.
+	vals   []LValue
 	offset int
 }
 
 func newVarNamePool(offset int) *varNamePool {
-	return &varNamePool{make([]string, 0, 16), make([]int, 0, 16), offset}
+	return &varNamePool{make([]string, 0, 16), make([]int, 0, 16), make([]int, 0, 16), make([]*DbgLocalInfo, 0, 16), make([]LValue, 0, 16), offset}
 }
 
 func (vp *varNamePool) Names() []string {
@@ -384,6 +411,12 @@ func (vp *varNamePool) LastIndex() int {
 
 func (vp *varNamePool) Find(name string) int {
 	for i := len(vp.names) - 1; i >= 0; i-- {
+		// global-declaration entries never match a program name (U5a —
+		// stock searchvar checks the kind before the name; collective
+		// entries carry a NULL name and match nothing)
+		if isGlobalKind(vp.kinds[i]) {
+			continue
+		}
 		if vp.names[i] == name {
 			return i + vp.offset
 		}
@@ -400,16 +433,57 @@ func (vp *varNamePool) RegisterUnique(name string) int {
 }
 
 func (vp *varNamePool) Register(name string) int {
-	vp.names = append(vp.names, name)
-	vp.kinds = append(vp.kinds, varKindReg)
-	return len(vp.names) - 1 + vp.offset
+	return vp.RegisterKindReg(name, varKindReg, vp.offset+len(vp.names))
 }
 
 // RegisterKind is Register with an explicit variable kind (U4 attributes).
 func (vp *varNamePool) RegisterKind(name string, kind int) int {
+	return vp.RegisterKindReg(name, kind, vp.offset+len(vp.names))
+}
+
+// RegisterKindReg is Register with an explicit register: the next free
+// slot for register-holding kinds, -1 for register-less ones (U5a —
+// stock's adjustlocalvars assigns ridx only to stack-resident variables;
+// RDKCTC/GDK entries are active for scoping but never occupy a slot).
+func (vp *varNamePool) RegisterKindReg(name string, kind, reg int) int {
 	vp.names = append(vp.names, name)
 	vp.kinds = append(vp.kinds, kind)
+	if !kindHasRegister(kind) {
+		reg = -1
+	}
+	vp.regs = append(vp.regs, reg)
+	vp.dbg = append(vp.dbg, nil)
+	vp.vals = append(vp.vals, nil)
 	return len(vp.names) - 1 + vp.offset
+}
+
+// noteDbg attaches the Proto.DbgLocals entry for the entry at index
+// (register-holding entries only).
+func (vp *varNamePool) noteDbg(index int, info *DbgLocalInfo) {
+	vp.dbg[index-vp.offset] = info
+}
+
+// noteCTC records the folded constant of the varKindCTC entry at index.
+func (vp *varNamePool) noteCTC(index int, value LValue) {
+	vp.vals[index-vp.offset] = value
+}
+
+// ctcValAt is the folded constant of the entry at index (nil unless the
+// entry is varKindCTC).
+func (vp *varNamePool) ctcValAt(index int) LValue {
+	return vp.vals[index-vp.offset]
+}
+
+// isGlobalKind reports a global-declaration entry (stock varglobal):
+// invisible to local-name resolution, active for the preambular walk.
+func isGlobalKind(kind int) bool {
+	return kind == varKindGlobalReg || kind == varKindGlobalConst
+}
+
+// regAt is the register of the entry at global (function-wide) index
+// (-1 for a register-less entry).
+func (vp *varNamePool) regAt(index int) int {
+	return vp.regs[index-vp.offset]
 }
 
 // kindAt is the kind of the local at global (function-wide) index.
@@ -429,16 +503,31 @@ func (vp *varNamePool) countKind(kind int) int {
 }
 
 /*
-	Local variable kinds (U4; stock lparser.h's VDK* numbers — only the
-
-three the fork models at U4: the RDKCTC compile-time constants and the
-GDK* global-declaration kinds arrive with U5's resolver).
+Local variable kinds (U4+U5; stock lparser.h's VDK* numbers).
 */
 const (
-	varKindReg   = 0 // VDKREG — a regular local
-	varKindConst = 1 // RDKCONST — <const>: assignment-locked
-	varKindTBC   = 3 // RDKTOCLOSE — <close>: assignment-locked + OP_TBC
+	varKindReg         = 0 // VDKREG — a regular local
+	varKindConst       = 1 // RDKCONST — <const>: assignment-locked
+	varKindTBC         = 3 // RDKTOCLOSE — <close>: assignment-locked + OP_TBC
+	varKindCTC         = 4 // RDKCTC — register-less compile-time constant (U5a)
+	varKindGlobalReg   = 5 // GDKREG — a declared global (U5a)
+	varKindGlobalConst = 6 // GDKCONST — a declared read-only global / collective
 )
+
+// kindHasRegister reports whether an entry of this kind occupies a stack
+// slot (stock's adjustlocalvars vs. the register-less RDKCTC/GDK kinds).
+func kindHasRegister(kind int) bool {
+	switch kind {
+	case varKindCTC, varKindGlobalReg, varKindGlobalConst:
+		return false
+	}
+	return true
+}
+
+// globalStarName is the pool name of a collective `global *` entry
+// (stock uses a NULL name; "*" cannot collide with a program name — the
+// lexer never produces it as an identifier).
+const globalStarName = "*"
 
 // attribToKind maps an AST attribute string to a variable kind.
 func attribToKind(attrib string) int {
@@ -577,7 +666,10 @@ func (fc *funcContext) closeGoto(g int, label *gotoLabelDesc, bup bool) {
 	if gt.NeedClose || (label.NumActiveLocalVars < gt.NumActiveLocalVars && bup) {
 		code := fc.Code
 		code.codes[gt.Pc+1] = code.codes[gt.Pc] // jump moves after the close
-		code.codes[gt.Pc] = opCreateABC(OP_CLOSE, label.NumActiveLocalVars, 0, 0)
+		// U5a: register-less entries (RDKCTC/GDK) sit between the goto's
+		// level and the label's — CLOSE takes the REGISTER level (stock
+		// closegoto's reglevel), not the active-var count
+		code.codes[gt.Pc] = opCreateABC(OP_CLOSE, fc.regLevelOfCount(label.NumActiveLocalVars), 0, 0)
 		gt.Pc++
 	}
 	fc.Code.SetSJ(gt.Pc, label.Id)
@@ -595,7 +687,10 @@ func (fc *funcContext) solveGotos() {
 		if lb := fc.findActiveLabel(gt.Name, bl.firstLabelIndex); lb != nil {
 			fc.closeGoto(igt, lb, bl.RefUpvalue)
 		} else {
-			if bl.RefUpvalue && gt.NumActiveLocalVars > bl.entryNactvar {
+			// U5a: stock solvegotos compares REGISTER levels (bl->upval &&
+			// reglevel(gt->nactvar) > outlevel) — a hoisted goto crossed
+			// variables in registers, not just scope entries
+			if bl.RefUpvalue && fc.regLevelOfCount(gt.NumActiveLocalVars) > fc.regLevelOfCount(bl.entryNactvar) {
 				gt.NeedClose = true
 			}
 			gt.NumActiveLocalVars = bl.entryNactvar
@@ -699,20 +794,102 @@ func (fc *funcContext) BlockLocalVarsCount() int {
 }
 
 func (fc *funcContext) RegisterLocalVar(name string) int {
-	ret := fc.Block.LocalVars.Register(name)
-	fc.Proto.DbgLocals = append(fc.Proto.DbgLocals, &DbgLocalInfo{Name: name, StartPc: fc.Code.LastPC() + 1})
-	fc.SetRegTop(fc.RegTop() + 1)
-	return ret
+	return fc.RegisterLocalVarKind(name, varKindReg)
 }
 
 // RegisterLocalVarKind is RegisterLocalVar with a variable kind (U4
 // attributes: <const>/<close> locals; for-loop control variables declare
-// varKindConst like stock lparser.c).
+// varKindConst like stock lparser.c). U5a: register-less kinds
+// (RDKCTC/GDK — stock's luaY_nvarstack discipline) do not move regTop;
+// they are active for scoping (block truncation, goto scope checks)
+// without occupying a stack slot.
 func (fc *funcContext) RegisterLocalVarKind(name string, kind int) int {
-	ret := fc.Block.LocalVars.RegisterKind(name, kind)
-	fc.Proto.DbgLocals = append(fc.Proto.DbgLocals, &DbgLocalInfo{Name: name, StartPc: fc.Code.LastPC() + 1})
-	fc.SetRegTop(fc.RegTop() + 1)
+	ret := fc.Block.LocalVars.RegisterKindReg(name, kind, fc.RegTop())
+	if kindHasRegister(kind) {
+		fc.SetRegTop(fc.RegTop() + 1)
+		info := &DbgLocalInfo{Name: name, StartPc: fc.Code.LastPC() + 1}
+		fc.Proto.DbgLocals = append(fc.Proto.DbgLocals, info)
+		fc.Block.LocalVars.noteDbg(ret, info)
+	}
 	return ret
+}
+
+// regOfVar is the register of the local at function-wide index idx —
+// the register sites (MOVE operands, capture descriptors, CLOSE levels)
+// go through here, never through the index itself (U5a: the index is a
+// scope identity; some kinds have no register).
+func (fc *funcContext) regOfVar(idx int) int {
+	_, block := fc.FindLocalVarAndBlockAt(idx)
+	return block.LocalVars.regAt(idx)
+}
+
+// kindOfVar is the variable kind of the local at function-wide index
+// idx (U5a — the RDKCTC test in stock searchvar's local arm).
+func (fc *funcContext) kindOfVar(idx int) int {
+	_, block := fc.FindLocalVarAndBlockAt(idx)
+	return block.LocalVars.kindAt(idx)
+}
+
+// regLevelOfCount converts an active-var count (a scope level —
+// register-less entries included) to its register level: 1 + the
+// register of the highest register-resident entry below the count, 0
+// when none (stock reglevel, lparser.c:236). CLOSE operands and goto
+// close decisions use this, never the count itself.
+func (fc *funcContext) regLevelOfCount(count int) int {
+	var chain []*codeBlock
+	for block := fc.Block; block != nil; block = block.Parent {
+		chain = append(chain, block)
+	}
+	// stock reglevel: the entries in scope at level count are the LOWEST
+	// count entries of the active stack (root-first flat indexing) — skip
+	// the (total-count) entries above the level, then walk down; the
+	// first register-resident entry met is the highest one below it
+	skip := fc.BlockLocalVarsCount() - count
+	for i := 0; i < len(chain) && count > 0; i++ { // innermost block first
+		pool := chain[i].LocalVars
+		for j := len(pool.names) - 1; j >= 0 && count > 0; j-- {
+			if skip > 0 {
+				skip--
+				continue
+			}
+			count--
+			if reg := pool.regAt(pool.offset + j); reg >= 0 {
+				return reg + 1
+			}
+		}
+	}
+	return 0
+}
+
+// FindLocalVarAndBlockAt locates the block owning a function-wide index.
+func (fc *funcContext) FindLocalVarAndBlockAt(idx int) (int, *codeBlock) {
+	for block := fc.Block; block != nil; block = block.Parent {
+		if idx >= block.LocalVars.offset && idx < block.LocalVars.LastIndex() {
+			return idx, block
+		}
+	}
+	return -1, nil
+}
+
+// nvarstack is the register level of the currently active variables
+// (stock luaY_nvarstack): 1 + the highest register among the active
+// chain's register-holding entries. CLOSE operands and block-exit
+// regTop restores use this, not the entry count (U5a).
+func (fc *funcContext) nvarstack() int {
+	return fc.nvarstackFrom(fc.Block)
+}
+
+// nvarstackFrom is nvarstack over the chain starting at block.
+func (fc *funcContext) nvarstackFrom(block *codeBlock) int {
+	n := 0
+	for b := block; b != nil; b = b.Parent {
+		for _, r := range b.LocalVars.regs {
+			if r >= n {
+				n = r + 1
+			}
+		}
+	}
+	return n
 }
 
 // checkReadOnlyLocal raises stock's const-assignment error (check_readonly,
@@ -771,15 +948,21 @@ func (fc *funcContext) LocalVars() []varNamePoolValue {
 }
 
 func (fc *funcContext) EnterBlock(blabel int, pos ast.PositionHolder) {
+	// U5a: the pool offset is the count of active ENTRIES (stock nactvar),
+	// not the register level — register-less kinds (RDKCTC/GDK) occupy a
+	// flat index without a slot, and a RegTop-seeded offset made their
+	// flat indices collide with an inner block's (a `global <const> *`
+	// preamble + a repeat-body local resolved both `a` and the inner `b`
+	// to the same register; locals.lua:68).
 	entryNactvar := fc.BlockLocalVarsCount()
-	fc.Block = newCodeBlock(newVarNamePool(fc.RegTop()), blabel, fc.Block, pos, len(fc.labels), len(fc.gotos), entryNactvar)
+	fc.Block = newCodeBlock(newVarNamePool(entryNactvar), blabel, fc.Block, pos, len(fc.labels), len(fc.gotos), entryNactvar)
 	fc.Blocks = append(fc.Blocks, fc.Block)
 }
 
 func (fc *funcContext) CloseUpvalues() int {
 	n := -1
 	if fc.Block.RefUpvalue {
-		n = fc.Block.Parent.LocalVars.LastIndex()
+		n = fc.nvarstackFrom(fc.Block.Parent)
 		fc.Code.AddABC(OP_CLOSE, n, 0, 0, fc.Block.LastLine)
 	}
 	return n
@@ -787,7 +970,7 @@ func (fc *funcContext) CloseUpvalues() int {
 
 func (fc *funcContext) LeaveBlock() int {
 	closed := fc.CloseUpvalues()
-	fc.EndScope()
+	fc.EndScope(closed > -1)
 
 	// U4: the block's <close> declarations are closed by its OP_CLOSE /
 	// the enclosing return — tailcall promotion is allowed again below
@@ -799,13 +982,26 @@ func (fc *funcContext) LeaveBlock() int {
 	fc.solveGotos()
 
 	fc.Block = fc.Block.Parent
-	fc.SetRegTop(fc.Block.LocalVars.LastIndex())
+	fc.SetRegTop(fc.nvarstack())
 	return closed
 }
 
-func (fc *funcContext) EndScope() {
-	for _, vr := range fc.Block.LocalVars.List() {
-		fc.Proto.DbgLocals[vr.Index].EndPc = fc.Code.LastPC()
+// EndScope closes the debug-info window of the block's locals
+// (stock removevars' endpc). extendToClose marks a scope whose exit code
+// CLOSES: stock emits OP_CLOSE before removevars, so its endpc is one
+// PAST the close — the close's own __close metamethod still sees the
+// block's locals in debug.getlocal (the repeat-until battery,
+// locals.lua:1198). LocalName's pc < EndPc keeps the extra pc visible at
+// the CLOSE only, never past it.
+func (fc *funcContext) EndScope(extendToClose bool) {
+	for _, info := range fc.Block.LocalVars.dbg {
+		if info != nil {
+			end := fc.Code.LastPC()
+			if extendToClose {
+				end++
+			}
+			info.EndPc = end
+		}
 	}
 }
 
@@ -1016,6 +1212,10 @@ func compileStmt(context *funcContext, stmt ast.Stmt, isLastStmt bool) { // {{{
 		compileAssignStmt(context, st)
 	case *ast.LocalAssignStmt:
 		compileLocalAssignStmt(context, st)
+	case *ast.GlobalDeclStmt:
+		compileGlobalDeclStmt(context, st)
+	case *ast.GlobalFuncStmt:
+		compileGlobalFuncStmt(context, st)
 	case *ast.FuncCallStmt:
 		compileFuncCallExpr(context, context.RegTop(), st.Expr.(*ast.FuncCallExpr), ecnone(-1))
 	case *ast.DoBlockStmt:
@@ -1059,14 +1259,28 @@ func compileAssignStmtLeft(context *funcContext, stmt *ast.AssignStmt) (int, []*
 			ac := &assigncontext{ec: ec, envLocalIdx: -1}
 			switch identtype {
 			case ecGlobal:
+				// U5a: a `global x <const>` entry (or an active
+				// `global <const> *`) locks the assignment — stock
+				// check_readonly's VINDEXUP/ro arm
+				checkGlobalWrite(context, st.Value, sline(st))
 				context.ConstIndex(LString(st.Value))
-				if envlocal, _ := envAccess(context); envlocal > -1 {
+				if cv, ok := envConstAccess(context); ok {
+					// U5a: _ENV is an RDKCTC constant — materialize it as
+					// the store's table operand (stock discharges VCONST;
+					// the SETFIELD then fails at runtime with "attempt to
+					// index a number value", attrib.lua:461). Without this
+					// the register-less _ENV fell through to the upvalue
+					// arm and the store silently hit the real globals.
+					loadConstant(context, reg, cv, sline(st))
+					ac.envLocalIdx = reg
+					reg++
+				} else if envlocal, _ := envAccess(context); envlocal > -1 {
 					ac.envLocalIdx = envlocal
 				}
 			case ecUpvalue:
 				context.Upvalues.RegisterUnique(st.Value)
 			case ecLocal:
-				ec.reg = context.FindLocalVar(st.Value)
+				ec.reg = context.regOfVar(context.FindLocalVar(st.Value))
 				// U4g (attrib.lua:505): stock check_conflict, the table
 				// arm — a field target parsed BEFORE this one may have its
 				// table operand aliasing this local's register (KMV
@@ -1316,7 +1530,7 @@ func compileAssignStmt(context *funcContext, stmt *ast.AssignStmt) { // {{{
 		switch acs[i].ec.ctype {
 		case ecLocal:
 			if acs[i].needmove {
-				code.AddABC(OP_MOVE, context.FindLocalVar(ex.(*ast.IdentExpr).Value), reg, 0, sline(ex))
+				code.AddABC(OP_MOVE, context.regOfVar(context.FindLocalVar(ex.(*ast.IdentExpr).Value)), reg, 0, sline(ex))
 				reg -= 1
 			}
 		case ecGlobal:
@@ -1408,6 +1622,25 @@ func compileRegAssignment(context *funcContext, names []string, exprs []ast.Expr
 
 func compileLocalAssignStmt(context *funcContext, stmt *ast.LocalAssignStmt) { // {{{
 	reg := context.RegTop()
+	// U5a (stock localstat's RDKCTC tail, lparser.c:1846): equal counts
+	// and the LAST name <const> with a foldable initializer promote that
+	// variable to a register-less compile-time constant — active for
+	// scoping, never in a register, the initializer emitting NO code.
+	if len(stmt.Names) == len(stmt.Exprs) && len(stmt.Names) > 0 &&
+		localStmtAttrib(stmt, len(stmt.Names)-1) == varKindConst {
+		if v, ok := ctcFoldValue(context, stmt.Exprs[len(stmt.Exprs)-1]); ok {
+			names := stmt.Names[:len(stmt.Names)-1]
+			exprs := stmt.Exprs[:len(stmt.Exprs)-1]
+			compileRegAssignment(context, names, exprs, reg, len(names), sline(stmt))
+			for i, name := range names {
+				context.RegisterLocalVarKind(name, localStmtAttrib(stmt, i))
+			}
+			idx := context.RegisterLocalVarKind(stmt.Names[len(stmt.Names)-1], varKindCTC)
+			context.Block.LocalVars.noteCTC(idx, v)
+			compileStmtTBC(context, stmt)
+			return
+		}
+	}
 	if len(stmt.Names) == 1 && len(stmt.Exprs) == 1 {
 		if _, ok := stmt.Exprs[0].(*ast.FunctionExpr); ok {
 			context.RegisterLocalVarKind(stmt.Names[0], localStmtAttrib(stmt, 0))
@@ -1444,13 +1677,264 @@ func compileStmtTBC(context *funcContext, stmt *ast.LocalAssignStmt) {
 		if localStmtAttrib(stmt, i) != varKindTBC {
 			continue
 		}
-		reg := context.FindLocalVar(name)
+		reg := context.regOfVar(context.FindLocalVar(name))
 		context.Code.AddABC(OP_TBC, reg, 0, 0, sline(stmt))
 		context.Block.RefUpvalue = true
 		context.NeedsClose = true
 		context.tbcActive++
 	}
 } // }}}
+
+// attribAt is attribs[i] with the no-attribute default "" (parallel
+// lists carry "" for plain names; a nil list is all-plain).
+func attribAt(attribs []string, i int) string {
+	if attribs == nil || i >= len(attribs) {
+		return ""
+	}
+	return attribs[i]
+}
+
+// globalAttribToKind maps a global declaration's attribute to its kind
+// (stock getglobalattribute's RDKCONST → GDKCONST adjustment; <close>
+// was rejected at parse).
+func globalAttribToKind(attrib string) int {
+	if attrib == "const" {
+		return varKindGlobalConst
+	}
+	return varKindGlobalReg
+}
+
+// compileGlobalDeclStmt — stock globalstat/globalnames/initglobal
+// (U5a). The collective `global *` / `global <const> *` and plain
+// declarations register entries and emit NOTHING; the entries are what
+// the searchvar port reads. With initializers the RHS compiles into the
+// value window FIRST (declarations activate after it — the RHS does not
+// see them), then each name checks-and-stores in REVERSE order
+// (initglobal's unwind): load the global's current value into a temp,
+// OP_ERRNNIL (raise `global '%s' already defined` when non-nil), store
+// the value. Register choreography (oracle-verified for `global a, b =
+// 1, 2`): values at reg..reg+n-1, var i's temp at reg+i+1, value at
+// reg+i.
+func compileGlobalDeclStmt(context *funcContext, stmt *ast.GlobalDeclStmt) { // {{{
+	line := sline(stmt)
+	if stmt.IsStar {
+		context.RegisterLocalVarKind(globalStarName, globalAttribToKind(attribAt(stmt.Attribs, 0)))
+		return
+	}
+	if len(stmt.Exprs) == 0 {
+		for i, name := range stmt.Names {
+			context.RegisterLocalVarKind(name, globalAttribToKind(attribAt(stmt.Attribs, i)))
+		}
+		return
+	}
+	n := len(stmt.Names)
+	reg := context.RegTop()
+	compileRegAssignment(context, stmt.Names, stmt.Exprs, reg, n, line)
+	for i, name := range stmt.Names {
+		context.RegisterLocalVarKind(name, globalAttribToKind(attribAt(stmt.Attribs, i)))
+	}
+	for i := n - 1; i >= 0; i-- {
+		compileGlobalInit(context, stmt.Names[i], reg+i, reg+i+1, line)
+	}
+} // }}}
+
+// compileGlobalFuncStmt — stock globalfunc (U5a): declare the name
+// FIRST (a `global function f` body's recursion sees it), compile the
+// closure, then the ERRNNIL redefinition check and the store at the
+// statement's line.
+func compileGlobalFuncStmt(context *funcContext, stmt *ast.GlobalFuncStmt) { // {{{
+	line := sline(stmt)
+	context.RegisterLocalVarKind(stmt.Name, varKindGlobalReg)
+	checkGlobalAccess(context, stmt.Name, line)
+	reg := context.RegTop()
+	compileExpr(context, reg, stmt.Func, ecnone(0))
+	compileGlobalInit(context, stmt.Name, reg, reg+1, line)
+} // }}}
+
+// compileGlobalInit is stock checkglobal + storevartop: read
+// _ENV[name] into temp, OP_ERRNNIL (Bx = the name's K index + 1, 0
+// when past MAXARG_Bx — luaK_codecheckglobal), store vreg.
+func compileGlobalInit(context *funcContext, name string, vreg, temp, line int) {
+	checkGlobalAccess(context, name, line)
+	kidx, fits := context.kStringIndex(name, line)
+	emitGlobalLoad(context, temp, name, kidx, fits, line)
+	bx := 0
+	if kidx < opMaxArgBx {
+		bx = kidx + 1
+	}
+	context.Code.AddABx(OP_ERRNNIL, temp, bx, line)
+	emitGlobalStore(context, name, kidx, fits, vreg, line)
+}
+
+// emitGlobalLoad reads _ENV[name] into reg (the ecGlobal read arm of
+// compileExpr — local-_ENV GETFIELD/GETTABLE vs GETTABUP, with the
+// K-overflow fallbacks).
+func emitGlobalLoad(context *funcContext, reg int, name string, kidx int, fits bool, line int) {
+	code := context.Code
+	if cv, ok := envConstAccess(context); ok {
+		// U5a: an RDKCTC _ENV is the table operand as a constant
+		loadConstant(context, reg, cv, line)
+		if fits {
+			code.AddABC(OP_GETFIELD, reg, reg, kidx, line)
+		} else {
+			loadStringK(context, reg+1, name, line)
+			code.AddABC(OP_GETTABLE, reg, reg, reg+1, line)
+		}
+	} else if envlocal, _ := envAccess(context); envlocal > -1 {
+		if fits {
+			code.AddABC(OP_GETFIELD, reg, envlocal, kidx, line)
+		} else {
+			loadStringK(context, reg, name, line)
+			code.AddABC(OP_GETTABLE, reg, envlocal, reg, line)
+		}
+	} else if fits {
+		code.AddABC(OP_GETTABUP, reg, envUpvalueIndexOf(context), kidx, line)
+	} else {
+		code.AddABC(OP_GETUPVAL, reg, envUpvalueIndexOf(context), 0, line)
+		loadStringK(context, reg+1, name, line)
+		code.AddABC(OP_GETTABLE, reg, reg, reg+1, line)
+	}
+}
+
+// emitGlobalStore stores vreg into _ENV[name] (compileAssignStmt's
+// ecGlobal store arm).
+func emitGlobalStore(context *funcContext, name string, kidx int, fits bool, vreg, line int) {
+	code := context.Code
+	if cv, ok := envConstAccess(context); ok {
+		// U5a: an RDKCTC _ENV is the store's table operand as a constant
+		// (the SETFIELD/SETTABLE fails at runtime, "attempt to index a
+		// number value")
+		loadConstant(context, vreg+1, cv, line)
+		if fits {
+			code.AddABCk(OP_SETFIELD, vreg+1, kidx, vreg, 0, line)
+		} else {
+			loadStringK(context, vreg+2, name, line)
+			code.AddABCk(OP_SETTABLE, vreg+1, vreg+2, vreg, 0, line)
+		}
+	} else if envlocal, _ := envAccess(context); envlocal > -1 {
+		if fits {
+			code.AddABCk(OP_SETFIELD, envlocal, kidx, vreg, 0, line)
+		} else {
+			loadStringK(context, vreg+1, name, line)
+			code.AddABCk(OP_SETTABLE, envlocal, vreg+1, vreg, 0, line)
+		}
+	} else if fits {
+		code.AddABCk(OP_SETTABUP, envUpvalueIndexOf(context), kidx, vreg, 0, line)
+	} else {
+		code.AddABC(OP_GETUPVAL, vreg+2, envUpvalueIndexOf(context), 0, line)
+		loadStringK(context, vreg+1, name, line)
+		code.AddABCk(OP_SETTABLE, vreg+2, vreg+1, vreg, 0, line)
+	}
+}
+
+// ctcValueOf resolves name to a visible RDKCTC entry's folded constant
+// (stock singlevaraux's VCONST propagation: the entry can live in this
+// function or any ancestor — it is never captured as an upvalue, the
+// value folds at the use site). Resolution stops at the first local or
+// upvalue-pool match at each level.
+func ctcValueOf(context *funcContext, name string) (LValue, bool) {
+	for fn := context; fn != nil; fn = fn.Parent {
+		if idx := fn.FindLocalVar(name); idx > -1 {
+			if fn.kindOfVar(idx) != varKindCTC {
+				return nil, false
+			}
+			return fn.ctcValOfVar(idx), true
+		}
+		if fn.Upvalues.Find(name) > -1 {
+			return nil, false
+		}
+	}
+	return nil, false
+}
+
+// ctcValOfVar is the folded constant of the varKindCTC entry at idx.
+func (fc *funcContext) ctcValOfVar(idx int) LValue {
+	_, block := fc.FindLocalVarAndBlockAt(idx)
+	return block.LocalVars.ctcValAt(idx)
+}
+
+// ctcSubst rewrites compile-time-constant identifiers appearing as
+// ARITHMETIC operands into literal values (stock's constfolding reads
+// VCONST values through const2val), so constFold can fold `k3 + (k3 <<
+// k0)` — the RDKCTC promotion test folds chains of <const> locals
+// (stock localstat tail + luaK_exp2const, code.lua's k-battery). A
+// top-level identifier is left alone (ctcFoldValue's own IdentExpr arm
+// handles it, including non-numeric constants).
+func ctcSubst(context *funcContext, expr ast.Expr) ast.Expr {
+	sub := func(e ast.Expr) ast.Expr {
+		if id, ok := e.(*ast.IdentExpr); ok {
+			if v, ok := ctcValueOf(context, id.Value); ok {
+				ce := &constLValueExpr{Value: v}
+				ce.SetLine(id.Line())
+				return ce
+			}
+		}
+		return e
+	}
+	switch ex := expr.(type) {
+	case *ast.ArithmeticOpExpr:
+		ex.Lhs = sub(ctcSubst(context, ex.Lhs))
+		ex.Rhs = sub(ctcSubst(context, ex.Rhs))
+	case *ast.UnaryMinusOpExpr:
+		ex.Expr = sub(ctcSubst(context, ex.Expr))
+	case *ast.UnaryBNotOpExpr:
+		ex.Expr = sub(ctcSubst(context, ex.Expr))
+	}
+	return expr
+}
+
+// ctcFoldValue is stock luaK_exp2const for a local-decl initializer:
+// fold arithmetic first, then accept numerals, strings, booleans, nil,
+// and references to other visible compile-time constants.
+func ctcFoldValue(context *funcContext, expr ast.Expr) (LValue, bool) {
+	switch ex := constFold(ctcSubst(context, expr)).(type) {
+	case *constLValueExpr:
+		switch ex.Value.(type) {
+		case LInteger, LNumber:
+			return ex.Value, true
+		}
+	case *ast.NumberExpr:
+		if v, err := parseNumber(ex.Value); err == nil {
+			return v, true
+		}
+	case *ast.StringExpr:
+		return LString(ex.Value), true
+	case *ast.TrueExpr:
+		return LTrue, true
+	case *ast.FalseExpr:
+		return LFalse, true
+	case *ast.NilExpr:
+		return LNil, true
+	case *ast.IdentExpr:
+		return ctcValueOf(context, ex.Value)
+	}
+	return nil, false
+}
+
+// loadConstant materializes a folded compile-time constant into reg
+// (stock's literal selection over the folded value).
+func loadConstant(fc *funcContext, reg int, v LValue, line int) {
+	switch lv := v.(type) {
+	case LInteger, LNumber:
+		loadNumber(fc, reg, v, line)
+	case LString:
+		cindex := fc.ConstIndex(lv)
+		if cindex <= opMaxArgBx {
+			fc.Code.AddABx(OP_LOADK, reg, cindex, line)
+		} else {
+			fc.Code.AddABx(OP_LOADKX, reg, 0, line)
+			fc.Code.AddAx(OP_EXTRAARG, cindex, line)
+		}
+	case LBool:
+		if lv {
+			fc.Code.AddABC(OP_LOADTRUE, reg, 0, 0, line)
+		} else {
+			fc.Code.AddABC(OP_LOADFALSE, reg, 0, 0, line)
+		}
+	default:
+		fc.Code.AddABC(OP_LOADNIL, reg, 0, 0, line)
+	}
+}
 
 func compileReturnStmt(context *funcContext, stmt *ast.ReturnStmt) { // {{{
 	lenexprs := len(stmt.Exprs)
@@ -1478,11 +1962,14 @@ func compileReturnStmt(context *funcContext, stmt *ast.ReturnStmt) { // {{{
 	if lenexprs == 1 {
 		switch ex := stmt.Exprs[0].(type) {
 		case *ast.IdentExpr:
-			if idx := context.FindLocalVar(ex.Value); idx > -1 {
+			// U5a: an RDKCTC name has no register — return as a constant
+			// through the generic path, not RETURN1 of regOfVar's -1
+			if idx := context.FindLocalVar(ex.Value); idx > -1 && context.kindOfVar(idx) != varKindCTC {
+				reg := context.regOfVar(idx)
 				if kc != 0 {
-					code.AddABCk(OP_RETURN, idx, 2, 0, 1, sline(stmt))
+					code.AddABCk(OP_RETURN, reg, 2, 0, 1, sline(stmt))
 				} else {
-					code.AddABC(OP_RETURN1, idx, 0, 0, sline(stmt))
+					code.AddABC(OP_RETURN1, reg, 0, 0, sline(stmt))
 				}
 				return
 			}
@@ -1494,6 +1981,11 @@ func compileReturnStmt(context *funcContext, stmt *ast.ReturnStmt) { // {{{
 				reg += compileExpr(context, reg, ex, ecnone(-2))
 				if context.tbcActive == 0 { // stock insidetbc: no tailcall over an open <close>
 					code.SetOpCode(code.LastPC(), OP_TAILCALL)
+					// U5a (stock luaK_finish): a closing function signals it
+					// on the TAILCALL itself too
+					if kc != 0 {
+						code.Setk(code.LastPC(), 1)
+					}
 				}
 				code.AddABCk(OP_RETURN, a, 0, 0, kc, sline(stmt))
 			}
@@ -1611,6 +2103,11 @@ func compileRepeatStmt(context *funcContext, stmt *ast.RepeatStmt) { // {{{
 	compileBranchCondition(context, context.RegTop(), stmt.Condition, thenlabel, elselabel, false)
 
 	context.SetLabelPc(thenlabel, context.Code.LastPC())
+	// U5a: the block's debug windows must cover the close dance below
+	// (stock's scope block leaves AFTER the dance — its removevars endpc
+	// is past the repetition close, so both CLOSEs see the block's locals
+	// in debug.getlocal; locals.lua:1198)
+	dbg := context.Block.LocalVars.dbg
 	n := context.LeaveBlock()
 
 	if n > -1 {
@@ -1620,6 +2117,11 @@ func compileRepeatStmt(context *funcContext, stmt *ast.RepeatStmt) { // {{{
 		context.Code.AddABC(OP_CLOSE, n, 0, 0, eline(stmt))
 		context.Code.AddSJ(OP_JMP, initlabel, eline(stmt))
 		context.SetLabelPc(label, context.Code.LastPC())
+		for _, info := range dbg {
+			if info != nil {
+				info.EndPc = context.Code.LastPC() + 1
+			}
+		}
 	}
 
 } // }}}
@@ -1638,7 +2140,7 @@ func compileBreakStmt(context *funcContext, stmt *ast.BreakStmt) { // {{{
 		if block.RefUpvalue && block.Parent != nil {
 			// keep overwriting: the OUTERMOST crossed block with captured
 			// locals owns the close register
-			closeIdx = block.Parent.LocalVars.LastIndex()
+			closeIdx = context.nvarstackFrom(block.Parent)
 		}
 		if label := block.BreakLabel; label != labelNoJump {
 			if closeIdx > -1 {
@@ -1689,12 +2191,16 @@ func compileNumberForStmt(context *funcContext, stmt *ast.NumberForStmt) { // {{
 	// starting exactly at its own target register (r0=count slot,
 	// r1=step slot, r2=control slot = the visible name)
 	reg := context.RegTop()
-	rfor := context.RegisterLocalVar("(for index)")
+	// U5a: a registration's flat index is a scope identity, not a slot —
+	// the register it occupies is RegTop at the call (a `global *` preamble
+	// shifts flat indices without shifting registers)
+	rfor := reg
+	context.RegisterLocalVar("(for state)")
 	ecupdate(ec, ecLocal, rfor, 0)
 	compileExpr(context, reg, stmt.Init, ec)
 
 	reg = context.RegTop()
-	context.RegisterLocalVar("(for limit)")
+	context.RegisterLocalVar("(for state)")
 	ecupdate(ec, ecLocal, rfor+1, 0)
 	compileExpr(context, reg, stmt.Limit, ec)
 
@@ -1727,41 +2233,78 @@ func compileNumberForStmt(context *funcContext, stmt *ast.NumberForStmt) { // {{
 	}
 } // }}}
 
-// compileGenericForStmt — the 5.5 four-slot layout: r0=iterator function,
-// r1=state, r2=closing variable (TFORPREP swaps it with the control),
-// r3=control variable (aliased with the first loop name). The closing
-// value's to-be-closed registration is deferred to U5; TFORPREP performs
-// only the swap (ledger row).
+// compileGenericForStmt — the 5.5 four-slot layout: r0=iterator
+// function, r1=state, r2=closing variable (TFORPREP swaps it with the
+// control and registers the to-be-closed value), r3=control variable
+// (aliased with the first loop name). The three internal variables are
+// all "(for state)" (stock new_localvarliteral ×3). marktobeclosed
+// (U5a): EVERY generic-for marks the FOR block upval+insidetbc and the
+// function needclose — the loop body's returns carry the CLOSE k-bit
+// and tailcall promotion is suppressed inside (locals.lua's
+// numopen==0 battery). TWO blocks, exactly stock's forstat/forbody
+// split: the loop names activate in the BODY block (its LeaveBlock
+// CLOSE runs per iteration, closing captured loop names and body
+// locals), while the FOR block's CLOSE is emitted only after TFORLOOP
+// — loop exit, break (compileBreakStmt's crossed-block walk) and the
+// fallthrough out of the loop are the paths that close the 4th value;
+// the per-iteration path never reaches it. A single block put the CLOSE
+// between body and TFORCALL, where fallthrough executed it EVERY
+// iteration (files.lua's io.lines closed its file after line 1).
 func compileGenericForStmt(context *funcContext, stmt *ast.GenericForStmt) { // {{{
 	code := context.Code
 	endlabel := context.NewLabel()
 	nnames := len(stmt.Names)
 
+	// the FOR block (stock forstat enterblock, isbreakable — break finds
+	// this block's endlabel through the body block's labelNoJump)
 	context.EnterBlock(endlabel, stmt)
-	rgen := context.RegisterLocalVar("(for generator)")
+	// U5a: rgen is the REGISTER of the first control slot (TFOR* A
+	// operands) — RegTop at the registrations, not their flat indices
+	rgen := context.RegTop()
 	context.RegisterLocalVar("(for state)")
-	context.RegisterLocalVar("(for control)")
+	context.RegisterLocalVar("(for state)")
+	context.RegisterLocalVar("(for state)")
 
 	compileRegAssignment(context,
 		[]string{"(for state)", "(for state)", "(for state)", "(for state)"},
 		stmt.Exprs, context.RegTop()-3, 4, sline(stmt))
 
+	// stock marktobeclosed: the closing variable's scope is the loop
+	// block itself (the internal slot has no pool entry, so the
+	// LeaveBlock countKind decrement below needs no counterpart here —
+	// the explicit tbcActive-- after LeaveBlock is the decrement)
+	context.Block.RefUpvalue = true
+	context.NeedsClose = true
+	context.tbcActive++
+
 	code.AddABx(OP_TFORPREP, rgen, 0, sline(stmt))
 	preppc := code.LastPC()
 	bodypc := code.LastPC() + 1
 
-	// U4: the loop names are RDKCONST (stock lparser.c)
-	for _, name := range stmt.Names {
-		context.RegisterLocalVarKind(name, varKindConst)
+	// the BODY block (stock forbody enterblock): U4/U5a (stock forlist)
+	// the control variable (first name) is RDKCONST, additional loop
+	// names are regular assignable locals — all activated HERE so their
+	// upvalues close at each iteration's LeaveBlock
+	context.EnterBlock(labelNoJump, stmt)
+	for i, name := range stmt.Names {
+		if i == 0 {
+			context.RegisterLocalVarKind(name, varKindConst)
+		} else {
+			context.RegisterLocalVar(name)
+		}
 	}
 	compileChunk(context, stmt.Stmts, false)
-
 	context.LeaveBlock()
 
 	tfcallpc := code.LastPC() + 1
 	code.AddABC(OP_TFORCALL, rgen, 0, nnames, sline(stmt))
 	tflpc := code.LastPC() + 1
 	code.AddABx(OP_TFORLOOP, rgen, tflpc+1-bodypc, sline(stmt))
+
+	// the FOR block closes AFTER TFORLOOP — emitted on the normal loop
+	// exit only; TFORLOOP's jump back lands above it
+	context.LeaveBlock()
+	context.tbcActive--
 	context.SetLabelPc(endlabel, code.LastPC())
 	if d := tfcallpc - preppc - 1; d < 0 || d > opMaxArgBx {
 		raiseCompileError(context, sline(stmt), "control structure too long")
@@ -1836,6 +2379,12 @@ func compileExpr(context *funcContext, reg int, expr ast.Expr, ec *expcontext) i
 		return sused
 	case *ast.IdentExpr:
 		switch getIdentRefType(context, context, ex) {
+		case ecConst:
+			// U5a: an RDKCTC reference folds to the stored literal (stock
+			// VCONST — dischargevars' const2exp); no register is read
+			if v, ok := ctcValueOf(context, ex.Value); ok {
+				loadConstant(context, sreg, v, sline(ex))
+			}
 		case ecGlobal:
 			// D3: a global reads a field of _ENV. With _ENV shadowed by
 			// a local, that is a plain keyed table read; otherwise it is
@@ -1844,7 +2393,18 @@ func compileExpr(context *funcContext, reg int, expr ast.Expr, ec *expcontext) i
 			// range takes stock's fallback: key (and the upvalue table)
 			// into registers, GETTABLE.
 			kidx, fits := context.kStringIndex(ex.Value, sline(ex))
-			if envlocal, _ := envAccess(context); envlocal > -1 {
+			if cv, ok := envConstAccess(context); ok {
+				// U5a: an RDKCTC _ENV is the table operand as a constant
+				// (attrib.lua:461) — the load then fails at runtime with
+				// "attempt to index a number value"
+				loadConstant(context, sreg, cv, sline(ex))
+				if fits {
+					code.AddABC(OP_GETFIELD, sreg, sreg, kidx, sline(ex))
+				} else {
+					loadStringK(context, sreg+1, ex.Value, sline(ex))
+					code.AddABC(OP_GETTABLE, sreg, sreg, sreg+1, sline(ex))
+				}
+			} else if envlocal, _ := envAccess(context); envlocal > -1 {
 				if fits {
 					code.AddABC(OP_GETFIELD, sreg, envlocal, kidx, sline(ex))
 				} else {
@@ -1862,7 +2422,7 @@ func compileExpr(context *funcContext, reg int, expr ast.Expr, ec *expcontext) i
 		case ecUpvalue:
 			code.AddABC(OP_GETUPVAL, sreg, context.Upvalues.RegisterUnique(ex.Value), 0, sline(ex))
 		case ecLocal:
-			b := context.FindLocalVar(ex.Value)
+			b := context.regOfVar(context.FindLocalVar(ex.Value))
 			code.AddABC(OP_MOVE, sreg, b, 0, sline(ex))
 		}
 		return sused
@@ -1931,7 +2491,7 @@ func compileExpr(context *funcContext, reg int, expr ast.Expr, ec *expcontext) i
 			localidx, block := context.FindLocalVarAndBlock(upvalue.Name)
 			if localidx > -1 {
 				childcontext.Proto.Upvalues = append(childcontext.Proto.Upvalues,
-					Upvaldesc{InStack: true, Idx: uint8(localidx), Name: upvalue.Name})
+					Upvaldesc{InStack: true, Idx: uint8(context.regOfVar(localidx)), Name: upvalue.Name})
 				block.RefUpvalue = true
 				// stock markupval sets fs->needclose alongside bl->upval
 				context.NeedsClose = true
@@ -2120,8 +2680,19 @@ func compileFunctionExpr(context *funcContext, funcexpr *ast.FunctionExpr, ec *e
 
 	compileChunk(context, funcexpr.Stmts, false)
 
-	context.Code.AddABC(OP_RETURN0, 0, 0, 0, eline(funcexpr))
-	context.EndScope()
+	// U5a (stock luaK_finish): the implicit final return goes through the
+	// same close rewrite as explicit ones — RETURN0 becomes RETURN with
+	// the k bit when the function needs closing, so the instruction names
+	// the __close dispatch (funcnamefromcode's RETURN arm — traceback
+	// frames "in metamethod 'close'", locals.lua:544)
+	retstmt := &ast.ReturnStmt{}
+	retstmt.SetLine(eline(funcexpr))
+	retstmt.SetLastLine(eline(funcexpr))
+	compileReturnStmt(context, retstmt)
+	// extendToClose: the final RETURN (just emitted) closes this
+	// function's tbc variables — its __close dispatch is the last
+	// instruction that must still see the locals
+	context.EndScope(true)
 	context.finishFunctionGotos()
 	context.Proto.Code = context.Code.List()
 	context.Proto.DbgSourcePositions = context.Code.PosList()
@@ -2658,7 +3229,7 @@ func compileLogicalOpExprAux(context *funcContext, reg int, expr ast.Expr, ec *e
 	isLastOr := thenlabel == lb.e && hasnextcond
 
 	if ident, ok := expr.(*ast.IdentExpr); ok && (isLastAnd || isLastOr) && getIdentRefType(context, context, ident) == ecLocal {
-		b := context.FindLocalVar(ident.Value)
+		b := context.regOfVar(context.FindLocalVar(ident.Value))
 		op := OP_TESTSET
 		if sreg == b {
 			op = OP_TEST
@@ -2754,13 +3325,47 @@ func compileFuncCallExpr(context *funcContext, reg int, expr *ast.FuncCallExpr, 
 // nested function finds it before the chain falls off to ecGlobal.
 func getIdentRefType(context *funcContext, current *funcContext, expr *ast.IdentExpr) expContextType { // {{{
 	if current == nil {
+		// U5a (stock buildvar): the name fell through local/upvalue
+		// resolution everywhere — it is a global ACCESS, subject to the
+		// declaring function's preambular state
+		checkGlobalAccess(context, expr.Value, sline(expr))
 		return ecGlobal
 	}
-	if current.FindLocalVar(expr.Value) > -1 {
-		if current == context {
-			return ecLocal
+	// U5a: one descending walk over this level's blocks — locals and named
+	// global declarations interleave by declaration order (stock's flat
+	// actvar array in searchvar), the newest entry shadowing regardless of
+	// kind: `do global X; X = 20 end` writes the global even with an outer
+	// local X (goto.lua:311), and an enclosing function's `global var1
+	// <const>` locks nested function writes (locals.lua:217 — VGLOBAL
+	// propagates through singlevaraux's recursion)
+	for block := current.Block; block != nil; block = block.Parent {
+		pool := block.LocalVars
+		for i := len(pool.names) - 1; i >= 0; i-- {
+			if isGlobalKind(pool.kinds[i]) {
+				if pool.names[i] == expr.Value { // '*' matches no program name
+					if envIsGlobal(context) {
+						raiseCompileError(context, sline(expr), "_ENV is global when accessing variable '%s'", expr.Value)
+					}
+					return ecGlobal
+				}
+				continue
+			}
+			if pool.names[i] == expr.Value {
+				// U5a (stock searchvar's local arm): an RDKCTC entry
+				// resolves as VCONST at any chain level — never a local,
+				// never an upvalue (singlevaraux returns without
+				// capturing; the value folds from the owning function's
+				// Vardesc)
+				idx := i + pool.offset
+				if current.kindOfVar(idx) == varKindCTC {
+					return ecConst
+				}
+				if current == context {
+					return ecLocal
+				}
+				return ecUpvalue
+			}
 		}
-		return ecUpvalue
 	}
 	if current.Upvalues.Find(expr.Value) > -1 {
 		return ecUpvalue
@@ -2768,9 +3373,128 @@ func getIdentRefType(context *funcContext, current *funcContext, expr *ast.Ident
 	return getIdentRefType(context, current.Parent, expr)
 } // }}}
 
+/*
+globalDeclState ports stock searchvar's preambular walk (lparser.c:414)
+for a name that resolves as a global in the function being compiled:
+walking the active entries innermost-out (descending index), a NAMED
+global declaration that does not match voids the implicit preamble
+(`variable 'x' not declared` from then on) — but a matching named entry
+RESOLVES immediately (the walk returns; voiding collected on the way
+dies with it, stock overwrites u.info with the match's index). A
+collective `global *` entry records whenever no collective was seen yet
+(even after voiding — stock records while u.info < 0) and re-opens the
+preamble for everything below it. U5a fix: stock's u.info accumulates
+across singlevaraux's WHOLE recursion — each level's entries, then its
+upvalue pool (a hit there stops the walk: the name resolved as an
+upvalue), then the enclosing level. An enclosing function's named
+declaration is therefore visible to nested functions (locking writes
+and rescuing the name from not-declared); locals are already excluded —
+resolution never falls through to the global arm while one matches.
+*/
+func globalDeclState(fc *funcContext, name string) (starKind, namedKind int, found, voided bool) {
+	starKind, namedKind = -1, -1
+	starSeen, voided := false, false
+	for fn := fc; fn != nil; fn = fn.Parent {
+		for block := fn.Block; block != nil; block = block.Parent {
+			pool := block.LocalVars
+			for i := len(pool.names) - 1; i >= 0; i-- {
+				kind := pool.kinds[i]
+				if !isGlobalKind(kind) {
+					continue
+				}
+				if pool.names[i] == globalStarName {
+					if !starSeen { // the innermost collective entry wins
+						starSeen = true
+						starKind = kind
+					}
+				} else if pool.names[i] == name {
+					// the match wins outright: entries below it (outer) never
+					// apply (stock returns VGLOBAL here)
+					namedKind = kind
+					return starKind, namedKind, true, false
+				} else if !starSeen && !voided {
+					// a non-matching named declaration voids the implicit
+					// preamble (until a collective entry re-opens it — stock
+					// voids only while u.info == -1)
+					voided = true
+				}
+			}
+		}
+		if fn.Upvalues.Find(name) > -1 {
+			break // resolved as an upvalue at this level (stock searchupvalue)
+		}
+	}
+	// a collective entry anywhere in scope wins over the voiding (stock
+	// overwrites info -2 with the star's index)
+	return starKind, namedKind, false, voided && !starSeen
+}
+
+// envIsGlobal reports whether _ENV itself resolves as a global
+// declaration (stock buildglobal's semerror condition — reachable only
+// through an explicit `global _ENV`, goto.lua:321): per chain level,
+// the innermost _ENV-named entry among locals and global declarations
+// decides, then the level's upvalue pool (singlevaraux's order).
+func envIsGlobal(context *funcContext) bool {
+	for fn := context; fn != nil; fn = fn.Parent {
+		for block := fn.Block; block != nil; block = block.Parent {
+			pool := block.LocalVars
+			for i := len(pool.names) - 1; i >= 0; i-- {
+				if pool.names[i] != envUpvalueName {
+					continue
+				}
+				return isGlobalKind(pool.kinds[i])
+			}
+		}
+		if fn.Upvalues.Find(envUpvalueName) > -1 {
+			return false // resolved as an upvalue at this level
+		}
+	}
+	return false
+}
+
+// checkGlobalAccess raises stock buildvar/buildglobal's semerrors for a
+// name that resolves as a global in the function being compiled: the
+// not-declared error under a voided preamble (reads and writes alike —
+// searchvar's u.info == -2), then the `_ENV is global` error when _ENV
+// itself was declared global.
+func checkGlobalAccess(context *funcContext, name string, line int) {
+	_, _, _, voided := globalDeclState(context, name)
+	if voided {
+		raiseCompileError(context, line, "variable '%s' not declared", name)
+	}
+	if envIsGlobal(context) {
+		raiseCompileError(context, line, "_ENV is global when accessing variable '%s'", name)
+	}
+}
+
+// checkGlobalWrite is checkGlobalAccess plus the read-only check: a
+// matching `global x <const>` entry or an active `global <const> *`
+// makes the assignment a compile error (stock check_readonly's
+// VINDEXUP/ro arm).
+func checkGlobalWrite(context *funcContext, name string, line int) {
+	checkGlobalAccess(context, name, line)
+	starKind, namedKind, found, _ := globalDeclState(context, name)
+	if (found && namedKind == varKindGlobalConst) || (!found && starKind == varKindGlobalConst) {
+		raiseCompileError(context, line, "attempt to assign to const variable '%s'", name)
+	}
+}
+
 // envUpvalueName is the upvalue globals resolve through (Lua 5.2's _ENV
 // scheme, upgrade plan D3).
 const envUpvalueName = "_ENV"
+
+// envConstAccess reports _ENV's folded constant when the function being
+// compiled sees _ENV as an RDKCTC entry (`local _ENV <const> = 11`,
+// attrib.lua:461): register-less, so the keyed-global sites must use the
+// constant itself as the table operand (stock discharges VCONST) — the
+// access then fails at runtime with "attempt to index a number value"
+// instead of silently falling through to the _ENV upvalue.
+func envConstAccess(context *funcContext) (LValue, bool) {
+	if idx := context.FindLocalVar(envUpvalueName); idx > -1 && context.kindOfVar(idx) == varKindCTC {
+		return context.ctcValOfVar(idx), true
+	}
+	return nil, false
+}
 
 // envAccess resolves how the function being compiled sees _ENV: either a
 // local (`local _ENV = t` shadows the upvalue and global accesses compile
@@ -2778,9 +3502,12 @@ const envUpvalueName = "_ENV"
 // first use; for the main chunk Compile pre-registers it at index 0, for
 // any nested function RegisterUnique adds it and the OP_CLOSURE capture
 // descriptors wire the cell from the enclosing scope).
-func envAccess(context *funcContext) (localIdx, upvalIdx int) {
+func envAccess(context *funcContext) (localReg, upvalIdx int) {
 	if idx := context.FindLocalVar(envUpvalueName); idx > -1 {
-		return idx, -1
+		// U5a: the consumers use this as a REGISTER operand (GETFIELD/
+		// SETFIELD B) — regOfVar, never the flat index (a `global *`
+		// preamble shifts flat indices without shifting registers)
+		return context.regOfVar(idx), -1
 	}
 	return -1, context.Upvalues.RegisterUnique(envUpvalueName)
 }
@@ -2912,7 +3639,11 @@ func patchCode(context *funcContext) { // {{{
 		}
 	}
 	maxreg++
-	if maxreg > maxRegisters {
+	// U5a: the window limit is MAX_FSTACK (255), not MAXVARS (200) — stock
+	// separates adjustlocalvars' declared-variable check from luaK_checkstack's
+	// maxstacksize; conflating them rejected legal 200-local chunks as soon as
+	// an expression needed a temp above register 200 (goto.lua:411).
+	if maxreg > maxFuncRegisters {
 		raiseCompileError(context, context.Proto.LineDefined, "register overflow(too many local variables)")
 	}
 	context.Proto.NumUsedRegisters = uint8(maxreg)
