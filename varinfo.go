@@ -417,7 +417,10 @@ func funcNameFromCode(p *FunctionProto, pc int) (kind, name string) {
 // raiseCallError — stock luaG_callerror: name the callee from the
 // calling code (funcnamefromcall) when the caller is a Lua frame; a
 // caller that yields no name falls back to varinfo of the callee value
-// (stock's instack scan of the frame's registers).
+// (stock's instack scan of the frame's registers). The raise is
+// luaG_runerror's position rule (U5c): the CURRENT frame — a C/G caller
+// (pcall, xpcall) yields NO position, so pcall(42) answers a bare
+// "attempt to call a number value".
 func (ls *LState) raiseCallError(fn LValue) {
 	extra := ""
 	if cf := ls.currentFrame; cf != nil && cf.Fn != nil && !cf.Fn.IsG && cf.Fn.Proto != nil {
@@ -432,7 +435,7 @@ func (ls *LState) raiseCallError(fn LValue) {
 		}
 		extra = formatVarInfo(kind, name)
 	}
-	ls.RaiseError("attempt to call a %s value%s", ls.objTypeName(fn), extra)
+	ls.raiseErrorAt(0, "attempt to call a %s value%s", ls.objTypeName(fn), extra)
 }
 
 /* }}} */

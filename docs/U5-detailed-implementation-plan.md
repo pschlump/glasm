@@ -564,3 +564,50 @@ history, this file's status log); memory; delete `testdiff/u5probe_test.go`.
   restored() pins the same-table restore), and the passing-boundary
   capacity texts ("registry overflow" vs "stack overflow") are excluded
   as row 81's e2 clause.
+- **U5c (2026-10-05)** — the small-5.5-items chunk landed (ledger row 83). **`__call`
+  chain** (`resolveCall`, stock luaD_precall's retry + tryfuncTM): per-hop metamethod
+  re-fetch with the link inserted as the new first argument (args shift up — a 5-link chain
+  delivers [t5..t1, args...]), MAX_CCMT=15 with the 16th raising `'__call' chain too long'`
+  AFTER its insert, counter reset per call site, the type error naming the last value's
+  TYPE with the original callee's varinfo, and the chain count riding the frame as
+  `callFrame.CCmt` — which IS `getinfo 't' extraargs` (stock's ci MAX_CCMT bits, not the
+  vararg count). **pcall/xpcall to stock callee semantics**: luaB_pcall is checkany+plain
+  call (no pre-check — the chain runs THROUGH pcall; `pcall(v16)` answers the bare cap
+  text), luaB_xpcall checks only arg 2; both ride the **luaG_runerror position rule**
+  (`raiseErrorAt(0, ...)`: the raise names the current frame — a C/G caller yields NO
+  position, so `pcall(42)` is a bare `attempt to call a number value`; `raiseError(0,...)`
+  is wrong, its level>0 gate never prefixes). **Light userdata**
+  (`LUserData.Light`): typename "userdata", `debug.upvalueid` produces one, full-userdata
+  arg checks say `got light userdata`, base setmetatable refuses while debug.setmetatable
+  uses the basic-type table. **Uservalue slots are a capacity** (`UserValues int8`,
+  stock newuserdatauv's nuvalue): the io files carry ZERO slots — get answers a single
+  nil, in-range answers value+true, writes store the value. **collectgarbage("param")**
+  (D10, protocol-exact/storage-no-op): six params as luaO_codeparam bytes,
+  applyparam(code,100) old-value return, optional set, checkoption/optinteger texts;
+  defaults pinned to the wasm32 readbacks (70→68, stepsize 5600). The corpus caught a real
+  port bug here: stock casts the set value through `(int)` inside lua_gc BEFORE the >=0
+  guard and the coding — `pause = 2^53` truncates to 0 and stores code 0 (readback 0), 2^31
+  wraps negative and reads get-only; the Go port had checked the 64-bit value (saturating
+  to 0xFF/396800). **debug.getinfo** (stock db_getinfo): default "flnSrtu",
+  option-filtered fields in stock's push order, name→nil when empty, thread-first form,
+  both argerrors ('>' first; invalid option — options at arg+2), 'L' as
+  collectvalidlines' table or nil for C (a nil *LTable must not land as a typed-nil
+  LValue — it printed `<table>`; corpus-caught). **Cross-thread levels over a SUSPENDED
+  thread**: stock's continuation model keeps the yielded C function's CallInfo, so level 0
+  is that C frame and the thread's frames start at 1; the fork's Go stack unwinds the
+  yield's G frame (running/normal-at-resume threads keep a REAL boundary frame), so
+  GetStack shifts suspended-thread queries by one and answers level 0 as a synthetic G
+  frame; debug.traceback(co) rides the same walk. **Row 78e closure**: a failing message
+  handler (any raise or a panic) collapses to exactly `error in error handling` — the
+  handler's object discarded (state_test.go's two legacy pins re-pinned);
+  cstack.lua:29's handler-overflow dialect stays row 78e's open slice. **Closeout**:
+  calls.lua (:195-240, :168) and errors.lua (:258-268) U5c items green — **row 25
+  (string.dump) is now the sole blocker for both** (:361/:307); goto.lua fully green and
+  un-skipped. Corpus: `_u5/call01, udata01, gcparam01, getinfo01` (positions stripped per
+  the clua55 prelude rule). Gates: TestU5Gate 19/19; TestU5ProbeOfficialSuite 20/20
+  (100%); TestPCall/TestGlua re-pinned; TestWasmFullMatrix/ErrorSuite/GluaFull,
+  TestCLuaConformance, U1/U2/U2f gates all green (interp-side work; the wasm legs run the
+  frozen U2e backend); wazero production legs (interp,wazero on _wasm-tests and
+  _wasm-err-tests) green. Deviation from §3: the chunk's items landed via resolveCall in
+  _state.go (not a metaCall loop edit — same file, same seam) and the errerr fix rode in
+  from U5a's PCall structure.

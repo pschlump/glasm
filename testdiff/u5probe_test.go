@@ -24,10 +24,9 @@ var u5ProbeSkips = func() map[string]string {
 		"gengc.lua":     "row 79 (U5c): generational-GC surface — gengc.lua:122 needs a minor collection to clear a __mode=\"kv\" table's entries",
 		"db.lua":        "debug.sethook/gethook family unimplemented (db.lua:16's gethook) — sethook precedent (row 77's errors.lua skip)",
 		"locals.lua":    "db.lua precedent: debug.sethook at locals.lua:842 (the to-be-closed-in-coroutines block) — green through :841, including the U5b vararg surface (the old :315 named-vararg blocker is fixed)",
-		"cstack.lua":    "row 78e: xpcall(loop, loop) at cstack.lua:29 — the handler itself overflows; the fork's frame reserve re-raises 'stack overflow' where stock says 'error in error handling'",
-		"calls.lua":     "row 78e: xpcall(loop, loop) at calls.lua:168 — the handler itself overflows; same dialect as cstack.lua:29 (fork re-raises 'stack overflow', stock says 'error in error handling')",
-		"goto.lua":      "row 77 precedent (U5c): debug.upvalueid at goto.lua:197 needs light userdata — same family as the errors.lua upvalueid skip",
-		"errors.lua":    "row 63 successor (U5c): debug.upvalueid at errors.lua:262 needs light userdata — the vararg half (:163, named vararg) is fixed at U5b",
+		"cstack.lua":    "row 78e (U5c closeout): xpcall(loop, loop) at cstack.lua:29 — the handler itself overflows and the fork's frame-reserve dialect still re-raises 'C stack overflow' where stock says 'error in error handling'; the row-78e fix covers the failing-handler raise/panic shapes (calls.lua:168 is green)",
+		"calls.lua":     "row 25 (U5c closeout): the __call-chain/errerr battery (:195-240, :168) is green; the remaining blocker is string.dump at :361 (binary chunks — the fork rejects it)",
+		"errors.lua":    "row 25 (U5c closeout): light userdata (:258-268) is green; the remaining blocker is string.dump at :307 (binary chunks — the fork rejects it)",
 		"coroutine.lua": "row 22 (U5d): yield inside a Go-function boundary — coroutine.create(pcall) + foo yields (coroutine.lua:277): resume returns the yield but the status reads 'dead' instead of 'suspended' (same seam as nextvar.lua:937's __pairs yield)",
 	}
 	for k, v := range clua55Skips {

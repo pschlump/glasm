@@ -221,6 +221,13 @@ type Global struct {
 	// fatally (official coroutine.lua's "infinite recursion" block).
 	resumeDepth int
 
+	// gcparams are the six collectgarbage("param", ...) tunables' codes
+	// (U5c, stock g->gcparams + luaO_codeparam's floating-point byte):
+	// minormul, majorminor, minormajor, pause, stepmul, stepsize.
+	// Protocol-exact storage, no-op tuning — the fork has no incremental
+	// GC to drive (upgrade plan D10).
+	gcparams [6]uint8
+
 	builtinMts map[int]LValue
 	tempFiles  []*os.File
 	gccount    int32
@@ -275,6 +282,23 @@ type LUserData struct {
 	Value     interface{}
 	Env       *LTable
 	Metatable LValue
+	// UserValue is the debug.getuservalue slot (U5c, stock uvalues[0]):
+	// any Lua value, nil by default — distinct from Env, the legacy 5.1
+	// environment table the fork's GetFEnv reads. UserValues is the slot
+	// capacity (stock newuserdatauv's nuvalue): stock's Lua-visible
+	// userdata — the io files — are created with ZERO slots, so
+	// debug.get/setuservalue answer nil for them (db.lua:434 pins it);
+	// NewUserData leaves 0 for the same posture.
+	UserValue  LValue
+	UserValues int8
+	// Light marks a light userdata (U5c, stock LUA_VLIGHTUSERDATA): a
+	// bare pointer in Lua's clothing. It still types as "userdata"
+	// (5.5's typename table maps both tags to it), but full-userdata
+	// argument checks reject it naming "light userdata" (luaL_typeerror
+	// special case), base setmetatable refuses it, and its metatable is
+	// the per-basic-type table (debug.setmetatable territory), never a
+	// per-object one. debug.upvalueid is the only creator.
+	Light bool
 }
 
 func (ud *LUserData) String() string   { return fmt.Sprintf("userdata: %p", ud) }

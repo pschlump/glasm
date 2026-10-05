@@ -86,4 +86,7 @@ end)
 assert(not ok and string.find(msg, "level out of range"))
 
 assert(debug.getinfo(100) == nil)
-assert(debug.getinfo(1, "a") == nil)
+-- U5c (stock db_getinfo): an option outside "flnSrtuL" raises the
+-- argerror instead of answering nil
+local ok, msg = pcall(debug.getinfo, 1, "a")
+assert(not ok and string.find(msg, "invalid option"))

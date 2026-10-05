@@ -3,6 +3,7 @@ package lua
 import (
 	"fmt"
 	"io"
+	"math/bits"
 	"os"
 	"runtime"
 	"strings"
@@ -73,6 +74,76 @@ func baseAssert(L *LState) int {
 	return 0
 }
 
+// gcParam indices (stock lgc.h's LUA_GCP* order).
+const (
+	gcpMinormul = iota
+	gcpMajorminor
+	gcpMinormajor
+	gcpPause
+	gcpStepmul
+	gcpStepsize
+)
+
+// defaultGCParams — stock lstate.c's setgcparam defaults, coded. The
+// wasm32 oracle's readbacks: minormajor's 70 quantizes to 68, stepsize
+// is 200 * sizeof(Table) = 5600 on wasm32 (the 64-bit build's 8000
+// differs; the interp pins the oracle's).
+func defaultGCParams() [6]uint8 {
+	return [6]uint8{
+		gcCodeParam(20),   // minormul
+		gcCodeParam(50),   // majorminor
+		gcCodeParam(70),   // minormajor
+		gcCodeParam(250),  // pause
+		gcCodeParam(200),  // stepmul
+		gcCodeParam(5600), // stepsize
+	}
+}
+
+// maxLMem is stock MAX_LMEM over the interp's 64-bit l_mem.
+const maxLMem = int64(1)<<62 - 1
+
+// gcCodeParam is luaO_codeparam: a percentage as one floating-point
+// byte (eeeexxxx — excess-7 exponent, 5-bit normalized mantissa,
+// subnormal below 0x10, 0xFF saturates).
+func gcCodeParam(p uint) uint8 {
+	if p >= (0x1F<<(0xF-7-1))*100 {
+		return 0xFF
+	}
+	p = uint((uint32(p)*128 + 99) / 100)
+	if p < 0x10 {
+		return uint8(p)
+	}
+	log := uint(bits.Len32(uint32(p+1))) - 5
+	return uint8(((p >> log) - 0x10) | ((log + 1) << 4))
+}
+
+// gcApplyParam is luaO_applyparam: p/100 * x with stock's overflow
+// rules (multiply-then-shift or shift-then-multiply by which avoids the
+// 2^62-1 saturation first).
+func gcApplyParam(p uint8, x int64) int64 {
+	m := int64(p & 0xF)
+	e := int(p >> 4)
+	if e > 0 {
+		e--
+		m += 0x10
+	}
+	e -= 7
+	if e >= 0 {
+		if x < (maxLMem/0x1F)>>e {
+			return (x * m) << e
+		}
+		return maxLMem
+	}
+	e = -e
+	if x < maxLMem/0x1F {
+		return (x * m) >> e
+	}
+	if (x >> e) < maxLMem/0x1F {
+		return (x >> e) * m
+	}
+	return maxLMem
+}
+
 // baseCollectGarbage ports stock luaB_collectgarbage's option surface:
 // "count" reports the synthetic accounting (gcMemBytes), the mode knobs
 // are accepted as no-ops with stock result shapes, and an unknown option
@@ -103,6 +174,54 @@ func baseCollectGarbage(L *LState) int {
 		// the host runtime's
 		L.Push(LString(gcMode))
 		gcMode = opt
+	case "param":
+		// U5c (stock LUA_GCPARAM, upgrade plan D10): the six tunables'
+		// protocol — answer the OLD value as a percent integer, set a
+		// non-negative argument. Storage is protocol-exact but a no-op
+		// (no incremental GC to drive); luaL_checkoption's texts verbatim.
+		name := L.CheckString(2)
+		var idx int
+		switch name {
+		case "minormul":
+			idx = gcpMinormul
+		case "majorminor":
+			idx = gcpMajorminor
+		case "minormajor":
+			idx = gcpMinormajor
+		case "pause":
+			idx = gcpPause
+		case "stepmul":
+			idx = gcpStepmul
+		case "stepsize":
+			idx = gcpStepsize
+		default:
+			L.ArgError(2, "invalid option '"+name+"'")
+		}
+		// luaL_optinteger(L,3,-1), then lua_gc's (int) cast: the set
+		// value truncates to 32 bits BEFORE the >=0 guard and the coding
+		// — collectgarbage("param","pause",2^53) stores codeparam(0)=0
+		// (not the 0xFF saturation), and 2^31 wraps negative and reads
+		// get-only (probed; gcparam01.lua)
+		value := int32(-1)
+		if lv := L.Get(3); lv != LNil {
+			switch n := lv.(type) {
+			case LInteger:
+				value = int32(n)
+			case LNumber:
+				if iv, ok := floatToIntExact(float64(n)); ok {
+					value = int32(iv)
+				} else {
+					L.ArgError(3, "number has no integer representation")
+				}
+			default:
+				L.TypeError(3, LTNumber)
+			}
+		}
+		old := gcApplyParam(L.G.gcparams[idx], 100)
+		if value >= 0 {
+			L.G.gcparams[idx] = gcCodeParam(uint(uint32(value)))
+		}
+		L.Push(LInteger(old))
 	default:
 		L.RaiseError("invalid option '%s'", opt)
 	}
@@ -367,14 +486,13 @@ func basePairs(L *LState) int {
 	return 4
 }
 
+// basePCall is stock luaB_pcall (U5c): no callee pre-check — a non-callable
+// first argument (through the '__call' chain, whose cap and naming the VM
+// owns) surfaces as the pcall's false + error exactly as a mid-call raise
+// would; a C-framed raise carries no position, so pcall(42) answers a bare
+// "attempt to call a number value".
 func basePCall(L *LState) int {
 	L.CheckAny(1)
-	v := L.Get(1)
-	if v.Type() != LTFunction && L.GetMetaField(v, "__call").Type() != LTFunction {
-		L.Push(LFalse)
-		L.Push(LString("attempt to call a " + v.Type().String() + " value"))
-		return 2
-	}
 	nargs := L.GetTop() - 1
 	if err := L.PCall(nargs, MultRet, nil); err != nil {
 		L.Push(LFalse)
@@ -483,18 +601,18 @@ func baseSelect(L *LState) int {
 }
 
 func baseSetMetatable(L *LState) int {
-	L.CheckTypes(2, LTNil, LTTable)
-	obj := L.Get(1)
-	if obj == LNil {
-		L.RaiseError("cannot set metatable to a nil object.")
-	}
-	mt := L.Get(2)
-	if m := L.metatable(obj, true); m != LNil {
-		if tb, ok := m.(*LTable); ok && tb.RawGetString("__metatable") != LNil {
+	// U5c: stock 5.5.1 luaB_setmetatable is table-only (debug.setmetatable
+	// covers the other types) — 5.1's is table-only too, so the clua gate
+	// is unaffected. Light userdata answers "table expected, got light
+	// userdata" through CheckType's distinct-tag rule.
+	L.CheckType(1, LTTable)
+	L.CheckAny(2)
+	if mt := L.metatable(L.Get(1), true); mt != LNil {
+		if tb, ok := mt.(*LTable); ok && tb.RawGetString("__metatable") != LNil {
 			L.RaiseError("cannot change a protected metatable")
 		}
 	}
-	L.SetMetatable(obj, mt)
+	L.SetMetatable(L.Get(1), L.Get(2))
 	L.SetTop(1)
 	return 1
 }
@@ -642,15 +760,17 @@ func baseWarn(L *LState) int {
 }
 
 // baseXPCall implements 5.2 xpcall(f, msgh [, ...]): the extra arguments
-// are passed through to f (5.1 dropped them).
+// are passed through to f (5.1 dropped them). U5c: stock checks only the
+// handler (luaL_checktype(2)) — f runs through the '__call' chain like
+// any call.
 func baseXPCall(L *LState) int {
-	fn := L.CheckFunction(1)
+	L.CheckAny(1)
 	errfunc := L.CheckFunction(2)
 	nargs := L.GetTop() - 2
 
 	// call a copy of fn with copies of the args (the originals, plus the
 	// handler between them, stay below untouched)
-	L.Push(fn)
+	L.Push(L.Get(1))
 	for i := 0; i < nargs; i++ {
 		L.Push(L.Get(3 + i))
 	}

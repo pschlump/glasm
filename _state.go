@@ -122,12 +122,26 @@ type Options struct {
 type Debug struct {
 	frame           *callFrame
 	Name            string
+	NameWhat        string
 	What            string
 	Source          string
 	CurrentLine     int
 	NUpvalues       int
 	LineDefined     int
 	LastLineDefined int
+	// U5c (stock lua_Debug): 'u' adds nparams/isvararg, 't' adds
+	// istailcall/extraargs — extraargs is the __call-chain count (the
+	// ci's MAX_CCMT bits, ldebug.c:359), NOT the vararg count: a plain
+	// vararg call answers 0, a chain-fed call answers its hop count.
+	NParams    int
+	IsVarArg   bool
+	IsTailCall bool
+	ExtraArgs  int
+	// 'r' ftransfer/ntransfer (no hooks in the fork: always 0) and 'L'
+	// activelines (nil for C functions, collectvalidlines' table).
+	FTransfer   int
+	NTransfer   int
+	ActiveLines *LTable
 }
 
 /* }}} */
@@ -145,6 +159,10 @@ type callFrame struct {
 	NArgs      int
 	NRet       int
 	TailCall   int
+	// CCmt is the __call-chain replacement count that reached this
+	// frame (stock's ci callstatus MAX_CCMT bits): getinfo 't' reports
+	// it as extraargs. Reset per call site (stock resets it per precall).
+	CCmt int
 }
 
 type callFrameStack interface {
@@ -558,6 +576,7 @@ func newGlobal() *Global {
 		MainThread: nil,
 		Registry:   newLTable(0, 32),
 		Global:     newLTable(0, 64),
+		gcparams:   defaultGCParams(),
 		builtinMts: make(map[int]LValue),
 		tempFiles:  make([]*os.File, 0, 10),
 	}
@@ -1066,7 +1085,16 @@ func (ls *LState) metatable(lvalue LValue, rawget bool) LValue {
 	case *LTable:
 		metatable = obj.Metatable
 	case *LUserData:
-		metatable = obj.Metatable
+		if obj.Light {
+			// U5c: light userdata has no per-object metatable — the
+			// basic-type table (debug.setmetatable territory; base
+			// setmetatable refuses light userdata outright)
+			if table, ok := ls.G.builtinMts[basicTypeIndex(obj)]; ok {
+				metatable = table
+			}
+		} else {
+			metatable = obj.Metatable
+		}
 	default:
 		if table, ok := ls.G.builtinMts[basicTypeIndex(obj)]; ok {
 			metatable = table
@@ -1111,14 +1139,48 @@ func (ls *LState) metaOp2(value1, value2 LValue, event string) LValue {
 	return LNil
 }
 
-func (ls *LState) metaCall(lvalue LValue) (*LFunction, bool) {
-	if fn, ok := lvalue.(*LFunction); ok {
-		return fn, false
+// maxCallChain is stock MAX_CCMT (lstate.h): the __call replacement
+// budget per call — 15 replacements allowed, the 16th raises.
+const maxCallChain = 15
+
+// resolveCall walks a call site's callee through the '__call' chain
+// (stock luaD_precall's retry loop + tryfuncTM, ldo.c:510): each hop
+// fetches the current value's __call field, inserts that value as the
+// new first argument at base (the callee cell's successor, shifting the
+// previous args up), and retries on the metamethod value itself — which
+// may be another non-function with its own __call. The 16th hop raises
+// "'__call' chain too long" AFTER its insert (tryfuncTM's
+// shift-then-check order). Returns the resolved function (nil when the
+// final value has no __call — callee names that VALUE for the caller's
+// type error: a __call=5 chain reports "number", probed), and the chain
+// count for the frame (getinfo 't' extraargs).
+func (ls *LState) resolveCall(callee LValue, base int) (*LFunction, LValue, int) {
+	if fn, ok := callee.(*LFunction); ok {
+		return fn, callee, 0
 	}
-	if fn, ok := ls.metaOp1(lvalue, "__call").(*LFunction); ok {
-		return fn, true
+	for ccmt := 0; ; ccmt++ {
+		tm := ls.metaOp1(callee, "__call")
+		if tm == LNil {
+			return nil, callee, ccmt
+		}
+		// tryfuncTM's insert (registry.Insert's shift): the link becomes
+		// the new first argument, the previous args move up
+		if top := ls.reg.Top(); top > base {
+			for ; top > base; top-- {
+				ls.reg.Set(top, ls.reg.Get(top-1))
+			}
+		}
+		ls.reg.Set(base, callee)
+		if ccmt == maxCallChain {
+			// luaG_runerror's position rule: the current frame — a C
+			// caller (pcall(x)) answers bare, a Lua caller carries its line
+			ls.raiseErrorAt(0, "'__call' chain too long")
+		}
+		if fn, ok := tm.(*LFunction); ok {
+			return fn, callee, ccmt + 1
+		}
+		callee = tm
 	}
-	return nil, false
 }
 
 func (ls *LState) initCallFrame(cf *callFrame) { // +inline-start
@@ -1183,18 +1245,19 @@ func (ls *LState) callR(nargs, nret, rbase int) {
 		rbase = base
 	}
 	lv := ls.reg.Get(base)
-	fn, meta := ls.metaCall(lv)
+	fn, callee, ccmt := ls.resolveCall(lv, base+1)
 	ls.pushCallFrame(callFrame{
 		Fn:         fn,
 		Pc:         0,
 		Base:       base,
 		LocalBase:  base + 1,
 		ReturnBase: rbase,
-		NArgs:      nargs,
+		NArgs:      nargs + ccmt,
 		NRet:       nret,
 		Parent:     ls.currentFrame,
 		TailCall:   0,
-	}, lv, meta)
+		CCmt:       ccmt,
+	}, callee, false)
 	if ls.G.MainThread == nil {
 		ls.G.MainThread = ls
 		ls.G.CurrentThread = ls
@@ -1752,56 +1815,127 @@ func (ls *LState) Error(lv LValue, level int) {
 	}
 }
 
+// GetInfo is lua_getinfo over the fork's Debug struct (U5c: stock's
+// option-filtered fields). A leading '>' queries the given function
+// instead of dbg.frame's — stock sets ci=NULL there, so the
+// frame-relative options answer their no-frame defaults ('l' -1, 'n'
+// empty, 't' false/0) while 'S'/'u' still read the function. Returns
+// the 'f' payload (nil without 'f'); the activelines table lands in
+// Debug.ActiveLines ('L'). An option outside "flnSrtuL" returns the
+// invalid-option error the debug library converts to its argerror
+// (stock lua_getinfo answers 0 and db_getinfo raises).
 func (ls *LState) GetInfo(what string, dbg *Debug, fn LValue) (LValue, error) {
-	if !strings.HasPrefix(what, ">") {
-		fn = dbg.frame.Fn
-	} else {
+	isfunc := strings.HasPrefix(what, ">")
+	if isfunc {
 		what = what[1:]
 	}
-	f, ok := fn.(*LFunction)
-	if !ok {
-		return LNil, newApiErrorS(ApiErrorRun, "can not get debug info(an object in not a function)")
+	var f *LFunction
+	if isfunc {
+		fok, ok := fn.(*LFunction)
+		if !ok {
+			return LNil, newApiErrorS(ApiErrorRun, "can not get debug info(an object in not a function)")
+		}
+		f = fok
+	} else {
+		f = dbg.frame.Fn
+	}
+	frame := dbg.frame
+	if isfunc {
+		frame = nil
 	}
 
 	retfn := false
+	retlines := false
 	for _, c := range what {
 		switch c {
 		case 'f':
 			retfn = true
 		case 'S':
-			if dbg.frame != nil && dbg.frame.Parent == nil {
-				dbg.What = "main"
-			} else if f.IsG {
-				// U4d stock pin: builtin (Go) functions are C functions —
-				// getinfo().what is "C" (coroutine.lua:249 checks the
-				// __close caller's level; db.lua:38 pins it generally)
+			// stock funcinfo — mode-independent; 5.5 dropped the "tail"
+			// what (a tail-called frame reports "Lua"/"main")
+			if f.IsG {
 				dbg.What = "C"
-			} else if dbg.frame != nil && dbg.frame.TailCall > 0 {
-				dbg.What = "tail"
+				dbg.Source = "=[C]"
+				dbg.LineDefined = -1
+				dbg.LastLineDefined = -1
 			} else {
-				dbg.What = "Lua"
-			}
-			if !f.IsG {
 				dbg.Source = f.Proto.SourceName
 				dbg.LineDefined = f.Proto.LineDefined
 				dbg.LastLineDefined = f.Proto.LastLineDefined
+				if dbg.LineDefined == 0 {
+					dbg.What = "main"
+				} else {
+					dbg.What = "Lua"
+				}
 			}
 		case 'l':
-			if !f.IsG && dbg.frame != nil {
-				if dbg.frame.Pc > 0 {
-					dbg.CurrentLine = f.Proto.DbgSourcePositions[dbg.frame.Pc-1]
-				}
+			if frame != nil && !frame.Fn.IsG && frame.Pc > 0 {
+				dbg.CurrentLine = f.Proto.DbgSourcePositions[frame.Pc-1]
 			} else {
 				dbg.CurrentLine = -1
 			}
 		case 'u':
 			dbg.NUpvalues = len(f.Upvalues)
-		case 'n':
-			if dbg.frame != nil {
-				dbg.Name = ls.rawFrameFuncName(dbg.frame)
+			if f.IsG {
+				dbg.IsVarArg = true
+				dbg.NParams = 0
+			} else {
+				dbg.IsVarArg = f.Proto.IsVarArg != 0
+				dbg.NParams = int(f.Proto.NumParameters)
 			}
+		case 't':
+			if frame != nil {
+				dbg.IsTailCall = frame.TailCall > 0
+				dbg.ExtraArgs = frame.CCmt
+			} else {
+				dbg.IsTailCall = false
+				dbg.ExtraArgs = 0
+			}
+		case 'n':
+			// stock getfuncname: a tail-called frame has no name; the
+			// name comes from the CALLER — funcnamefromcall over the
+			// caller's current instruction (funcnamefromcode: the call
+			// site's getobjname kind, a metamethod event, or the for
+			// iterator); a C caller yields nothing
+			dbg.NameWhat = ""
+			dbg.Name = ""
+			if frame != nil && frame.TailCall == 0 {
+				if parent := frame.Parent; parent != nil && parent.Fn != nil && !parent.Fn.IsG && parent.Fn.Proto != nil {
+					if kind, name := funcNameFromCode(parent.Fn.Proto, parent.Pc-1); kind != "" {
+						dbg.NameWhat = kind
+						dbg.Name = name
+					}
+				}
+			}
+		case 'r':
+			// ftransfer/ntransfer are hook-transfer bookkeeping; with no
+			// hooks in the fork they are always 0
+			dbg.FTransfer = 0
+			dbg.NTransfer = 0
+		case 'L':
+			retlines = true
 		default:
-			return LNil, newApiErrorS(ApiErrorRun, "invalid what: "+string(c))
+			return LNil, newApiErrorS(ApiErrorRun, "invalid option")
+		}
+	}
+
+	if retlines {
+		// stock collectvalidlines: nil for C functions; else
+		// {line=true} over the lineinfo — a vararg proto skips
+		// instruction 0 (its VARARGPREP, which carries the function's
+		// definition line)
+		if f.IsG {
+			dbg.ActiveLines = nil
+		} else {
+			p := f.Proto
+			dbg.ActiveLines = ls.NewTable()
+			i := 0
+			if p.IsVarArg != 0 {
+				i = 1
+			}
+			for ; i < len(p.Code); i++ {
+				dbg.ActiveLines.RawSetInt(p.DbgSourcePositions[i], LTrue)
+			}
 		}
 	}
 
@@ -1812,7 +1946,24 @@ func (ls *LState) GetInfo(what string, dbg *Debug, fn LValue) (LValue, error) {
 
 }
 
+// GetStack is lua_getstack. Cross-thread queries over a SUSPENDED
+// thread (U5c) run over stock's continuation model: 5.5 keeps the
+// yielded C function's CallInfo alive while the thread is suspended,
+// so level 0 is that C frame and the thread's own frames start at
+// level 1. The fork's Go stack unwinds the yield's G frame instead —
+// the running and normal-at-resume threads keep their boundary frame
+// as a REAL frame, only the suspended ones need the shift. Level 0
+// hands back a synthetic G frame (C-shaped for 'S'/'u'/'l'/'t'; 'f'
+// on it is not stock's yield function — unpinned corner).
 func (ls *LState) GetStack(level int) (*Debug, bool) {
+	if level >= 0 && ls.G != nil && ls.G.CurrentThread != nil &&
+		ls.G.CurrentThread != ls && ls.G.CurrentThread.Parent != ls &&
+		ls.stack != nil && !ls.stack.IsEmpty() {
+		if level == 0 {
+			return &Debug{frame: &callFrame{Fn: newLFunctionG(nil, nil, 0), Parent: ls.currentFrame}}, true
+		}
+		level--
+	}
 	frame := ls.currentFrame
 	for ; level > 0 && frame != nil; frame = frame.Parent {
 		level--
@@ -2135,19 +2286,16 @@ func (ls *LState) PCall(nargs, nret int, errfunc *LFunction) (err error) {
 						if _, isunwind := rcv.(*closeSelfUnwind); isunwind {
 							panic(rcv) // base-level unwind: never caught here
 						}
-						// the errfunc itself panicked — its frames die too
+						// the errfunc itself panicked — its frames die too.
+						// U5c (stock luaD_errerr, row 83): a FAILING message
+						// handler — raising any object or dying of stack
+						// exhaustion — collapses to exactly "error in error
+						// handling" as the final error object; the handler's own
+						// object is discarded (probed: string/table raises and
+						// the handler-overflow shapes; calls.lua:168,
+						// cstack.lua:24-31)
 						ls.closeUpvalues(base)
-						if _, ok := rcv.(*ApiError); !ok {
-							err = newApiErrorS(ApiErrorPanic, fmt.Sprint(rcv))
-							if ls.Options.IncludeGoStackTrace {
-								buf := make([]byte, 4096)
-								runtime.Stack(buf, false)
-								err.(*ApiError).StackTrace = strings.Trim(string(buf), "\000") + ls.stackTrace(0)
-							}
-						} else {
-							err = rcv.(*ApiError)
-							err.(*ApiError).StackTrace = ls.stackTrace(0)
-						}
+						err = newApiErrorS(ApiErrorError, "error in error handling")
 						// U5a: restore the CALL STACK before the error-path
 						// closes (stock luaD_pcall's L->ci = old_ci precedes
 						// luaD_closeprotected) — the dying frames must be
@@ -2236,7 +2384,13 @@ func (ls *LState) SetMetatable(obj LValue, mt LValue) {
 	case *LTable:
 		v.Metatable = mt
 	case *LUserData:
-		v.Metatable = mt
+		if v.Light {
+			// U5c: light userdata shares the basic-type table (stock
+			// lua_setmetatable's G->mt arm)
+			ls.G.builtinMts[basicTypeIndex(v)] = mt
+		} else {
+			v.Metatable = mt
+		}
 	default:
 		ls.G.builtinMts[basicTypeIndex(obj)] = mt
 	}

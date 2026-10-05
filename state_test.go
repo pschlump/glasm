@@ -296,14 +296,16 @@ func TestPCall(t *testing.T) {
 		L.RaiseError("error!")
 		return 1
 	}))
-	errorIfFalse(t, strings.Contains(err.Error(), "error!"), "")
+	// U5c (stock luaD_errerr, row 78e): a FAILING message handler — any
+	// raise or panic — collapses to exactly "error in error handling"
+	errorIfFalse(t, strings.Contains(err.Error(), "error in error handling"), "")
 
 	L.Push(L.GetGlobal("f1"))
 	err = L.PCall(0, 0, L.NewFunction(func(L *LState) int {
 		panic("panicc!")
 		return 1
 	}))
-	errorIfFalse(t, strings.Contains(err.Error(), "panicc!"), "")
+	errorIfFalse(t, strings.Contains(err.Error(), "error in error handling"), "")
 
 	// Issue #452, expected to be revert back to previous call stack after any error.
 	currentFrame, currentTop, currentSp := L.currentFrame, L.GetTop(), L.stack.Sp()

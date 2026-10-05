@@ -84,6 +84,21 @@ type Upvalue struct {
 	index  int
 	value  LValue
 	closed bool
+	// lightID is the stable light userdata debug.upvalueid(f, n) hands
+	// out for this cell (U5c, stock returns the Upvalue pointer itself;
+	// the fork's pointer doubles as the Go map key, so a dedicated
+	// object preserves identity). Lazily created, never GC-visible.
+	lightID *LUserData
+}
+
+// UpvalueID returns the identity object for this upvalue cell — the
+// same cell answers the same light userdata, different cells different
+// ones (stock db_upvalueid's semantics over the Upvalue pointer).
+func (uv *Upvalue) UpvalueID() *LUserData {
+	if uv.lightID == nil {
+		uv.lightID = &LUserData{Light: true}
+	}
+	return uv.lightID
 }
 
 func (uv *Upvalue) Value() LValue {

@@ -116,6 +116,12 @@ func (ls *LState) CheckThread(n int) *LState {
 
 func (ls *LState) CheckType(n int, typ LValueType) {
 	v := ls.Get(n)
+	// U5c: light userdata is a distinct tag (LUA_TLIGHTUSERDATA) — a
+	// full-userdata check rejects it as "light userdata" (luaL_checktype
+	// over lua_type)
+	if ud, ok := v.(*LUserData); ok && typ == LTUserData && ud.Light {
+		ls.TypeError(n, typ)
+	}
 	if v.Type() != typ {
 		ls.TypeError(n, typ)
 	}
@@ -380,9 +386,14 @@ func (ls *LState) typeErrorStr(n int, tname string) {
 // objTypeName — stock luaT_objtypename: the value's type name as error
 // messages render it, which a string __name metafield overrides (io's
 // "FILE*", a test's "My Type"); type() and the base names are unchanged.
+// Light userdata is luaL_typeerror's special message name (U5c, after
+// the __name check like stock) — type() still says "userdata".
 func (ls *LState) objTypeName(v LValue) string {
 	if name, ok := ls.GetMetaField(v, "__name").(LString); ok {
 		return string(name)
+	}
+	if ud, ok := v.(*LUserData); ok && ud.Light {
+		return "light userdata"
 	}
 	return v.Type().String()
 }

@@ -1493,20 +1493,18 @@ func init() {
 			}
 			lv := reg.Get(RA)
 			nret := C - 1
-			var callable *LFunction
-			var meta bool
-			if fn, ok := lv.(*LFunction); ok {
-				callable = fn
-				meta = false
-			} else {
-				callable, meta = L.metaCall(lv)
-			}
+			// U5c: the full __call chain (row 83) — resolveCall inserts
+			// each link as an extra first argument, so the frame takes
+			// the args post-chain and no meta insert
+			callable, callee, ccmt := L.resolveCall(lv, RA+1)
+			nargs += ccmt
 			// this section is inlined by go-inline
 			// source function is 'func (ls *LState) pushCallFrame(cf callFrame, fn LValue, meta bool) ' in '_state.go'
 			{
 				ls := L
-				cf := callFrame{Fn: callable, Pc: 0, Base: RA, LocalBase: RA + 1, ReturnBase: RA, NArgs: nargs, NRet: nret, Parent: cf, TailCall: 0}
-				fn := lv
+				cf := callFrame{Fn: callable, Pc: 0, Base: RA, LocalBase: RA + 1, ReturnBase: RA, NArgs: nargs, NRet: nret, Parent: cf, TailCall: 0, CCmt: ccmt}
+				fn := callee
+				meta := false
 				if meta {
 					cf.NArgs++
 					ls.reg.Insert(fn, cf.LocalBase)
@@ -1595,18 +1593,16 @@ func init() {
 				nargs = reg.Top() - (RA + 1)
 			}
 			lv := reg.Get(RA)
-			var callable *LFunction
-			var meta bool
-			if fn, ok := lv.(*LFunction); ok {
-				callable = fn
-				meta = false
-			} else {
-				callable, meta = L.metaCall(lv)
-			}
+			// U5c: the full __call chain (row 83) — inserts at RA+1, the
+			// reused frame's argument window
+			callable, callee, ccmt := L.resolveCall(lv, RA+1)
+			nargs += ccmt
 			if callable == nil {
-				// U2f re-pin: luaG_typeerror names the callee's type;
+				// U2f re-pin: luaG_typeerror names the callee's type —
+				// with a chain, the LAST link (the metamethod value that
+				// itself has no __call);
 				// U3 row 62: luaG_callerror's call-site name or varinfo
-				L.raiseCallError(lv)
+				L.raiseCallError(callee)
 			}
 			// this section is inlined by go-inline
 			// source function is 'func (ls *LState) closeUpvalues(idx int) ' in '_state.go'
@@ -1645,7 +1641,8 @@ func init() {
 					NRet:       cf.NRet,
 					Parent:     cf,
 					TailCall:   0,
-				}, lv, meta)
+					CCmt:       ccmt,
+				}, callee, false)
 				if callGFunction(L, true) {
 					return 1
 				}
@@ -1662,10 +1659,7 @@ func init() {
 				cf.NArgs = nargs
 				cf.NRet = cf.NRet
 				cf.TailCall++
-				if meta {
-					cf.NArgs++
-					L.reg.Insert(lv, cf.LocalBase)
-				}
+				cf.CCmt = ccmt
 				// this section is inlined by go-inline
 				// source function is 'func (ls *LState) initCallFrame(cf *callFrame) ' in '_state.go'
 				{
