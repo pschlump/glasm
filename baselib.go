@@ -19,6 +19,13 @@ func OpenBase(L *LState) int {
 	basemod := L.RegisterModule("_G", baseFuncs)
 	global.RawSetString("ipairs", L.NewClosure(baseIpairs, L.NewFunction(ipairsaux)))
 	global.RawSetString("pairs", L.NewClosure(basePairs, L.NewFunction(pairsaux)))
+	// U5d (row 22): stash the marker-intercept identities — the VM's call
+	// dispatch compares the RESOLVED callee against these (any alias of
+	// the builtin object intercepts; a replaced global is an ordinary
+	// function and does not).
+	L.G.builtinPcall, _ = global.RawGetString("pcall").(*LFunction)
+	L.G.builtinXPCall, _ = global.RawGetString("xpcall").(*LFunction)
+	L.G.builtinPairs, _ = global.RawGetString("pairs").(*LFunction)
 	L.Push(basemod)
 	return 1
 }

@@ -285,7 +285,10 @@ func tableUnpack(L *LState) int {
 // aware); a function's result is lua_toboolean'd.
 func sortComp(L *LState, cmp *LFunction, a, b LValue) bool {
 	if cmp == nil {
-		return lessThan(L, a, b)
+		// Go context (sort runs under a noyield call region): the state
+		// is always mmSync
+		v, _ := lessThan(L, a, b)
+		return v
 	}
 	L.Push(cmp)
 	L.Push(a)

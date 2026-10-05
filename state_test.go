@@ -404,42 +404,55 @@ func TestCoroutineApi1(t *testing.T) {
 
 }
 
-// TestYieldPastBaseFrame (U4g, row 22's panic half): a yield that unwinds
-// past the thread's base frame — a pcall body whose nested Call was
-// surgically "returned" — must leave a DEAD thread whose next resume is
-// the clean stock error, never the zombie state (empty stack, not
-// started, not dead) that crashed initCallFrame on a nil base frame. The
-// stock CONTINUATION semantics (resume re-enters at the yield point,
-// returning true/done) are the row-22 semantic half and ride to U5 —
-// these pins are fork-side stability only, which is why they are Go
-// tests and not corpus cases.
+// TestYieldPastBaseFrame (U5d closes row 22's seam): a yield crossing a
+// pcall/xpcall frame inside a coroutine now has stock continuation
+// semantics — pcall is a marker frame, not a live Go frame, so the yield
+// SUSPENDS the thread; the resume re-enters the payload with the resume
+// values as the yield's returns; the marker completes [true, ...] when
+// the payload finishes. The U4g surgical behavior (thread killed at the
+// yield, next resume "cannot resume dead coroutine") is gone — only the
+// genuinely-dead thread reports it. These are Go tests, not corpus
+// cases, because they pin thread-state transitions (asserts carry the
+// expectations; every shape verified against the clua55 oracle).
 func TestYieldPastBaseFrame(t *testing.T) {
 	shapes := []string{
-		// statement call: the zombie arose at doReturn's base pop
-		`local co = coroutine.create(function() pcall(coroutine.yield, "y1") return "done" end)
-		 print(coroutine.resume(co))
-		 error(select(2, coroutine.resume(co)))`,
-		// local-assignment call
+		// statement call: yield as a direct pcall payload — a G body
+		`local co = coroutine.create(function()
+		   local ok, v = pcall(coroutine.yield, "y1")
+		   assert(ok == true and v == "r1", "resume continues the payload")
+		   return "done"
+		 end)
+		 assert(select(2, coroutine.resume(co)) == "y1")
+		 assert(coroutine.status(co) == "suspended", "suspended at the yield")
+		 assert(coroutine.resume(co, "r1") == true)
+		 assert(coroutine.resume(co) == false) -- now genuinely dead`,
+		// local-assignment call with a Lua payload
 		`local co = coroutine.create(function()
 		   local ok, v = pcall(function() coroutine.yield("y1") end)
+		   assert(ok == true and v == nil, "resume continues the Lua payload")
 		   return ok, v
 		 end)
-		 print(coroutine.resume(co))
-		 error(select(2, coroutine.resume(co)))`,
-		// tailcall shape (return pcall(...)): the G body IS the base
+		 assert(select(2, coroutine.resume(co)) == "y1")
+		 local ok2, a, b = coroutine.resume(co)
+		 assert(ok2 == true and a == true and b == nil)
+		 assert(coroutine.resume(co) == false)`,
+		// tailcall shape (return pcall(...)): the marker replaces the frame
 		`local co = coroutine.create(function() return pcall(coroutine.yield, "y1") end)
-		 print(coroutine.resume(co))
-		 error(select(2, coroutine.resume(co)))`,
-		// a G function as the thread entry itself (pcall is the base) —
-		// and the killed thread reports dead
+		 assert(select(2, coroutine.resume(co)) == "y1")
+		 local ok2, a = coroutine.resume(co)
+		 assert(ok2 == true and a == true, "tailcall marker completes")
+		 assert(coroutine.resume(co) == false)`,
+		// a G function as the thread entry itself (pcall is the base
+		// marker) — suspended after the yield, then completes
 		`local co = coroutine.create(pcall)
-		 print(coroutine.resume(co, function() coroutine.yield("y1") end))
-		 assert(coroutine.status(co) == "dead")
-		 error(select(2, coroutine.resume(co)))`,
-		// coroutine.wrap flavor: the second call propagates
+		 assert(select(2, coroutine.resume(co, function() coroutine.yield("y1") end)) == "y1")
+		 assert(coroutine.status(co) == "suspended", "entry marker suspends")
+		 local ok2, a = coroutine.resume(co)
+		 assert(ok2 == true and a == true, "entry marker completes")`,
+		// coroutine.wrap flavor: the second call returns pcall's results
 		`local f = coroutine.wrap(function() return pcall(coroutine.yield, "w") end)
-		 print(f())
-		 f()`,
+		 assert(f() == "w")
+		 assert(f() == true, "wrap resumes into the marker completion")`,
 	}
 	for i, src := range shapes {
 		L := NewState()
@@ -450,10 +463,9 @@ func TestYieldPastBaseFrame(t *testing.T) {
 					t.Fatalf("shape %d panicked: %v", i, r)
 				}
 			}()
-			err := L.DoString(src)
-			errorIfNil(t, err)
-			errorIfFalse(t, strings.Contains(err.Error(), "cannot resume dead coroutine"),
-				"shape %d: the post-surgical resume must be the clean dead error", i)
+			if err := L.DoString(src); err != nil {
+				t.Errorf("shape %d: %v", i, err)
+			}
 		}()
 	}
 }

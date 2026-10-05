@@ -332,7 +332,8 @@ func mathMax(L *LState) int {
 	}
 	imax := 1
 	for i := 2; i <= n; i++ {
-		if lessThan(L, L.Get(imax), L.Get(i)) {
+		// Go context: the dispatch state is always mmSync (discarded)
+		if v, _ := lessThan(L, L.Get(imax), L.Get(i)); v {
 			imax = i
 		}
 	}
@@ -347,7 +348,8 @@ func mathMin(L *LState) int {
 	}
 	imin := 1
 	for i := 2; i <= n; i++ {
-		if lessThan(L, L.Get(i), L.Get(imin)) {
+		// Go context: the dispatch state is always mmSync (discarded)
+		if v, _ := lessThan(L, L.Get(i), L.Get(imin)); v {
 			imin = i
 		}
 	}

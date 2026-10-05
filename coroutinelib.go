@@ -38,6 +38,19 @@ func coCreate(L *LState) int {
 }
 
 func coYield(L *LState) int {
+	// U5d (row 22, stock lua_yieldk's yieldable guard): a yield inside a
+	// Go-driven call region — anything under ls.Call (sort comparators,
+	// gsub replacements, the tostring/concat metamethod dispatch, __close
+	// under the error paths) — raises the CATCHABLE boundary error; from
+	// the main thread, the outside-coroutine error. Both are
+	// luaG_runerror at the yield C frame: no position, bare text (a
+	// pcall marker in the frame stack catches them; coroutine.lua:341).
+	if L == L.G.MainThread {
+		L.raiseErrorAt(0, "attempt to yield from outside a coroutine")
+	}
+	if L.noyieldDepth > 0 {
+		L.raiseErrorAt(0, "attempt to yield across a C-call boundary")
+	}
 	return -1
 }
 
@@ -69,6 +82,71 @@ func resumeError(L *LState, th *LState, msg string) int {
 	return 2
 }
 
+// resumeEntryMarker restructures a not-yet-started coroutine whose entry
+// function IS the pcall/xpcall builtin (U5d, row 22 —
+// coroutine.create(pcall), official coroutine.lua:277): the base frame
+// becomes the protected marker and the payload — already staged at
+// register 1 by the resume — becomes its body frame, so a yield inside
+// the payload suspends the thread instead of unwinding the Go stack.
+// Degenerate arities and non-function handlers stay plain so the
+// builtin's own checks raise. Returns false on the plain path.
+func resumeEntryMarker(th *LState, cf *callFrame, nargs int) bool {
+	fn := cf.Fn
+	kind := uint8(0)
+	if fn != nil && fn.IsG {
+		if fn == th.G.builtinPcall && nargs >= 1 {
+			kind = 1
+		} else if fn == th.G.builtinXPCall && nargs >= 2 && th.reg.Get(2).Type() == LTFunction {
+			kind = 2
+		}
+	}
+	if kind == 0 {
+		return false
+	}
+	handler := LNil
+	markerNArgs := nargs
+	if kind == 2 {
+		handler = th.reg.Get(2)
+		th.reg.CopyRange(2, 3, -1, nargs-2)
+		markerNArgs = nargs - 1
+	}
+	cf.Pcall = kind
+	cf.PcallHandler = handler
+	cf.Base = 0
+	cf.LocalBase = 1
+	cf.ReturnBase = 0
+	cf.NArgs = markerNArgs
+	lv := th.reg.Get(1)
+	// a payload that is ITSELF a marker builtin (resume(co, pcall, f)) is
+	// a nested marker — the builtin's Go body PCalls noyield and loses the
+	// continuation (same rule as pushPcallMarker's body resolution)
+	bodyArgs := nargs - 1
+	if kind == 2 {
+		bodyArgs = nargs - 2
+	}
+	if kind2 := markerKind(th, lv, 1, bodyArgs); kind2 != 0 {
+		return pushPcallMarker(th, cf, lv, 1, bodyArgs, MultRet, kind2, false)
+	}
+	bfn, callee, ccmt := th.resolveCall(lv, 2)
+	bodyNArgs := nargs - 1 + ccmt
+	if kind == 2 {
+		bodyNArgs = nargs - 2 + ccmt
+	}
+	th.pushCallFrame(callFrame{
+		Fn:         bfn,
+		Pc:         0,
+		Base:       1,
+		LocalBase:  2,
+		ReturnBase: 1,
+		NArgs:      bodyNArgs,
+		NRet:       MultRet,
+		Parent:     cf,
+		TailCall:   0,
+		CCmt:       ccmt,
+	}, callee, false)
+	return true
+}
+
 func coResume(L *LState) int {
 	th := L.CheckThread(1)
 	// U4d stock pin (lua_resume's guards, stock order): only a fresh or
@@ -98,8 +176,10 @@ func coResume(L *LState) int {
 		th.SetTop(0)
 		nargs := L.GetTop() - 1
 		L.XMoveTo(th, nargs)
-		cf.NArgs = nargs
-		th.initCallFrame(cf)
+		if !resumeEntryMarker(th, cf, nargs) {
+			cf.NArgs = nargs
+			th.initCallFrame(cf)
+		}
 		th.Panic = panicWithoutTraceback
 	} else {
 		nargs := L.GetTop() - 1
@@ -196,10 +276,12 @@ func coClose(L *LState) int {
 }
 
 // coIsYieldable: a coroutine is yieldable iff it is not the main
-// thread (5.5's no-arg form asks about the running one).
+// thread AND not inside a Go-driven call region (U5d, stock
+// yieldable(L) = L->nny == 0 && !isMain; 5.5's no-arg form asks about
+// the running one).
 func coIsYieldable(L *LState) int {
 	th := coOptThread(L)
-	L.Push(LBool(th != L.G.MainThread))
+	L.Push(LBool(th != L.G.MainThread && th.noyieldDepth == 0))
 	return 1
 }
 

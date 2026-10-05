@@ -228,6 +228,17 @@ type Global struct {
 	// GC to drive (upgrade plan D10).
 	gcparams [6]uint8
 
+	// builtinPcall/builtinXPCall/builtinPairs are the marker-intercept
+	// identities (U5d, row 22): the VM's call dispatch compares the
+	// RESOLVED callee against these — any alias of the builtin object
+	// intercepts, a replaced global does not. pcall/xpcall become
+	// protected marker frames (stock's lua_pcallk continuations) and
+	// pairs' __pairs call a continuation marker (stock pairscont), so
+	// yields crossing them suspend instead of unwinding the Go stack.
+	builtinPcall  *LFunction
+	builtinXPCall *LFunction
+	builtinPairs  *LFunction
+
 	builtinMts map[int]LValue
 	tempFiles  []*os.File
 	gccount    int32
@@ -265,6 +276,14 @@ type LState struct {
 	// uses, innermost (highest) first, so cross-frame ordering holds and
 	// closeTBC(level) reaches exactly the entries a block/function owns.
 	tbclist *tbcEntry
+	// noyieldDepth is stock's nny (U5d, row 22): every call driven from
+	// a Go frame (ls.Call — sort comparators, gsub replacements, the
+	// tostring/concat metamethod dispatch, __close under the error
+	// paths) bumps it; coroutine.isyieldable answers false and a yield
+	// attempt raises the catchable "attempt to yield across a C-call
+	// boundary". Marker-frame bodies (pcall/xpcall/pairs/__close from
+	// the VM) are pushed by the loop itself and never bump it.
+	noyieldDepth int
 }
 
 // tbcEntry is one to-be-closed variable registration (U4). The value

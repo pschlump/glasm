@@ -13,21 +13,23 @@ import (
 
 // u5ProbeSkips layers the interp-only rulings on clua55Skips (U5a
 // closeout triage): closure/gc/gengc need real GC surface (row 79),
-// nextvar's yield-in-__pairs is the U5d row-22 seam, db.lua needs the
-// sethook family, and cstack.lua:29 is row 78e's handler-overflow
-// dialect. Oracle-side these all stay in TestCLua55Conformance (green).
+// db.lua needs the sethook family, and cstack.lua:29 is row 78e's
+// handler-overflow dialect. U5d un-skipped nextvar.lua (the __pairs
+// yield, :937) and coroutine.lua's yield battery (create(pcall) :277
+// and the mm-yield shapes — green under the marker-frame machinery);
+// coroutine.lua's remaining blocker is sethook :410, narrowed below.
+// Oracle-side these all stay in TestCLua55Conformance (green).
 var u5ProbeSkips = func() map[string]string {
 	m := map[string]string{
-		"closure.lua":   "row 79: weak tables unimplemented — closure.lua:39 repeat-until-GC cannot terminate (hangs, not fails)",
-		"nextvar.lua":   "row 22 (U5d): yield inside __pairs (nextvar.lua:937) crosses the pairs() Go-function boundary and crashes the coroutine machinery — plain __pairs/__index ipairs are fixed; yields are U5d",
-		"gc.lua":        "row 79 (U5c): collectgarbage deep surface — the 5.4 \"param\" get/set protocol (gc.lua:31) and weak tables (__mode clearing) later in the file",
-		"gengc.lua":     "row 79 (U5c): generational-GC surface — gengc.lua:122 needs a minor collection to clear a __mode=\"kv\" table's entries",
-		"db.lua":        "debug.sethook/gethook family unimplemented (db.lua:16's gethook) — sethook precedent (row 77's errors.lua skip)",
-		"locals.lua":    "db.lua precedent: debug.sethook at locals.lua:842 (the to-be-closed-in-coroutines block) — green through :841, including the U5b vararg surface (the old :315 named-vararg blocker is fixed)",
-		"cstack.lua":    "row 78e (U5c closeout): xpcall(loop, loop) at cstack.lua:29 — the handler itself overflows and the fork's frame-reserve dialect still re-raises 'C stack overflow' where stock says 'error in error handling'; the row-78e fix covers the failing-handler raise/panic shapes (calls.lua:168 is green)",
-		"calls.lua":     "row 25 (U5c closeout): the __call-chain/errerr battery (:195-240, :168) is green; the remaining blocker is string.dump at :361 (binary chunks — the fork rejects it)",
-		"errors.lua":    "row 25 (U5c closeout): light userdata (:258-268) is green; the remaining blocker is string.dump at :307 (binary chunks — the fork rejects it)",
-		"coroutine.lua": "row 22 (U5d): yield inside a Go-function boundary — coroutine.create(pcall) + foo yields (coroutine.lua:277): resume returns the yield but the status reads 'dead' instead of 'suspended' (same seam as nextvar.lua:937's __pairs yield)",
+		"closure.lua": "row 79: weak tables unimplemented — closure.lua:39 repeat-until-GC cannot terminate (hangs, not fails)",
+		"gc.lua":      "row 79 (U5c): collectgarbage deep surface — the 5.4 \"param\" get/set protocol (gc.lua:31) and weak tables (__mode clearing) later in the file",
+		"gengc.lua":   "row 79 (U5c): generational-GC surface — gengc.lua:122 needs a minor collection to clear a __mode=\"kv\" table's entries",
+		"db.lua":      "debug.sethook/gethook family unimplemented (db.lua:16's gethook) — sethook precedent (row 77's errors.lua skip)",
+		"locals.lua":  "db.lua precedent: debug.sethook at locals.lua:842 (the to-be-closed-in-coroutines block) — green through :841, including the U5b vararg surface (the old :315 named-vararg blocker is fixed)",
+		"coroutine.lua": "db.lua precedent: debug.sethook at coroutine.lua:410 — green through :409 including the U5d yield battery (create(pcall) :277, the mm-yield shapes; the old row-22 blockers are fixed)",
+		"cstack.lua":  "row 78e (U5c closeout): xpcall(loop, loop) at cstack.lua:29 — the handler itself overflows and the fork's frame-reserve dialect still re-raises 'C stack overflow' where stock says 'error in error handling'; the row-78e fix covers the failing-handler raise/panic shapes (calls.lua:168 is green)",
+		"calls.lua":   "row 25 (U5c closeout): the __call-chain/errerr battery (:195-240, :168) is green; the remaining blocker is string.dump at :361 (binary chunks — the fork rejects it)",
+		"errors.lua":  "row 25 (U5c closeout): light userdata (:258-268) is green; the remaining blocker is string.dump at :307 (binary chunks — the fork rejects it)",
 	}
 	for k, v := range clua55Skips {
 		m[k] = v

@@ -25,7 +25,9 @@ func (lv lValueArraySorter) Less(i, j int) bool {
 		lv.L.Call(2, 1)
 		return LVAsBool(lv.L.reg.Pop())
 	}
-	return lessThan(lv.L, lv.Values[i], lv.Values[j])
+	// Go context (sort's call region): the dispatch state is always mmSync
+	v, _ := lessThan(lv.L, lv.Values[i], lv.Values[j])
+	return v
 }
 
 // gcMemBytes is the synthetic Lua-heap accounting behind

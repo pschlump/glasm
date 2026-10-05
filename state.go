@@ -167,6 +167,28 @@ type callFrame struct {
 	// frame (stock's ci callstatus MAX_CCMT bits): getinfo 't' reports
 	// it as extraargs. Reset per call site (stock resets it per precall).
 	CCmt int
+	// Pcall marks a continuation/protected marker frame (U5d, row 22 —
+	// stock models these as C frames with lua_callk/lua_pcallk
+	// continuations; the fork carries the semantics as DATA on the
+	// frame so a yield suspends through them instead of unwinding the
+	// Go stack):
+	//   0    plain frame
+	//   1    pcall  — body results prefix true; errors stage [false, obj]
+	//   2    xpcall — as pcall, msgh in PcallHandler run AT raise
+	//   3    pairs  — __pairs call, body results pad to NRet (pairscont)
+	//   4/5  close continuation: a VM-called __close (4 = from OP_CLOSE,
+	//        5 = from a RETURN; ContRA/ContB resume the interrupted
+	//        instruction's tail)
+	//   6    metamethod continuation: a VM-dispatched Lua metamethod
+	//        (MMBIN/getfield/order/concat/...); vmFinishMM completes the
+	//        owner's interrupted instruction when it returns
+	// A marker never executes code; the return/error/resume paths
+	// complete it (completePcallMarker, the close continuations, and
+	// vmFinishMM).
+	Pcall        uint8
+	PcallHandler LValue
+	ContRA       int
+	ContB        int
 }
 
 type callFrameStack interface {
@@ -1416,7 +1438,505 @@ func (ls *LState) pushCallFrame(cf callFrame, fn LValue, meta bool) { // +inline
 	ls.currentFrame = newcf
 } // +inline-end
 
+// findPcallMarker walks the current frame chain innermost-out for the
+// nearest pcall/xpcall marker (U5d, row 22): the PROTECTOR that catches
+// an in-flight error. Pcall 3/4/5 are continuations, not protectors —
+// they never catch. minIdx scopes the walk to a recovery region: only
+// markers the wrapped loop itself pushed (Idx >= minIdx) complete at
+// that depth; outer markers belong to outer recovery points.
+func (ls *LState) findPcallMarker(minIdx int) *callFrame {
+	for cf := ls.currentFrame; cf != nil; cf = cf.Parent {
+		if cf.Idx < minIdx {
+			return nil
+		}
+		if cf.Pcall == 1 || cf.Pcall == 2 {
+			return cf
+		}
+	}
+	return nil
+}
+
+// runMsgh runs an xpcall message handler AT RAISE (U5d; stock
+// luaG_errormsg invokes the errfunc before any unwinding, so a traceback
+// handler sees the full dying stack). A failing handler collapses to
+// exactly "error in error handling" (row 78e); its object is discarded.
+func (ls *LState) runMsgh(handler LValue, obj LValue) LValue {
+	fn, ok := handler.(*LFunction)
+	if !ok {
+		return obj
+	}
+	top := ls.reg.Top()
+	ls.reg.Push(fn)
+	ls.reg.Push(obj)
+	if perr := ls.PCall(1, 1, nil); perr != nil {
+		ls.reg.SetTop(top)
+		return LString("error in error handling")
+	}
+	v := ls.reg.Get(top)
+	ls.reg.SetTop(top)
+	return v
+}
+
+// completePcallMarker completes the pcall/xpcall/pairs marker that is
+// the current frame — its body just finished, results staged at
+// marker.LocalBase..top (ok), or [false, obj] staged here (!ok with
+// errobj). The completion stages prefix+results at the marker's return
+// window, pops it, and cascades while the revealed frame is itself a
+// marker (pcall(pcall(...)) with a tailcall seam, the resume-entry
+// marker). Returns 1 when the driver loop must exit (thread suspended
+// or finished, or a Go-caller region takes over), 0 to continue.
+func (ls *LState) completePcallMarker(ok bool, errobj LValue) int {
+	if !ok {
+		// stage just the object: the completion prefixes the false, so
+		// the marker returns exactly [false, obj]
+		m := ls.currentFrame
+		ls.reg.SetTop(m.LocalBase)
+		ls.reg.Push(errobj)
+	}
+	for {
+		m := ls.currentFrame
+		nres := ls.reg.Top() - m.LocalBase
+		n := m.NRet
+		var prefix LValue
+		if m.Pcall == 3 {
+			// pairscont: "__pairs did all the work" — the call is padded
+			// to 4 (lua_callk's nresults) and the marker returns them
+			// AS-IS (the true/false prefix is pcall's protocol, not
+			// pairs')
+			if nres < 4 {
+				copyReturnValues(ls, m.LocalBase, m.LocalBase, 4, nres+1)
+				nres = 4
+			}
+			if n == MultRet {
+				n = nres
+			}
+		} else {
+			if n == MultRet {
+				n = nres + 1
+			}
+			prefix = LTrue
+			if !ok {
+				prefix = LFalse
+			}
+		}
+		if ls.stack.Sp() == 1 && ls.Parent != nil {
+			// the marker is the thread's base frame (create(pcall)) —
+			// stage above it and let switchToParentThread deliver and
+			// pop, exactly like doReturnTail's base-frame arm
+			top := ls.reg.Top()
+			if prefix != nil {
+				copyReturnValues(ls, top+1, m.LocalBase, n-1, nres+1)
+				ls.reg.Set(top, prefix)
+			} else {
+				copyReturnValues(ls, top, m.LocalBase, n, nres+1)
+			}
+			switchToParentThread(ls, n, false, true)
+			return 1
+		}
+		if n == 0 {
+			ls.reg.SetTop(m.Base)
+		} else if prefix != nil {
+			copyReturnValues(ls, m.Base+1, m.LocalBase, n-1, nres+1)
+			ls.reg.Set(m.Base, prefix)
+		} else {
+			copyReturnValues(ls, m.Base, m.LocalBase, n, nres+1)
+		}
+		ls.stack.Pop()
+		ls.currentFrame = ls.stack.Last()
+		if ls.currentFrame == nil || ls.stack.IsEmpty() {
+			if ls != ls.G.MainThread && !ls.Dead && ls.Parent == nil {
+				// mirror doReturn's U4g arm: nothing left to deliver
+				ls.kill()
+			}
+			return 1
+		}
+		if p := ls.currentFrame.Pcall; p >= 1 && p <= 3 {
+			// cascade: this marker's call site just returned into an
+			// enclosing marker (a tailcall seam or the resume entry)
+			ok = true
+			continue
+		}
+		if ls.currentFrame.Fn.IsG {
+			// a Go-caller region (callR): its code takes the results
+			return 1
+		}
+		return 0
+	}
+}
+
+// completeErrorMarker is the error arm of the marker catch (U5d): the
+// innermost in-scope pcall/xpcall marker swallows rcv — msgh AT raise
+// while the dying frames are still on the stack (xpcall), then the
+// unwind to the marker, the dying frames' upvalue/tbc closes with the
+// object in flight (a failing __close replaces it; the nil-object fix
+// after the handler, stock luaD_pcall's order) — and the marker
+// completes [false, obj].
+func (ls *LState) completeErrorMarker(rcv interface{}, m *callFrame) int {
+	var obj LValue
+	if ae, ok := rcv.(*ApiError); ok {
+		obj = ae.Object
+	} else {
+		obj = LString(fmt.Sprint(rcv))
+	}
+	if m.Pcall == 2 {
+		// U5a's frame reserve, carried into the marker path (row 84): a
+		// stack overflow leaves the frame stack FULL, so the handler's
+		// call would re-raise before running (stock luaD_growstack
+		// reserves ERRORSTACKSIZE before raising; PCall's errfunc arm is
+		// the old path's analog). Unwind the topmost DYING frames — they
+		// sit above the marker and the SetSp below discards them anyway;
+		// a handler needing more than the reserve re-raises where stock
+		// reports luaD_errerr (row 78e dialect).
+		if ls.stack.IsFull() {
+			drop := ls.stack.Sp() - errorFrameReserve
+			if drop < m.Idx+1 {
+				drop = m.Idx + 1
+			}
+			ls.stack.SetSp(drop)
+			ls.currentFrame = ls.stack.Last()
+		}
+		obj = ls.runMsgh(m.PcallHandler, obj)
+	}
+	if obj == LNil {
+		obj = LString("<no error object>")
+	}
+	// unwind to (and including above) the marker: SetSp keeps 0..m.Idx
+	ls.stack.SetSp(m.Idx + 1)
+	ls.currentFrame = ls.stack.Last()
+	ls.closeUpvalues(m.Base)
+	if o2, failed := ls.closeTBCProtected(m.Base, obj); failed {
+		obj = o2
+	}
+	return ls.completePcallMarker(false, obj)
+}
+
+// markerKind classifies a call-site callee for the U5d marker
+// intercept: the pcall/xpcall/pairs BUILTIN OBJECTS (any alias — the
+// dispatch compares the resolved callee cell, so a replaced global is
+// an ordinary function and never intercepts). Returns the marker kind
+// (0 = no intercept). Degenerate arities and non-function handlers stay
+// on the plain path so the builtin's own argument checks raise exactly
+// as stock's do.
+func markerKind(L *LState, lv LValue, RA, nargs int) uint8 {
+	fn, ok := lv.(*LFunction)
+	if !ok || !fn.IsG || nargs < 1 {
+		return 0
+	}
+	if fn == L.G.builtinPcall {
+		return 1
+	}
+	if fn == L.G.builtinXPCall {
+		if nargs >= 2 && L.reg.Get(RA+2).Type() == LTFunction {
+			return 2
+		}
+		return 0
+	}
+	if fn == L.G.builtinPairs {
+		// only the __pairs metamethod arm; plain pairs stays the builtin
+		if L.metaOp1(L.reg.Get(RA+1), "__pairs").Type() == LTFunction {
+			return 3
+		}
+	}
+	return 0
+}
+
+// pushPcallMarker performs the U5d marker intercept (row 22): pcall/
+// xpcall become protected marker frames and pairs' __pairs call a
+// continuation marker (stock's lua_pcallk/lua_callk continuations), so
+// a yield crossing them suspends instead of unwinding the Go stack. The
+// marker window IS the call site's window (fn@RA, body@RA+1, args@
+// RA+2+); the body is an ordinary frame the loop enters next — pushed
+// AFTER the marker, so a non-callable payload's raise is bare over the
+// IsG marker (pcall(42), row 83's position rule). tailcall replaces the
+// running frame wholesale (stock: a tailcall to C returns to OUR
+// caller), keeping ReturnBase/NRet/Parent/TailCall. Returns whether the
+// driver loop must exit (a Go body finished through the marker).
+func pushPcallMarker(L *LState, cf *callFrame, lv LValue, RA, nargs, nret int, kind uint8, tailcall bool) (exit bool) {
+	reg := L.reg
+	bifn, _ := lv.(*LFunction) // markerKind validated it is the builtin
+	handler := LNil
+	bodyArgs := nargs - 1
+	markerNArgs := nargs
+	switch kind {
+	case 1: // pcall: payload@RA+1, args@RA+2+
+	case 2: // xpcall: f@RA+1, msgh@RA+2, extras@RA+3+ — extras shift down
+		handler = reg.Get(RA + 2)
+		reg.CopyRange(RA+2, RA+3, -1, nargs-2)
+		bodyArgs = nargs - 2
+		markerNArgs = nargs - 1
+	case 3: // pairs: __pairs(t) — window mm@RA+1, t@RA+2
+		reg.CopyRange(RA+2, RA+1, -1, 1)
+		reg.Set(RA+1, L.metaOp1(reg.Get(RA+2), "__pairs"))
+		bodyArgs = 1
+		markerNArgs = nargs + 1
+	}
+	marker := callFrame{
+		Fn:           bifn, // the builtin; debug-shaped as its C frame
+		Pc:           0,
+		Base:         RA,
+		LocalBase:    RA + 1,
+		ReturnBase:   RA,
+		NArgs:        markerNArgs,
+		NRet:         nret,
+		Parent:       cf,
+		TailCall:     0,
+		Pcall:        kind,
+		PcallHandler: handler,
+	}
+	if tailcall {
+		idx, rb, nr, parent, tc := cf.Idx, cf.ReturnBase, cf.NRet, cf.Parent, cf.TailCall
+		base := cf.Base
+		*cf = marker
+		cf.Idx, cf.ReturnBase, cf.NRet, cf.Parent, cf.TailCall = idx, rb, nr, parent, tc
+		L.initCallFrame(cf)
+		// the plain tailcall slides the reused frame's window back down to
+		// the frame's ORIGINAL base (the caller reads results at its own
+		// call window, not at RA inside the dying registers) — the marker
+		// window must make the same slide. initCallFrame's G arm already
+		// set top just past the marker window, so the live span is exactly
+		// top-RA cells.
+		reg.CopyRange(base, RA, -1, reg.Top()-RA)
+		cf.Base = base
+		cf.LocalBase = base + 1
+		RA = base
+	} else {
+		L.pushCallFrame(marker, LNil, false)
+	}
+	// the body: resolve the payload (or the metamethod) in the marker's
+	// window — resolveCall may shift the window's args for a __call chain.
+	// A payload that is ITSELF a marker builtin (xpcall(pcall, msgh, f),
+	// pcall(pairs, t)) becomes a NESTED marker, not a live G frame: the
+	// builtin's Go body PCalls (noyield, no continuation), losing exactly
+	// what the markers exist to preserve. The body window is the payload's
+	// call window (callee@RA+1, args@RA+2+), so the recursion is a plain
+	// pushPcallMarker over it with the outer marker as the caller.
+	bodyLv := reg.Get(RA + 1)
+	if kind2 := markerKind(L, bodyLv, RA+1, bodyArgs); kind2 != 0 {
+		return pushPcallMarker(L, L.currentFrame, bodyLv, RA+1, bodyArgs, MultRet, kind2, false)
+	}
+	bfn, callee, ccmt := L.resolveCall(bodyLv, RA+2)
+	L.pushCallFrame(callFrame{
+		Fn:         bfn,
+		Pc:         0,
+		Base:       RA + 1,
+		LocalBase:  RA + 2,
+		ReturnBase: RA + 1,
+		NArgs:      bodyArgs + ccmt,
+		NRet:       MultRet,
+		Parent:     L.currentFrame,
+		TailCall:   0,
+		CCmt:       ccmt,
+	}, callee, false)
+	if bfn != nil && bfn.IsG && callGFunction(L, false) {
+		return true
+	}
+	return false
+}
+
+// closeTBCVM drives the VM-yieldable to-be-closed list (U5d): each
+// __close call runs as a frame TAGGED with the continuation kind — 4 =
+// from an OP_CLOSE (ContB the close level), 5 = from a RETURN (ContRA/
+// ContB the interrupted return's staging params, level the owner's
+// LocalBase) — so a yield inside a Lua __close suspends through it
+// (stock luaF_close from Lua code calls metamethods yieldable) and the
+// owner's close/return resumes via doReturn's continuation arm. A C
+// __close runs noyield (stock callclosemethod -> luaD_callnoyield): its
+// Go frame cannot survive a suspend. Returns true when a close frame
+// was pushed (the caller returns 0 so the loop enters it).
+func (ls *LState) closeTBCVM(level int, kind uint8, contRA, contB int) bool {
+	for ls.tbclist != nil && ls.tbclist.idx >= level {
+		e := ls.tbclist
+		ls.tbclist = e.prev
+		lv := ls.reg.Get(e.idx)
+		if LVIsFalse(lv) {
+			continue // defensive: false/nil never register
+		}
+		op := ls.metaOp1(lv, "__close")
+		base := ls.reg.Top()
+		ls.reg.Push(op)
+		ls.reg.Push(lv)
+		bfn, callee, ccmt := ls.resolveCall(op, base+1)
+		cfk := callFrame{
+			Fn:         bfn,
+			Pc:         0,
+			Base:       base,
+			LocalBase:  base + 1,
+			ReturnBase: base,
+			NArgs:      1 + ccmt,
+			NRet:       0,
+			Parent:     ls.currentFrame,
+			TailCall:   0,
+			CCmt:       ccmt,
+			Pcall:      kind,
+			ContRA:     contRA,
+			ContB:      contB,
+		}
+		if bfn != nil && bfn.IsG {
+			// the depth bump must survive a raise mid-close: scope it so
+			// the deferred decrement runs on the unwind too
+			ls.noyieldDepth++
+			done := func() (done bool) {
+				defer func() { ls.noyieldDepth-- }()
+				ls.pushCallFrame(cfk, callee, false)
+				return callGFunction(ls, false)
+			}()
+			if done {
+				return true
+			}
+			continue
+		}
+		ls.pushCallFrame(cfk, callee, false)
+		return true
+	}
+	return false
+}
+
+// The metamethod-dispatch states (U5d, row 22 — stock ltm.c's
+// luaD_call-vs-luaD_callnoyield dispatch plus its completion):
+//
+//	mmSync   the call ran to completion under this Go frame (a Go-context
+//	         dispatch, or a C metamethod in VM context) — the result is
+//	         the return value, the staging window popped
+//	mmPushed a Lua metamethod in VM context became a kind-6 continuation
+//	         frame — the interrupted instruction suspends (vmFinishMM
+//	         completes it when the metamethod returns)
+//	mmExit   the driver loop must exit (a C-metamethod completion ended
+//	         the thread or handed off to a Go region)
+const (
+	mmSync uint8 = iota
+	mmPushed
+	mmExit
+)
+
+// mmYieldable is stock ltm.c's rule — "metamethod may yield only when
+// called from Lua code" (luaT_callTM's isLuacode(L->ci)): the dispatch
+// happens in a running Lua frame with no Go call region between (stock's
+// nny == 0). Go-context dispatches — host API under L.Call/callR, G
+// function bodies, sort comparators — stay noyield; a yield there raises
+// the catchable boundary error.
+func (ls *LState) mmYieldable() bool {
+	if ls.noyieldDepth != 0 {
+		return false
+	}
+	cf := ls.currentFrame
+	return cf != nil && cf.Fn != nil && !cf.Fn.IsG
+}
+
+// callMM dispatches a staged metamethod call — op@base, args@base+1..,
+// base = reg.Top()-nargs-1 — under stock's yieldability rule. From Go
+// context (or for a C metamethod, which has no continuation — stock's
+// callclosemethod uses luaD_callnoyield for exactly this shape) it runs
+// to completion noyield with the result at the window base and the
+// window popped (mmSync). From VM context a Lua metamethod becomes a
+// kind-6 continuation frame carrying contA/contB — opcode-specific
+// fold/loop state for vmFinishMM (CONCAT's remaining fold) — and the
+// interrupted instruction suspends (mmPushed) or the loop exits (mmExit).
+func (ls *LState) callMM(nargs, nret int, contA, contB int) (LValue, uint8) {
+	reg := ls.reg
+	base := reg.Top() - nargs - 1
+	if !ls.mmYieldable() {
+		ls.Call(nargs, nret)
+		v := LNil
+		if nret > 0 {
+			v = reg.Get(base)
+		}
+		reg.SetTop(base)
+		return v, mmSync
+	}
+	op := reg.Get(base)
+	bfn, callee, ccmt := ls.resolveCall(op, base+1)
+	if bfn != nil && bfn.IsG {
+		// the depth bump must survive a raise mid-call: scope it so the
+		// deferred decrement runs on the unwind too
+		ls.noyieldDepth++
+		done := func() (done bool) {
+			defer func() { ls.noyieldDepth-- }()
+			ls.pushCallFrame(callFrame{
+				Fn:         bfn,
+				Pc:         0,
+				Base:       base,
+				LocalBase:  base + 1,
+				ReturnBase: base,
+				NArgs:      nargs + ccmt,
+				NRet:       nret,
+				Parent:     ls.currentFrame,
+				TailCall:   0,
+				CCmt:       ccmt,
+			}, callee, false)
+			return callGFunction(ls, false)
+		}()
+		if done {
+			return LNil, mmExit
+		}
+		v := LNil
+		if nret > 0 {
+			v = reg.Get(base)
+		}
+		reg.SetTop(base)
+		return v, mmSync
+	}
+	ls.pushCallFrame(callFrame{
+		Fn:         bfn,
+		Pc:         0,
+		Base:       base,
+		LocalBase:  base + 1,
+		ReturnBase: base,
+		NArgs:      nargs + ccmt,
+		NRet:       nret,
+		Parent:     ls.currentFrame,
+		TailCall:   0,
+		CCmt:       ccmt,
+		Pcall:      6,
+		ContRA:     contA,
+		ContB:      contB,
+	}, callee, false)
+	return LNil, mmPushed
+}
+
+// loopAttempt runs one mainLoop attempt under the pcall-marker catch
+// (U5d, row 22): an error raised inside a pcall/xpcall marker's body at
+// this recovery depth or deeper (Idx >= minIdx) completes the marker
+// (false + object — msgh at raise) and restarts the loop at the
+// repaired frame. baseframe is mainLoop's stop frame — for a callR
+// region it is the callee's own frame, so the loop drives ONLY that
+// callee and returns to the Go caller when it finishes (the stackless
+// loop would otherwise run the caller's frames to completion inside the
+// Go call); nil runs the thread until the stack empties. Anything else
+// re-panics to the outer recovery points (threadRun's thread-death
+// recover, an enclosing loopAttempt, or a host PCall) — stock's
+// lua_pcallk catching at the depth that owns the continuation.
+// closeSelfUnwind always re-panics (no recovery point may catch it). A
+// restart keeps the baseframe: the marker unwind stops above it
+// (m.Idx >= minIdx == baseframe.Idx in the callR shape), so the stop
+// frame survives.
+func loopAttempt(L *LState, minIdx int, baseframe *callFrame) {
+	defer func() {
+		if rcv := recover(); rcv != nil {
+			if _, isunwind := rcv.(*closeSelfUnwind); isunwind {
+				panic(rcv)
+			}
+			m := L.findPcallMarker(minIdx)
+			if m == nil {
+				panic(rcv)
+			}
+			if L.completeErrorMarker(rcv, m) == 1 {
+				return
+			}
+			loopAttempt(L, minIdx, baseframe)
+		}
+	}()
+	L.mainLoop(L, baseframe)
+}
+
 func (ls *LState) callR(nargs, nret, rbase int) {
+	// U5d (row 22, stock lua_call/lua_pcall from C = luaD_callnoyield):
+	// a call driven from a Go frame has no continuation — mark the
+	// region no-yield so a yield inside raises the catchable boundary
+	// error instead of unwinding this live Go frame. A plain yield
+	// unwinds the Go stack NORMALLY (gfnret<0 returns through every
+	// level), so the deferred decrement still runs.
+	ls.noyieldDepth++
+	defer func() { ls.noyieldDepth-- }()
 	base := ls.reg.Top() - nargs - 1
 	if rbase < 0 {
 		rbase = base
@@ -1438,9 +1958,14 @@ func (ls *LState) callR(nargs, nret, rbase int) {
 	if ls.G.MainThread == nil {
 		ls.G.MainThread = ls
 		ls.G.CurrentThread = ls
-		ls.mainLoop(ls, nil)
+		loopAttempt(ls, 0, nil)
 	} else {
-		ls.mainLoop(ls, ls.currentFrame)
+		// markers the callee's code pushes (Idx >= its own) complete HERE
+		// so the Go caller of this call keeps running (stock: pcallk
+		// catches at the depth that owns the Go frame — gsub continues);
+		// baseframe = the callee's frame keeps the loop scoped to it (the
+		// old callR passed ls.currentFrame for exactly this)
+		loopAttempt(ls, ls.stack.Sp()-1, ls.currentFrame)
 	}
 	if nret != MultRet {
 		ls.reg.SetTop(rbase + nret)
@@ -1453,14 +1978,21 @@ func (ls *LState) callR(nargs, nret, rbase int) {
 // only level whose value lives in a register (or, for GETTABUP/
 // SETTABUP, an upvalue cell), so the hint applies at i == 0 only.
 
-func (ls *LState) getField(obj LValue, key LValue, hint varinfoHint) LValue {
+// The field walkers return the metamethod-dispatch state alongside their
+// value (U5d, row 22): mmSync completes the instruction here; mmPushed/
+// mmExit mean a VM-dispatched __index/__newindex became a kind-6 frame —
+// the caller's instruction suspends and vmFinishMM completes it on resume
+// (the host-API wrappers run in Go context, where the state is always
+// mmSync).
+
+func (ls *LState) getField(obj LValue, key LValue, hint varinfoHint) (LValue, uint8) {
 	curobj := obj
 	for i := 0; i < MaxTableGetLoop; i++ {
 		tb, istable := curobj.(*LTable)
 		if istable {
 			ret := tb.RawGet(key)
 			if ret != LNil {
-				return ret
+				return ret, mmSync
 			}
 		}
 		metaindex := ls.metaOp1(curobj, "__index")
@@ -1472,30 +2004,29 @@ func (ls *LState) getField(obj LValue, key LValue, hint varinfoHint) LValue {
 				}
 				ls.RaiseError("attempt to index a %s value%s", curobj.Type().String(), h)
 			}
-			return LNil
+			return LNil, mmSync
 		}
 		if metaindex.Type() == LTFunction {
 			ls.reg.Push(metaindex)
 			ls.reg.Push(curobj)
 			ls.reg.Push(key)
-			ls.Call(2, 1)
-			return ls.reg.Pop()
+			return ls.callMM(2, 1, 0, 0)
 		} else {
 			curobj = metaindex
 		}
 	}
 	ls.RaiseError("too many recursions in gettable")
-	return nil
+	return nil, mmSync
 }
 
-func (ls *LState) getFieldString(obj LValue, key string, hint varinfoHint) LValue {
+func (ls *LState) getFieldString(obj LValue, key string, hint varinfoHint) (LValue, uint8) {
 	curobj := obj
 	for i := 0; i < MaxTableGetLoop; i++ {
 		tb, istable := curobj.(*LTable)
 		if istable {
 			ret := tb.RawGetString(key)
 			if ret != LNil {
-				return ret
+				return ret, mmSync
 			}
 		}
 		metaindex := ls.metaOp1(curobj, "__index")
@@ -1507,30 +2038,29 @@ func (ls *LState) getFieldString(obj LValue, key string, hint varinfoHint) LValu
 				}
 				ls.RaiseError("attempt to index a %s value%s", curobj.Type().String(), h)
 			}
-			return LNil
+			return LNil, mmSync
 		}
 		if metaindex.Type() == LTFunction {
 			ls.reg.Push(metaindex)
 			ls.reg.Push(curobj)
 			ls.reg.Push(LString(key))
-			ls.Call(2, 1)
-			return ls.reg.Pop()
+			return ls.callMM(2, 1, 0, 0)
 		} else {
 			curobj = metaindex
 		}
 	}
 	ls.RaiseError("too many recursions in gettable")
-	return nil
+	return nil, mmSync
 }
 
-func (ls *LState) setField(obj LValue, key LValue, value LValue, hint varinfoHint) {
+func (ls *LState) setField(obj LValue, key LValue, value LValue, hint varinfoHint) uint8 {
 	curobj := obj
 	for i := 0; i < MaxTableGetLoop; i++ {
 		tb, istable := curobj.(*LTable)
 		if istable {
 			if tb.RawGet(key) != LNil {
 				ls.RawSet(tb, key, value)
-				return
+				return mmSync
 			}
 		}
 		metaindex := ls.metaOp1(curobj, "__newindex")
@@ -1543,30 +2073,31 @@ func (ls *LState) setField(obj LValue, key LValue, value LValue, hint varinfoHin
 				ls.RaiseError("attempt to index a %s value%s", curobj.Type().String(), h)
 			}
 			ls.RawSet(tb, key, value)
-			return
+			return mmSync
 		}
 		if metaindex.Type() == LTFunction {
 			ls.reg.Push(metaindex)
 			ls.reg.Push(curobj)
 			ls.reg.Push(key)
 			ls.reg.Push(value)
-			ls.Call(3, 0)
-			return
+			_, st := ls.callMM(3, 0, 0, 0)
+			return st
 		} else {
 			curobj = metaindex
 		}
 	}
 	ls.RaiseError("too many recursions in settable")
+	return mmSync
 }
 
-func (ls *LState) setFieldString(obj LValue, key string, value LValue, hint varinfoHint) {
+func (ls *LState) setFieldString(obj LValue, key string, value LValue, hint varinfoHint) uint8 {
 	curobj := obj
 	for i := 0; i < MaxTableGetLoop; i++ {
 		tb, istable := curobj.(*LTable)
 		if istable {
 			if tb.RawGetString(key) != LNil {
 				tb.RawSetString(key, value)
-				return
+				return mmSync
 			}
 		}
 		metaindex := ls.metaOp1(curobj, "__newindex")
@@ -1579,20 +2110,21 @@ func (ls *LState) setFieldString(obj LValue, key string, value LValue, hint vari
 				ls.RaiseError("attempt to index a %s value%s", curobj.Type().String(), h)
 			}
 			tb.RawSetString(key, value)
-			return
+			return mmSync
 		}
 		if metaindex.Type() == LTFunction {
 			ls.reg.Push(metaindex)
 			ls.reg.Push(curobj)
 			ls.reg.Push(LString(key))
 			ls.reg.Push(value)
-			ls.Call(3, 0)
-			return
+			_, st := ls.callMM(3, 0, 0, 0)
+			return st
 		} else {
 			curobj = metaindex
 		}
 	}
 	ls.RaiseError("too many recursions in settable")
+	return mmSync
 }
 
 /* }}} */
@@ -2245,11 +2777,13 @@ func (ls *LState) RawGetInt(tb *LTable, key int) LValue {
 }
 
 func (ls *LState) GetField(obj LValue, skey string) LValue {
-	return ls.getFieldString(obj, skey, varinfoHint{})
+	v, _ := ls.getFieldString(obj, skey, varinfoHint{})
+	return v
 }
 
 func (ls *LState) GetTable(obj LValue, key LValue) LValue {
-	return ls.getField(obj, key, varinfoHint{})
+	v, _ := ls.getField(obj, key, varinfoHint{})
+	return v
 }
 
 func (ls *LState) RawSet(tb *LTable, key LValue, value LValue) {
@@ -2266,11 +2800,11 @@ func (ls *LState) RawSetInt(tb *LTable, key int, value LValue) {
 }
 
 func (ls *LState) SetField(obj LValue, key string, value LValue) {
-	ls.setFieldString(obj, key, value, varinfoHint{})
+	_ = ls.setFieldString(obj, key, value, varinfoHint{})
 }
 
 func (ls *LState) SetTable(obj LValue, key LValue, value LValue) {
-	ls.setField(obj, key, value, varinfoHint{})
+	_ = ls.setField(obj, key, value, varinfoHint{})
 }
 
 func (ls *LState) ForEach(tb *LTable, cb func(LValue, LValue)) {
@@ -2324,21 +2858,24 @@ func (ls *LState) Concat(values ...LValue) string {
 	for _, value := range values {
 		ls.reg.Push(value)
 	}
-	ret := stringConcat(ls, len(values), ls.reg.Top()-1, nil)
+	ret, _ := stringConcat(ls, len(values), ls.reg.Top()-1, nil)
 	ls.reg.SetTop(top)
 	return LVAsString(ret)
 }
 
 func (ls *LState) LessThan(lhs, rhs LValue) bool {
-	return lessThan(ls, lhs, rhs)
+	v, _ := lessThan(ls, lhs, rhs)
+	return v
 }
 
 func (ls *LState) Equal(lhs, rhs LValue) bool {
-	return equals(ls, lhs, rhs, false)
+	v, _ := equals(ls, lhs, rhs, false)
+	return v
 }
 
 func (ls *LState) RawEqual(lhs, rhs LValue) bool {
-	return equals(ls, lhs, rhs, true)
+	v, _ := equals(ls, lhs, rhs, true)
+	return v
 }
 
 /* }}} */

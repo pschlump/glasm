@@ -19,6 +19,18 @@ func mainLoop(L *LState, baseframe *callFrame) {
 	}
 
 	L.currentFrame = L.stack.Last()
+	// U5d (row 22): a resumed marker — its G body (coroutine.yield as a
+	// pcall payload, a G __pairs) was popped by the yield's suspension,
+	// leaving the marker on top. The resume values ARE the body's
+	// results: switchToParentThread normalized the post-suspension top
+	// to marker.LocalBase, so XMoveTo staged them exactly where the
+	// completion reads them. Never re-run the builtin here.
+	if m := L.currentFrame; m != nil && m.Pcall >= 1 && m.Pcall <= 3 {
+		if L.completePcallMarker(true, LNil) == 1 {
+			return
+		}
+		L.currentFrame = L.stack.Last()
+	}
 	if L.currentFrame.Fn.IsG {
 		callGFunction(L, false)
 		return
@@ -43,6 +55,12 @@ func mainLoopWithContext(L *LState, baseframe *callFrame) {
 	}
 
 	L.currentFrame = L.stack.Last()
+	if m := L.currentFrame; m != nil && m.Pcall >= 1 && m.Pcall <= 3 {
+		if L.completePcallMarker(true, LNil) == 1 {
+			return
+		}
+		L.currentFrame = L.stack.Last()
+	}
 	if L.currentFrame.Fn.IsG {
 		callGFunction(L, false)
 		return
@@ -176,7 +194,10 @@ func copyReturnValues(L *LState, regv, start, n, b int) { // +inline-start
 func switchToParentThread(L *LState, nargs int, haserror bool, kill bool) {
 	parent := L.Parent
 	if parent == nil {
-		L.RaiseError("can not yield from outside of a coroutine")
+		// U5d: stock lua_yieldk's outside-coroutine error, bare (the
+		// common path front-checks in coYield; this is the host-API
+		// backstop)
+		L.raiseErrorAt(0, "attempt to yield from outside a coroutine")
 	}
 	L.G.CurrentThread = parent
 	L.Parent = nil
@@ -291,6 +312,19 @@ func callGFunction(L *LState, tailcall bool) bool {
 	}
 	L.stack.Pop()
 	L.currentFrame = L.stack.Last()
+	// U5d (row 22): a G body whose caller is a pcall/xpcall/pairs marker
+	// returned INTO it (results staged at the body's ReturnBase = the
+	// marker's LocalBase) — complete the marker here; it owns the
+	// delivery (pcall(print, ...), create(pcall) with a G payload). The
+	// marker never executes: without this the loop would fetch from its
+	// builtin Fn (no Proto). The NRet gate keeps Go-caller bodies out: a
+	// G __close under completeErrorMarker (or an xpcall msgh under
+	// runMsgh) runs as a callR body ABOVE the marker with NRet 0/1 — its
+	// results belong to that Go caller, never to the marker; only a
+	// marker's own body (pushPcallMarker) carries MultRet.
+	if m := L.currentFrame; m != nil && m != frame && frame.NRet == MultRet && m.Pcall >= 1 && m.Pcall <= 3 {
+		return L.completePcallMarker(true, LNil) == 1
+	}
 	return false
 }
 
@@ -375,7 +409,10 @@ func threadRun(L *LState) {
 			}
 		}
 	}()
-	L.mainLoop(L, nil)
+	// U5d (row 22): the whole thread loop runs under the pcall-marker
+	// catch — markers at any depth of this thread complete here when no
+	// nearer loopAttempt (a callR region between) owns them
+	loopAttempt(L, 0, nil)
 }
 
 type instFunc func(*LState, uint32, *callFrame) int
@@ -703,7 +740,10 @@ func init() {
 			C := int(inst>>24) & 0xff //GETC
 			t := cf.Fn.Upvalues[B].Value()
 			k := cf.Fn.Proto.Constants[C]
-			v := L.getFieldString(t, string(k.(LString)), upvalHint(cf, B))
+			v, st := L.getFieldString(t, string(k.(LString)), upvalHint(cf, B))
+			if st != mmSync {
+				return mmSignal(st)
+			}
 			// this section is inlined by go-inline
 			// source function is 'func (rg *registry) Set(regi int, vali LValue) ' in '_state.go'
 			{
@@ -734,7 +774,10 @@ func init() {
 			RA := lbase + A
 			B := int(inst>>16) & 0xff //GETB
 			C := int(inst>>24) & 0xff //GETC
-			v := L.getField(reg.Get(lbase+B), reg.Get(lbase+C), regHint(cf, B))
+			v, st := L.getField(reg.Get(lbase+B), reg.Get(lbase+C), regHint(cf, B))
+			if st != mmSync {
+				return mmSignal(st)
+			}
 			// this section is inlined by go-inline
 			// source function is 'func (rg *registry) Set(regi int, vali LValue) ' in '_state.go'
 			{
@@ -765,7 +808,10 @@ func init() {
 			RA := lbase + A
 			B := int(inst>>16) & 0xff //GETB
 			C := int(inst>>24) & 0xff //GETC
-			v := L.getField(reg.Get(lbase+B), LInteger(C), regHint(cf, B))
+			v, st := L.getField(reg.Get(lbase+B), LInteger(C), regHint(cf, B))
+			if st != mmSync {
+				return mmSignal(st)
+			}
 			// this section is inlined by go-inline
 			// source function is 'func (rg *registry) Set(regi int, vali LValue) ' in '_state.go'
 			{
@@ -796,7 +842,10 @@ func init() {
 			RA := lbase + A
 			B := int(inst>>16) & 0xff //GETB
 			C := int(inst>>24) & 0xff //GETC
-			v := L.getFieldString(reg.Get(lbase+B), string(cf.Fn.Proto.Constants[C].(LString)), regHint(cf, B))
+			v, st := L.getFieldString(reg.Get(lbase+B), string(cf.Fn.Proto.Constants[C].(LString)), regHint(cf, B))
+			if st != mmSync {
+				return mmSignal(st)
+			}
 			// this section is inlined by go-inline
 			// source function is 'func (rg *registry) Set(regi int, vali LValue) ' in '_state.go'
 			{
@@ -835,7 +884,9 @@ func init() {
 			} else {
 				v = reg.Get(lbase + C)
 			}
-			L.setFieldString(t, key, v, upvalHint(cf, A))
+			if st := L.setFieldString(t, key, v, upvalHint(cf, A)); st != mmSync {
+				return mmSignal(st)
+			}
 			return 0
 		},
 		func(L *LState, inst uint32, baseframe *callFrame) int { //OP_SETTABLE
@@ -853,7 +904,9 @@ func init() {
 			} else {
 				v = reg.Get(lbase + C)
 			}
-			L.setField(reg.Get(RA), reg.Get(lbase+B), v, regHint(cf, A))
+			if st := L.setField(reg.Get(RA), reg.Get(lbase+B), v, regHint(cf, A)); st != mmSync {
+				return mmSignal(st)
+			}
 			return 0
 		},
 		func(L *LState, inst uint32, baseframe *callFrame) int { //OP_SETI
@@ -871,7 +924,9 @@ func init() {
 			} else {
 				v = reg.Get(lbase + C)
 			}
-			L.setField(reg.Get(RA), LInteger(B), v, regHint(cf, A))
+			if st := L.setField(reg.Get(RA), LInteger(B), v, regHint(cf, A)); st != mmSync {
+				return mmSignal(st)
+			}
 			return 0
 		},
 		func(L *LState, inst uint32, baseframe *callFrame) int { //OP_SETFIELD
@@ -890,7 +945,9 @@ func init() {
 			} else {
 				v = reg.Get(lbase + C)
 			}
-			L.setFieldString(reg.Get(RA), key, v, regHint(cf, A))
+			if st := L.setFieldString(reg.Get(RA), key, v, regHint(cf, A)); st != mmSync {
+				return mmSignal(st)
+			}
 			return 0
 		},
 		func(L *LState, inst uint32, baseframe *callFrame) int { //OP_NEWTABLE
@@ -946,13 +1003,15 @@ func init() {
 			B := int(inst>>16) & 0xff //GETB
 			C := int(inst>>24) & 0xff //GETC
 			selfobj := reg.Get(lbase + B)
-			v := L.getFieldString(selfobj, string(cf.Fn.Proto.Constants[C].(LString)), regHint(cf, B))
+			// stock sets ra+1 BEFORE the metamethod dispatch (OP_SELF's
+			// own body); vmFinishMM's SELF arm then only stages the
+			// __index result at RA
 			// this section is inlined by go-inline
 			// source function is 'func (rg *registry) Set(regi int, vali LValue) ' in '_state.go'
 			{
 				rg := reg
-				regi := RA
-				vali := v
+				regi := RA + 1
+				vali := selfobj
 				newSize := regi + 1
 				// this section is inlined by go-inline
 				// source function is 'func (rg *registry) checkSize(requiredSize int) ' in '_state.go'
@@ -967,12 +1026,16 @@ func init() {
 					rg.top = regi + 1
 				}
 			}
+			v, st := L.getFieldString(selfobj, string(cf.Fn.Proto.Constants[C].(LString)), regHint(cf, B))
+			if st != mmSync {
+				return mmSignal(st)
+			}
 			// this section is inlined by go-inline
 			// source function is 'func (rg *registry) Set(regi int, vali LValue) ' in '_state.go'
 			{
 				rg := reg
-				regi := RA + 1
-				vali := selfobj
+				regi := RA
+				vali := v
 				newSize := regi + 1
 				// this section is inlined by go-inline
 				// source function is 'func (rg *registry) checkSize(requiredSize int) ' in '_state.go'
@@ -1078,13 +1141,16 @@ func init() {
 					reg.Push(op)
 					reg.Push(unaryv)
 					reg.Push(unaryv)
-					L.Call(2, 1)
+					v, st := L.callMM(2, 1, 0, 0)
+					if st != mmSync {
+						return mmSignal(st)
+					}
 					// this section is inlined by go-inline
 					// source function is 'func (rg *registry) Set(regi int, vali LValue) ' in '_state.go'
 					{
 						rg := reg
 						regi := RA
-						vali := reg.Pop()
+						vali := v
 						newSize := regi + 1
 						// this section is inlined by go-inline
 						// source function is 'func (rg *registry) checkSize(requiredSize int) ' in '_state.go'
@@ -1172,13 +1238,16 @@ func init() {
 					reg.Push(op)
 					reg.Push(unaryv)
 					reg.Push(unaryv)
-					L.Call(2, 1)
+					v, st := L.callMM(2, 1, 0, 0)
+					if st != mmSync {
+						return mmSignal(st)
+					}
 					// this section is inlined by go-inline
 					// source function is 'func (rg *registry) Set(regi int, vali LValue) ' in '_state.go'
 					{
 						rg := reg
 						regi := RA
-						vali := reg.Pop()
+						vali := v
 						newSize := regi + 1
 						// this section is inlined by go-inline
 						// source function is 'func (rg *registry) checkSize(requiredSize int) ' in '_state.go'
@@ -1294,14 +1363,16 @@ func init() {
 					reg.Push(op)
 					reg.Push(lv)
 					reg.Push(lv)
-					L.Call(2, 1)
-					ret := reg.Pop()
+					v, st := L.callMM(2, 1, 0, 0)
+					if st != mmSync {
+						return mmSignal(st)
+					}
 					// this section is inlined by go-inline
 					// source function is 'func (rg *registry) Set(regi int, vali LValue) ' in '_state.go'
 					{
 						rg := reg
 						regi := RA
-						vali := ret
+						vali := v
 						newSize := regi + 1
 						// this section is inlined by go-inline
 						// source function is 'func (rg *registry) checkSize(requiredSize int) ' in '_state.go'
@@ -1352,7 +1423,10 @@ func init() {
 			A := int(inst>>7) & 0xff  //GETA
 			B := int(inst>>16) & 0xff //GETB
 			RA := lbase + A
-			v := stringConcat(L, B, RA+B-1, cf)
+			v, st := stringConcat(L, B, RA+B-1, cf)
+			if st != mmSync {
+				return mmSignal(st)
+			}
 			// this section is inlined by go-inline
 			// source function is 'func (rg *registry) Set(regi int, vali LValue) ' in '_state.go'
 			{
@@ -1400,9 +1474,11 @@ func init() {
 					}
 				}
 			}
-			// U4: upvalues first, then to-be-closed (stock luaF_close);
-			// a __close error propagates as a normal error
-			L.closeTBC(RA)
+			// U5d (row 22): the __close calls run as VM frames (a yield
+			// inside a Lua __close suspends, stock luaF_close from Lua
+			// code) with a kind-4 close continuation; a __close error
+			// propagates as a normal error
+			L.closeTBCVM(RA, 4, 0, RA)
 			return 0
 		},
 		func(L *LState, inst uint32, baseframe *callFrame) int { //OP_TBC
@@ -1493,6 +1569,14 @@ func init() {
 			}
 			lv := reg.Get(RA)
 			nret := C - 1
+			// U5d (row 22): the pcall/xpcall/pairs builtins intercept as
+			// marker frames — a yield crossing them suspends the thread
+			if kind := markerKind(L, lv, RA, nargs); kind != 0 {
+				if pushPcallMarker(L, cf, lv, RA, nargs, nret, kind, false) {
+					return 1
+				}
+				return 0
+			}
 			// U5c: the full __call chain (row 83) — resolveCall inserts
 			// each link as an extra first argument, so the frame takes
 			// the args post-chain and no meta insert
@@ -1593,6 +1677,36 @@ func init() {
 				nargs = reg.Top() - (RA + 1)
 			}
 			lv := reg.Get(RA)
+			// U5d (row 22): a marker callee replaces this frame wholesale
+			// (stock: a tailcall to C returns to OUR caller) — the closes
+			// run first, Go-driven, per the TAILCALL ruling
+			if kind := markerKind(L, lv, RA, nargs); kind != 0 {
+				// this section is inlined by go-inline
+				// source function is 'func (ls *LState) closeUpvalues(idx int) ' in '_state.go'
+				{
+					ls := L
+					idx := lbase
+					if ls.uvcache != nil {
+						var prev *Upvalue
+						for uv := ls.uvcache; uv != nil; uv = uv.next {
+							if uv.index >= idx {
+								if prev != nil {
+									prev.next = nil
+								} else {
+									ls.uvcache = nil
+								}
+								uv.Close()
+							}
+							prev = uv
+						}
+					}
+				}
+				L.closeTBC(lbase)
+				if pushPcallMarker(L, cf, lv, RA, nargs, cf.NRet, kind, true) {
+					return 1
+				}
+				return 0
+			}
 			// U5c: the full __call chain (row 83) — inserts at RA+1, the
 			// reused frame's argument window
 			callable, callee, ccmt := L.resolveCall(lv, RA+1)
@@ -2194,7 +2308,105 @@ func init() {
 					rg.top = regi + 1
 				}
 			}
-			L.callR(2, C, RA+3)
+			// U5d (row 22, §4.3 ruling): the iterator call is a VM call —
+			// stock TFORCALL precalls luaD_call, which is YIELDABLE (not
+			// luaD_callnoyield): a yielding for-iterator suspends through
+			// the generic for, and the resume values land exactly in this
+			// frame's result window (switchToParentThread normalizes the
+			// suspended top to the callee's ReturnBase = RA+3), so the
+			// TFORLOOP that follows reads them as the iterator's returns.
+			// The old callR drove it as a Go frame (noyield) and lost the
+			// continuation. The marker intercept applies here too: a
+			// pcall/xpcall/pairs iterator gets marker semantics.
+			lv := reg.Get(RA + 3)
+			if kind := markerKind(L, lv, RA+3, 2); kind != 0 {
+				if pushPcallMarker(L, cf, lv, RA+3, 2, C, kind, false) {
+					return 1
+				}
+				return 0
+			}
+			callable, callee, ccmt := L.resolveCall(lv, RA+4)
+			// this section is inlined by go-inline
+			// source function is 'func (ls *LState) pushCallFrame(cf callFrame, fn LValue, meta bool) ' in '_state.go'
+			{
+				ls := L
+				cf := callFrame{Fn: callable, Pc: 0, Base: RA + 3, LocalBase: RA + 4, ReturnBase: RA + 3, NArgs: 2 + ccmt, NRet: C, Parent: cf, TailCall: 0, CCmt: ccmt}
+				fn := callee
+				meta := false
+				if meta {
+					cf.NArgs++
+					ls.reg.Insert(fn, cf.LocalBase)
+				}
+				if cf.Fn == nil {
+					// U2f re-pin: luaG_typeerror names the callee's type
+					ls.raiseCallError(fn)
+				}
+				if ls.stack.IsFull() {
+					ls.RaiseError("stack overflow")
+				}
+				ls.stack.Push(cf)
+				newcf := ls.stack.Last()
+				// this section is inlined by go-inline
+				// source function is 'func (ls *LState) initCallFrame(cf *callFrame) ' in '_state.go'
+				{
+					cf := newcf
+					if cf.Fn.IsG {
+						ls.reg.SetTop(cf.LocalBase + cf.NArgs)
+					} else {
+						proto := cf.Fn.Proto
+						nargs := cf.NArgs
+						np := int(proto.NumParameters)
+						if nargs < np {
+							// default any missing arguments to nil
+							newSize := cf.LocalBase + np
+							// this section is inlined by go-inline
+							// source function is 'func (rg *registry) checkSize(requiredSize int) ' in '_state.go'
+							{
+								rg := ls.reg
+								requiredSize := newSize
+								if requiredSize > cap(rg.array) {
+									rg.resize(requiredSize)
+								}
+							}
+							for i := nargs; i < np; i++ {
+								ls.reg.array[cf.LocalBase+i] = LNil
+							}
+							nargs = np
+							ls.reg.top = newSize
+						}
+						// U5b: no call-time vararg shuffle — the extra arguments stay in
+						// the window at registers np..nargs-1 (stock's layout: a callee's
+						// cells above its params hold the caller's extras until its own
+						// code overwrites them), and the frame is built by OP_VARARGPREP,
+						// every vararg proto's first instruction: hidden model copies the
+						// fixed params above the extras, table model builds {1..n, n=n}
+						// into register np. The nil window fill starts above ALL arguments
+						// so the extras survive until the prep runs.
+						lo := nargs
+						if nr := int(proto.NumUsedRegisters); nr > lo {
+							lo = nr
+						}
+						newSize := cf.LocalBase + lo
+						// this section is inlined by go-inline
+						// source function is 'func (rg *registry) checkSize(requiredSize int) ' in '_state.go'
+						{
+							rg := ls.reg
+							requiredSize := newSize
+							if requiredSize > cap(rg.array) {
+								rg.resize(requiredSize)
+							}
+						}
+						for i := nargs; i < lo; i++ {
+							ls.reg.array[cf.LocalBase+i] = LNil
+						}
+						ls.reg.top = newSize
+					}
+				}
+				ls.currentFrame = newcf
+			}
+			if callable.IsG && callGFunction(L, false) {
+				return 1
+			}
 			return 0
 		},
 		func(L *LState, inst uint32, baseframe *callFrame) int { //OP_TFORLOOP
@@ -2500,19 +2712,77 @@ func condJump(cf *callFrame, cond bool, k int) {
 	}
 }
 
+// mmSignal maps a metamethod-dispatch state onto the opcode-handler
+// return: mmPushed (a kind-6 frame was pushed — the loop enters it
+// next) is 0, mmExit (a C-metamethod handoff ended the thread or
+// reached a Go-caller region) is 1. mmSync never reaches here — the
+// instruction completed under the handler itself.
+func mmSignal(st uint8) int { return int(st - 1) }
+
+// vmFinishMM is the fork's luaV_finishOp for kind-6 metamethod
+// continuations (U5d, row 22): a VM-dispatched metamethod returned with
+// its result staged at the call window (cf.ReturnBase) — complete the
+// owner's interrupted instruction, exactly stock's arms. The
+// instruction is Code[owner.Pc-1] (Pc saved already-incremented at
+// fetch, stock's savedpc); the MMBIN family's dest rides the
+// instruction before it; CONCAT's fold state rides cf.ContRA/ContB
+// (ContRA the lhs index being folded, ContB the candidates remaining
+// including it — the pair collapses into that cell and the fold
+// resumes, possibly dispatching again). SET* completed at the call
+// itself (stock's default arm: no-op).
+func vmFinishMM(L *LState, owner *callFrame, cf *callFrame) int {
+	reg := L.reg
+	lbase := owner.LocalBase
+	inst := owner.Fn.Proto.Code[owner.Pc-1]
+	res := reg.Get(cf.ReturnBase)
+	switch int(inst & 0x7f) { //GETOPCODE
+	case OP_MMBIN, OP_MMBINI, OP_MMBINK:
+		// the MMBIN slot follows its arith op: dest = A of *(savedpc - 2)
+		dest := lbase + opGetArgA(owner.Fn.Proto.Code[owner.Pc-2])
+		reg.Set(dest, res)
+	case OP_UNM, OP_BNOT, OP_LEN, OP_GETTABUP, OP_GETTABLE,
+		OP_GETI, OP_GETFIELD, OP_SELF:
+		reg.Set(lbase+int(inst>>7)&0xff, res) //GETA
+	case OP_LT, OP_LE, OP_LTI, OP_LEI, OP_GTI, OP_GEI, OP_EQ:
+		// the mm's boolean answers the compare; res != k skips the jump
+		// slot at owner.Pc (OP_EQI/OP_EQK never dispatch metamethods)
+		k := int(inst>>15) & 1 //GETK
+		condJump(owner, LVAsBool(res), k)
+	case OP_CONCAT:
+		// resume the fold: the folded pair (lhs@ContRA, rhs) collapses
+		// into the lhs cell — the mm result lands at ContRA and the fold
+		// continues over the ContB-1 candidates below it (stringConcat
+		// entry: rhs at last=ContRA, total--, loop from last-1 — exactly
+		// the post-mm state the sync path's `rhs = v; total--; i--`
+		// produces). ContB==1 was the final pair: res is the whole result
+		v := res
+		if cf.ContB > 1 {
+			var st uint8
+			reg.Set(cf.ContRA, res)
+			v, st = stringConcat(L, cf.ContB, cf.ContRA, owner)
+			if st != mmSync {
+				return mmSignal(st)
+			}
+		}
+		reg.Set(lbase+int(inst>>7)&0xff, v) //GETA
+	}
+	return 0
+}
+
 // leValues is the OP_LE comparison core, shared with the immediate order
 // family's LEI/GEI metamethod path — luaV_lessequal's shape (U4e): both
 // numbers, both strings, else the __le metamethod. The __le→!__lt mirror
 // (LUA_COMPAT_LT_LE, removed from stock in 5.4) is gone: only __le is
 // consulted, so a type with only __lt defined now order-errors on <=
-// exactly like stock 5.5.
-func leValues(L *LState, lhs, rhs LValue) bool {
+// exactly like stock 5.5. The second return is the U5d metamethod
+// dispatch state (a suspended __le leaves the compare mid-instruction).
+func leValues(L *LState, lhs, rhs LValue) (bool, uint8) {
 	if res, ok := numLE(lhs, rhs); ok {
-		return res
+		return res, mmSync
 	}
 	if ls, ok1 := lhs.(LString); ok1 {
 		if rs, ok2 := rhs.(LString); ok2 {
-			return strCmp(string(ls), string(rs)) <= 0
+			return strCmp(string(ls), string(rs)) <= 0, mmSync
 		}
 	}
 	return objectRationalWithError(L, lhs, rhs, "__le")
@@ -2849,7 +3119,10 @@ func opMMBIN(L *LState, inst uint32, baseframe *callFrame) int { //OP_MMBIN
 	dest := lbase + opGetArgA(pi)
 	p1 := reg.Get(lbase + A)
 	p2 := reg.Get(lbase + B)
-	v := objectArith(L, tmToArithOp(C), p1, p2, A, B)
+	v, st := objectArith(L, tmToArithOp(C), p1, p2, A, B)
+	if st != mmSync {
+		return mmSignal(st)
+	}
 	// this section is inlined by go-inline
 	// source function is 'func (rg *registry) Set(regi int, vali LValue) ' in '_state.go'
 	{
@@ -2890,7 +3163,10 @@ func opMMBINI(L *LState, inst uint32, baseframe *callFrame) int { //OP_MMBINI
 		p1, p2 = p2, p1
 		r1, r2 = r2, r1
 	}
-	v := objectArith(L, tmToArithOp(C), p1, p2, r1, r2)
+	v, st := objectArith(L, tmToArithOp(C), p1, p2, r1, r2)
+	if st != mmSync {
+		return mmSignal(st)
+	}
 	// this section is inlined by go-inline
 	// source function is 'func (rg *registry) Set(regi int, vali LValue) ' in '_state.go'
 	{
@@ -2931,7 +3207,10 @@ func opMMBINK(L *LState, inst uint32, baseframe *callFrame) int { //OP_MMBINK
 		p1, p2 = p2, p1
 		r1, r2 = r2, r1
 	}
-	v := objectArith(L, tmToArithOp(C), p1, p2, r1, r2)
+	v, st := objectArith(L, tmToArithOp(C), p1, p2, r1, r2)
+	if st != mmSync {
+		return mmSignal(st)
+	}
 	// this section is inlined by go-inline
 	// source function is 'func (rg *registry) Set(regi int, vali LValue) ' in '_state.go'
 	{
@@ -2962,7 +3241,10 @@ func opEQTest(L *LState, inst uint32, baseframe *callFrame) int { //OP_EQ
 	A := int(inst>>7) & 0xff  //GETA
 	B := int(inst>>16) & 0xff //GETB
 	k := int(inst>>15) & 1    //GETK
-	ret := equals(L, reg.Get(lbase+A), reg.Get(lbase+B), false)
+	ret, st := equals(L, reg.Get(lbase+A), reg.Get(lbase+B), false)
+	if st != mmSync {
+		return mmSignal(st)
+	}
 	condJump(cf, ret, k)
 	return 0
 }
@@ -2974,7 +3256,10 @@ func opLTTest(L *LState, inst uint32, baseframe *callFrame) int { //OP_LT
 	A := int(inst>>7) & 0xff  //GETA
 	B := int(inst>>16) & 0xff //GETB
 	k := int(inst>>15) & 1    //GETK
-	ret := lessThan(L, reg.Get(lbase+A), reg.Get(lbase+B))
+	ret, st := lessThan(L, reg.Get(lbase+A), reg.Get(lbase+B))
+	if st != mmSync {
+		return mmSignal(st)
+	}
 	condJump(cf, ret, k)
 	return 0
 }
@@ -2986,7 +3271,10 @@ func opLETest(L *LState, inst uint32, baseframe *callFrame) int { //OP_LE
 	A := int(inst>>7) & 0xff  //GETA
 	B := int(inst>>16) & 0xff //GETB
 	k := int(inst>>15) & 1    //GETK
-	ret := leValues(L, reg.Get(lbase+A), reg.Get(lbase+B))
+	ret, st := leValues(L, reg.Get(lbase+A), reg.Get(lbase+B))
+	if st != mmSync {
+		return mmSignal(st)
+	}
 	condJump(cf, ret, k)
 	return 0
 }
@@ -3000,7 +3288,7 @@ func opEQKTest(L *LState, inst uint32, baseframe *callFrame) int { //OP_EQK
 	A := int(inst>>7) & 0xff  //GETA
 	B := int(inst>>16) & 0xff //GETB
 	k := int(inst>>15) & 1    //GETK
-	ret := equals(L, reg.Get(lbase+A), cf.Fn.Proto.Constants[B], true)
+	ret, _ := equals(L, reg.Get(lbase+A), cf.Fn.Proto.Constants[B], true)
 	condJump(cf, ret, k)
 	return 0
 }
@@ -3042,6 +3330,7 @@ func opOrderI(L *LState, inst uint32, baseframe *callFrame) int { //OP_LTI..OP_G
 	ra := reg.Get(lbase + A)
 	im := int64(sC2int(B))
 	var cond bool
+	var st uint8
 	switch v := ra.(type) {
 	case LInteger:
 		i := int64(v)
@@ -3076,13 +3365,16 @@ func opOrderI(L *LState, inst uint32, baseframe *callFrame) int { //OP_LTI..OP_G
 			aux = LInteger(im)
 		}
 		if op == OP_GTI { // (a > imm) <=> __lt(imm, a)
-			cond = lessThan(L, aux, ra)
+			cond, st = lessThan(L, aux, ra)
 		} else if op == OP_GEI { // (a >= imm) <=> __le(imm, a)
-			cond = leValues(L, aux, ra)
+			cond, st = leValues(L, aux, ra)
 		} else if op == OP_LTI {
-			cond = lessThan(L, ra, aux)
+			cond, st = lessThan(L, ra, aux)
 		} else {
-			cond = leValues(L, ra, aux)
+			cond, st = leValues(L, ra, aux)
+		}
+		if st != mmSync {
+			return mmSignal(st)
 		}
 	}
 	condJump(cf, cond, k)
@@ -3090,8 +3382,11 @@ func opOrderI(L *LState, inst uint32, baseframe *callFrame) int { //OP_LTI..OP_G
 }
 
 // doReturn is the RETURN/RETURN0/RETURN1 core (the old OP_RETURN body).
+// U5d (row 22): the frame's own to-be-closed variables close as VM
+// frames (a yield inside a Lua __close suspends through them) tagged
+// with the kind-5 return continuation, and a RETURNING kind-4/5 __close
+// frame resumes the interrupted CLOSE/RETURN.
 func doReturn(L *LState, cf *callFrame, baseframe *callFrame, RA, nres, b int) int {
-	reg := L.reg
 	lbase := cf.LocalBase
 	// this section is inlined by go-inline
 	// source function is 'func (ls *LState) closeUpvalues(idx int) ' in '_state.go'
@@ -3113,10 +3408,57 @@ func doReturn(L *LState, cf *callFrame, baseframe *callFrame, RA, nres, b int) i
 			}
 		}
 	}
+	if cf.Pcall == 4 || cf.Pcall == 5 {
+		// a VM-called __close returned (its results are discarded —
+		// NRet=0): the close body's own tbc variables close Go-driven
+		// (a nested __close-in-__close cannot carry two continuations;
+		// yields inside it raise the boundary error — ledger row), then
+		// the interrupted close (4) or return (5) resumes
+		L.closeTBC(lbase)
+		L.stack.Pop()
+		owner := L.stack.Last()
+		L.currentFrame = owner
+		if cf.Pcall == 4 {
+			L.closeTBCVM(cf.ContB, 4, 0, cf.ContB)
+			return 0
+		}
+		if L.closeTBCVM(owner.LocalBase, 5, cf.ContRA, cf.ContB) {
+			return 0
+		}
+		return doReturnTail(L, owner, baseframe, cf.ContRA, cf.ContB, cf.ContB+1)
+	}
+	if cf.Pcall == 6 {
+		// a VM-dispatched metamethod returned (U5d): stage its results at
+		// the call window (one for value metamethods, none for
+		// __newindex), close the mm body's own tbc Go-driven (a nested
+		// <close> inside a metamethod cannot carry two continuations —
+		// same ruling as kinds 4/5), then complete the owner's
+		// interrupted instruction (vmFinishMM, stock luaV_finishOp)
+		L.closeTBC(lbase)
+		n := cf.NRet
+		if n > nres {
+			n = nres
+		}
+		copyReturnValues(L, cf.ReturnBase, RA, n, b)
+		L.stack.Pop()
+		owner := L.stack.Last()
+		L.currentFrame = owner
+		return vmFinishMM(L, owner, cf)
+	}
 	// U4: the frame's to-be-closed variables close at return too (stock
 	// RETURN k / luaF_close(base, CLOSEKTOP) — unconditional here: the
 	// list is empty when the function declared no <close>)
-	L.closeTBC(lbase)
+	if L.closeTBCVM(lbase, 5, RA, nres) {
+		return 0
+	}
+	return doReturnTail(L, cf, baseframe, RA, nres, b)
+}
+
+// doReturnTail is doReturn's tail — the return staging, the base-frame
+// delivery, and the marker/IsG handoff — after the frame's own closes
+// ran (or resumed).
+func doReturnTail(L *LState, cf *callFrame, baseframe *callFrame, RA, nres, b int) int {
+	reg := L.reg
 	n := cf.NRet
 	if cf.NRet == MultRet {
 		n = nres
@@ -3338,6 +3680,18 @@ func doReturn(L *LState, cf *callFrame, baseframe *callFrame, RA, nres, b int) i
 		}
 	}
 	L.currentFrame = L.stack.Last()
+	if !islast && L.currentFrame != nil && L.currentFrame.Pcall >= 1 && L.currentFrame.Pcall <= 3 {
+		// U5d (row 22): the body of a pcall/xpcall/pairs marker returned
+		// — complete it (prefix + restage at its return window, cascade
+		// over tailcall seams, deliver at the thread base). islast gates
+		// this to loop-driven bodies: a Lua __close under
+		// completeErrorMarker (or an xpcall msgh under runMsgh) returns
+		// with the marker revealed too, but it ran as a callR region's
+		// OWN baseframe — the Go caller owns its results; completing the
+		// marker here would deliver [true] early and kill the thread
+		// mid-close (coroutine.lua's `<close> versus pcall` block).
+		return L.completePcallMarker(true, LNil)
+	}
 	if islast || L.currentFrame == nil || L.currentFrame.Fn.IsG {
 		if L.currentFrame == nil && L.stack.IsEmpty() && L.Parent == nil && L != L.G.MainThread && !L.Dead {
 			// U4g (row 22's seam, the panic half — callGFunction's arm
@@ -3473,8 +3827,10 @@ func luaModulo(lhs, rhs LNumber) LNumber {
 // objectArith is the MMBIN-slot slow path (luaT_trybinTM); reg1/reg2
 // are the operands' frame-relative registers for the row-62 varinfo
 // hints (-1 for the MMBINI/MMBINK aux values, which stock's instack
-// cannot see either).
-func objectArith(L *LState, opcode int, lhs, rhs LValue, reg1, reg2 int) LValue {
+// cannot see either). The second return is the U5d metamethod dispatch
+// state: a suspended Lua metamethod leaves the arith mid-instruction
+// (the MMBIN's completion is vmFinishMM's).
+func objectArith(L *LState, opcode int, lhs, rhs LValue, reg1, reg2 int) (LValue, uint8) {
 	event := arithEvent(opcode)
 	if op := L.metaOp2(lhs, rhs, event); op != LNil {
 		// covers user metamethods AND the string metatable's arith
@@ -3486,11 +3842,14 @@ func objectArith(L *LState, opcode int, lhs, rhs LValue, reg1, reg2 int) LValue 
 		L.reg.Push(op)
 		L.reg.Push(lhs)
 		L.reg.Push(rhs)
-		L.Call(2, 1)
-		return L.reg.Pop()
+		v, st := L.callMM(2, 1, 0, 0)
+		if st != mmSync {
+			return LNil, st
+		}
+		return v, mmSync
 	}
 	if v, errText, res := arithCompute(opcode, lhs, rhs); res == arithDone {
-		return v
+		return v, mmSync
 	} else if res == arithRaise {
 		raiseArithError(L, errText, lhs, rhs, reg1, reg2)
 	}
@@ -3506,7 +3865,7 @@ func objectArith(L *LState, opcode int, lhs, rhs LValue, reg1, reg2 int) LValue 
 	}
 	L.RaiseError("attempt to perform %s on a %s value%s", what, L.objTypeName(bad), frameRegVarinfo(L, badreg))
 
-	return LNil
+	return LNil, mmSync
 }
 
 // raiseArithError: the numeric arithRaise texts. luaG_tointerror
@@ -3747,8 +4106,16 @@ func bitwiseInt(op int, x, y int64) int64 {
 
 // stringConcat is the OP_CONCAT core (luaV_concat); cf names the
 // frame for the row-62 varinfo hint (nil from host-API Concat, where
-// stock's varinfo sees a C frame and yields no name).
-func stringConcat(L *LState, total, last int, cf *callFrame) LValue {
+// stock's varinfo sees a C frame and yields no name). The second return
+// is the U5d metamethod dispatch state: a suspended Lua __concat leaves
+// the fold mid-instruction — vmFinishMM stages the metamethod result at
+// the folded pair's lhs cell (ContRA) and re-enters here with
+// (total=ContB, last=ContRA), which reproduces the post-dispatch fold
+// state exactly (the pair collapses; entry reads rhs at last,
+// pre-decrements total, starts the loop at last-1 — the sync path's
+// `rhs = v; total--; i--`). Go-context dispatches (host-API Concat)
+// are always mmSync.
+func stringConcat(L *LState, total, last int, cf *callFrame) (LValue, uint8) {
 	rhs := L.reg.Get(last)
 	total--
 	for i := last - 1; total > 0; {
@@ -3762,8 +4129,14 @@ func stringConcat(L *LState, total, last int, cf *callFrame) LValue {
 				L.reg.Push(op)
 				L.reg.Push(lhs)
 				L.reg.Push(rhs)
-				L.Call(2, 1)
-				rhs = L.reg.Pop()
+				// contA/contB carry the fold state at dispatch: i is the
+				// lhs being folded, total the candidates remaining
+				// including it
+				v, st := L.callMM(2, 1, i, total)
+				if st != mmSync {
+					return LNil, st
+				}
+				rhs = v
 				total--
 				i--
 			} else {
@@ -3779,7 +4152,7 @@ func stringConcat(L *LState, total, last int, cf *callFrame) LValue {
 					hint = protoVarinfo(L, cf, badreg-cf.LocalBase)
 				}
 				L.RaiseError("attempt to concatenate a %s value%s", L.objTypeName(bad), hint)
-				return LNil
+				return LNil, mmSync
 			}
 		} else {
 			buf := make([]string, total+1)
@@ -3796,7 +4169,7 @@ func stringConcat(L *LState, total, last int, cf *callFrame) LValue {
 			rhs = LString(strings.Join(buf, ""))
 		}
 	}
-	return rhs
+	return rhs, mmSync
 }
 
 // The four mixed int/float order comparisons below are ports of stock
@@ -3945,65 +4318,73 @@ func orderError(L *LState, lhs, rhs LValue) {
 // mixed-type/number early orderError was a 5.1-ism (5.1's ttype(l) !=
 // ttype(r) guard): with user metatables, `5.0 > a` must reach a's __lt
 // (events.lua's capture battery), and a number operand no longer masks
-// the other side's metamethod.
-func lessThan(L *LState, lhs, rhs LValue) bool {
+// the other side's metamethod. The second return is the U5d dispatch
+// state (a suspended __lt leaves the compare mid-instruction).
+func lessThan(L *LState, lhs, rhs LValue) (bool, uint8) {
 	if ret, ok := numLT(lhs, rhs); ok {
-		return ret
+		return ret, mmSync
 	}
 	if ls, ok1 := lhs.(LString); ok1 {
 		if rs, ok2 := rhs.(LString); ok2 {
-			return strCmp(string(ls), string(rs)) < 0
+			return strCmp(string(ls), string(rs)) < 0, mmSync
 		}
 	}
 	return objectRationalWithError(L, lhs, rhs, "__lt")
 }
 
-func equals(L *LState, lhs, rhs LValue, raw bool) bool {
+// equals is luaV_rawequalobj / luaV_equalobj (raw gates the __eq arm).
+// The second return is the U5d dispatch state: a suspended __eq leaves
+// the compare mid-instruction — vmFinishMM's OP_EQ arm answers the jump
+// with the metamethod's boolean.
+func equals(L *LState, lhs, rhs LValue, raw bool) (bool, uint8) {
 	lt := lhs.Type()
 	if lt != rhs.Type() {
 		// the two number subtypes compare numerically across types
 		if isNumberValue(lhs) && isNumberValue(rhs) {
-			return equalsNumber(lhs, rhs)
+			return equalsNumber(lhs, rhs), mmSync
 		}
-		return false
+		return false, mmSync
 	}
 
-	ret := false
 	switch lt {
 	case LTNil:
-		ret = true
+		return true, mmSync
 	case LTNumber, LTInteger:
-		ret = equalsNumber(lhs, rhs)
+		return equalsNumber(lhs, rhs), mmSync
 	case LTBool:
-		ret = bool(lhs.(LBool)) == bool(rhs.(LBool))
+		return bool(lhs.(LBool)) == bool(rhs.(LBool)), mmSync
 	case LTString:
-		ret = string(lhs.(LString)) == string(rhs.(LString))
+		return string(lhs.(LString)) == string(rhs.(LString)), mmSync
 	case LTUserData, LTTable:
 		if lhs == rhs {
-			ret = true
-		} else if !raw {
-			switch objectRational(L, lhs, rhs, "__eq") {
-			case 1:
-				ret = true
-			default:
-				ret = false
-			}
+			return true, mmSync
 		}
+		if raw {
+			return false, mmSync
+		}
+		r, st := objectRational(L, lhs, rhs, "__eq")
+		if st != mmSync {
+			return false, st
+		}
+		return r == 1, mmSync
 	default:
-		ret = lhs == rhs
+		return lhs == rhs, mmSync
 	}
-	return ret
 }
 
-func objectRationalWithError(L *LState, lhs, rhs LValue, event string) bool {
-	switch objectRational(L, lhs, rhs, event) {
+func objectRationalWithError(L *LState, lhs, rhs LValue, event string) (bool, uint8) {
+	r, st := objectRational(L, lhs, rhs, event)
+	if st != mmSync {
+		return false, st
+	}
+	switch r {
 	case 1:
-		return true
+		return true, mmSync
 	case 0:
-		return false
+		return false, mmSync
 	}
 	orderError(L, lhs, rhs)
-	return false
+	return false, mmSync
 }
 
 // objectRational is the metamethod comparison core (stock callbinTM's
@@ -4013,17 +4394,21 @@ func objectRationalWithError(L *LState, lhs, rhs LValue, event string) bool {
 // "metamethod '<ev>'", U4d) — with the boolean result mapped to 1/0;
 // -1 when neither operand has the event. The old fork guard required
 // the SAME function on both operands (a gopherlua artifact — stock 5.1
-// and 5.5 both call the first one found).
-func objectRational(L *LState, lhs, rhs LValue, event string) int {
+// and 5.5 both call the first one found). The second return is the U5d
+// dispatch state (a suspended order/__eq metamethod).
+func objectRational(L *LState, lhs, rhs LValue, event string) (int, uint8) {
 	if op := L.metaOp2(lhs, rhs, event); op != LNil {
 		L.reg.Push(op)
 		L.reg.Push(lhs)
 		L.reg.Push(rhs)
-		L.Call(2, 1)
-		if LVAsBool(L.reg.Pop()) {
-			return 1
+		v, st := L.callMM(2, 1, 0, 0)
+		if st != mmSync {
+			return -1, st
 		}
-		return 0
+		if LVAsBool(v) {
+			return 1, mmSync
+		}
+		return 0, mmSync
 	}
-	return -1
+	return -1, mmSync
 }

@@ -16,10 +16,19 @@ package testdiff
 // per-file official runs.
 //
 // Corpus discipline (inherited from _u1/_u4): level-1 errors only (row
-// 60), no create(pcall)+yield shapes (row 22), semerror texts
-// position-stripped through load(). The handler-exhausts-the-reserve
-// shape (row 78e's divergence: "stack overflow" vs "error in error
-// handling") is deliberately absent.
+// 60), semerror texts position-stripped through load(). U5d adds the
+// yield slice (coyield01–06, row 84): pcall/xpcall/pairs marker frames
+// (yields suspend through them; create(pcall)/wrap flavors; the
+// tailcall-into-marker slide), the noyield depth (the catchable
+// boundary error through sort/gsub/__tostring callbacks, isyieldable),
+// the pairs continuation marker + yielding for-iterators, kind-4/5
+// close continuations, and the kind-6 metamethod battery. The
+// handler-exhausts-the-reserve shape (row 78e's divergence: "stack
+// overflow" vs "error in error handling") and the C-metamethod-yield
+// shapes (row 84's divergence: stock lets a C-function metamethod yield
+// when dispatched from Lua code; the fork raises the boundary error)
+// are deliberately absent — coyield05.lua's header carries the excluded
+// shapes.
 
 import (
 	"testing"
