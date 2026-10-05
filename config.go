@@ -4,7 +4,6 @@ import (
 	"os"
 )
 
-var CompatVarArg = true
 var FieldsPerFlush = 50
 var RegistrySize = 256 * 20
 var RegistryGrowStep = 32

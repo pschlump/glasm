@@ -473,7 +473,10 @@ func baseSelect(L *LState) int {
 		if string(lv) != "#" {
 			L.ArgError(1, "invalid string '"+string(lv)+"'")
 		}
-		L.Push(LNumber(L.GetTop() - 1))
+		// stock pushes an INTEGER (lbaselib.c) — LNumber here printed
+		// "3.0" and failed math.type (caught by the U5b var03 boundary
+		// probe, row 81)
+		L.Push(LInteger(L.GetTop() - 1))
 		return 1
 	}
 	return 0

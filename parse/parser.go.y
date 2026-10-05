@@ -642,14 +642,6 @@ function:
 
 funcbody:
         '(' parlist ')' block TEnd {
-            // U3a: a named vararg param (5.5 `...t`) binds a placeholder
-            // local for the name so dead-branch bodies referencing it
-            // compile; the real vararg-table semantics are U5.
-            if name := $2.VArgName; name != "" {
-                la := &ast.LocalAssignStmt{Names: []string{name}, Exprs: []ast.Expr{&ast.TableExpr{Fields: []*ast.Field{}}}}
-                la.SetLine($1.Pos.Line)
-                $4 = append([]ast.Stmt{la}, $4...)
-            }
             $$ = &ast.FunctionExpr{ParList: $2, Stmts: $4}
             $$.SetLine($1.Pos.Line)
             $$.SetLastLine($5.Pos.Line)

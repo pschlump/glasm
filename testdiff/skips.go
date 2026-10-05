@@ -79,13 +79,9 @@ var gluaWasmSkips = map[string]string{
 // U2e un-skipped the row-56 integer/text families: the ABI v4 blob
 // speaks stock 5.5 semantics + texts, matching the interp's re-pins.
 var wasmTestsSkips = map[string]string{
-	// U2e (row 60): the 5.0-compat `arg` table is a 5.1-ism the v4 blob
-	// does not carry (rt_compat_arg dropped until U6); the interp's
-	// CompatVarArg dies at U5's vararg rework. The corpus regenerates
-	// with the U5/U6 vararg work.
-	"var08.lua": "compat `arg` table not on the v4 blob until U6 — row 60",
-	"var16.lua": "compat `arg` table not on the v4 blob until U6 — row 60",
-	"var20.lua": "compat `arg` table not on the v4 blob until U6 — row 60",
+	// U5b un-skipped var08/var16/var20 — the compat `arg` table is dead
+	// (row 60's clause closes with it); the corpus regenerated onto the
+	// pack-table / first-extra shapes.
 	// U2f: err00/err02 un-skipped — the interp's index/concat texts are
 	// re-pinned to stock, matching the blob.
 	// U3i (row 70d): gnf00/gnf01 un-skipped — the interp's number

@@ -1,12 +1,15 @@
 package testdiff
 
-// U5a gate (docs/U5-detailed-implementation-plan.md §3 U5a): the `_u5`
-// corpus, interp ↔ clua55 byte-exact — global declarations (forms,
+// U5 gate (docs/U5-detailed-implementation-plan.md §3): the `_u5`
+// corpus, interp ↔ clua55 byte-exact — U5a: global declarations (forms,
 // voiding, read-only, ERRNNIL redefinition, chain visibility, the
 // contextual-keyword ruling), RDKCTC promotion, goto and the collective
 // '*' scope, generic-for 4th-value TBC, the debug close window
 // (endpc = closepc+1), and the ERRORSTACKSIZE-analog frame reserve
-// (ledger row 78).
+// (ledger row 78). U5b: the vararg model — named reads/mutations, the
+// 'n' validation battery, shadowing/capture, tailcalls across the
+// hidden/table models, promotion, and the official idioms (row 81;
+// var01–var09).
 //
 // TestU5OfficialSuite (≥95%, vararg/locals/goto fully green) lands at
 // U5f with the remaining chunks; until then u5probe_test.go carries the

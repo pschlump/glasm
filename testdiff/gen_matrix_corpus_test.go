@@ -262,7 +262,7 @@ func TestGenMatrixCorpus(t *testing.T) {
 	add("var05", "local function g(a, b) return a + b end\nlocal function f(...) return g(...) end\nprint(f(3, 4))\n") // ... as sole call args
 	add("var06", "local t = {}\nfunction t.f(...) return ... end\nprint(t.f(1, 2))\n")
 	add("var07", "local function f(...) local n = 0\nfor _, v in ipairs({...}) do n = n + v end\nreturn n end\nprint(f(1, 2, 3))\n")                               // vararg iterator
-	add("var08", "local function f(...) return arg[1], arg.n end\nprint(f(7, 8))\n")                                                                               // compat arg contents
+	add("var08", "local function f(...) local t = table.pack(...) return t[1], t.n end\nprint(f(7, 8))\n")                                                        // vararg contents via pack (U5b: compat `arg` is dead — row 60 closes)
 	add("var09", "local function f(a, ...) return a, select('#', ...) end\nprint(f(1, 2, 3))\n")                                                                   // params + varargs split
 	add("var10", "local function f(...) return (...) end\nprint(f(9))\n")                                                                                          // single value
 	add("var11", "local function f(...) return ... end\nprint(f())\n")                                                                                             // zero varargs
@@ -270,11 +270,11 @@ func TestGenMatrixCorpus(t *testing.T) {
 	add("var13", "local function h(...) return ... end\nlocal function g(...) return h(...) end\nlocal function f(...) return g(2, ...) end\nprint(f(1, 2, 3))\n") // const+varargs, two levels (the M5b scratch-collision repro)
 	add("var14", "local function f(...) return select('#', ...) end\nprint(f('p', 'q'))\n")
 	add("var15", "local function f(a, b, ...) return a, b, ... end\nprint(f(1, 2, 3, 4))\n") // mixed params + varargs through
-	add("var16", "local function f(...) return arg.n end\nprint(f())\n")                     // arg.n with zero varargs
+	add("var16", "local function f(...) local t = table.pack(...) return t.n end\nprint(f())\n") // pack count with zero varargs (U5b)
 	add("var17", "local function f(...) return select(2, ...) end\nprint(f(1, 2, 3))\n")
 	add("var18", "local function f(...) return table.concat({...}, '-') end\nprint(f('a', 'b', 'c'))\n")
 	add("var19", "local function f(fmt, ...) return string.format(fmt, ...) end\nprint(f('%d-%s', 7, 'q'))\n") // leading fixed arg then varargs to a C function
-	add("var20", "local function f(...) local x = ... return arg == nil end\nprint(f(1, 2))\n")                // ... used → the arg local is never filled (compile.go:1188 clears NeedsArg) → nil, not the global
+	add("var20", "local function f(...) local x = ... return x == nil end\nprint(f(1, 2))\n")   // first extra's nil-ness (U5b: no compat arg local anymore)
 	// ---- tailcalls (M5c: the trampoline; staged for wasm-closure callees,
 	// rt_call fallback otherwise) ----
 	add("tco00", "local function f(n) if n == 0 then return 'done' end return f(n-1) end\nprint(f(100000))\n")                                                                                                     // flat 10⁵

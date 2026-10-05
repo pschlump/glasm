@@ -1,8 +1,9 @@
 package testdiff
 
-// TEMPORARY U5 planning probe (deleted at U5a): run the whole official
-// 5.5.1 suite interp↔clua55 and report per-file PASS/DIFF/SKIP so the
-// U5 plan's chunk inventory is grounded in the real failure set.
+// TEMPORARY U5 planning probe (deleted at U5f, when TestU5OfficialSuite
+// takes over): run the whole official 5.5.1 suite interp↔clua55 and
+// report per-file PASS/DIFF/SKIP so the U5 plan's chunk inventory is
+// grounded in the real failure set.
 
 import (
 	"os"
@@ -22,12 +23,11 @@ var u5ProbeSkips = func() map[string]string {
 		"gc.lua":        "row 79 (U5c): collectgarbage deep surface — the 5.4 \"param\" get/set protocol (gc.lua:31) and weak tables (__mode clearing) later in the file",
 		"gengc.lua":     "row 79 (U5c): generational-GC surface — gengc.lua:122 needs a minor collection to clear a __mode=\"kv\" table's entries",
 		"db.lua":        "debug.sethook/gethook family unimplemented (db.lua:16's gethook) — sethook precedent (row 77's errors.lua skip)",
+		"locals.lua":    "db.lua precedent: debug.sethook at locals.lua:842 (the to-be-closed-in-coroutines block) — green through :841, including the U5b vararg surface (the old :315 named-vararg blocker is fixed)",
 		"cstack.lua":    "row 78e: xpcall(loop, loop) at cstack.lua:29 — the handler itself overflows; the fork's frame reserve re-raises 'stack overflow' where stock says 'error in error handling'",
 		"calls.lua":     "row 78e: xpcall(loop, loop) at calls.lua:168 — the handler itself overflows; same dialect as cstack.lua:29 (fork re-raises 'stack overflow', stock says 'error in error handling')",
 		"goto.lua":      "row 77 precedent (U5c): debug.upvalueid at goto.lua:197 needs light userdata — same family as the errors.lua upvalueid skip",
-		"errors.lua":    "row 63 (U5b): named vararg — errors.lua:163's checkmessage runs 'local function foo (...t) return t.xx + 1' before anything else diverges (upvalueid at :262 is the U5c blocker behind it)",
-		"vararg.lua":    "row 63 (U5b): the vararg model rework — vararg.lua:5's 'local function f (a, ...t)' binds a placeholder local (GETVARG/opcode 81 is the U5b core); this file is the U5b gate",
-		"locals.lua":    "row 63 (U5b): named vararg — locals.lua:315's func2close(function (...t)) battery (the <close> function receives the vararg table)",
+		"errors.lua":    "row 63 successor (U5c): debug.upvalueid at errors.lua:262 needs light userdata — the vararg half (:163, named vararg) is fixed at U5b",
 		"coroutine.lua": "row 22 (U5d): yield inside a Go-function boundary — coroutine.create(pcall) + foo yields (coroutine.lua:277): resume returns the yield but the status reads 'dead' instead of 'suspended' (same seam as nextvar.lua:937's __pairs yield)",
 	}
 	for k, v := range clua55Skips {

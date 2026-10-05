@@ -844,15 +844,21 @@ func init() {
 				cf.NArgs = nargs
 				cf.NRet = cf.NRet
 				cf.TailCall++
-				lbase := cf.LocalBase
 				if meta {
 					cf.NArgs++
 					L.reg.Insert(lv, cf.LocalBase)
 				}
 				// +inline-call L.initCallFrame cf
-				// +inline-call L.reg.CopyRange base RA -1 reg.Top()-RA-1
+				// move the func cell + args (+ the nil window initCallFrame
+				// grew above them) down to the reused frame's base: after
+				// initCallFrame, top = RA+1+max(nargs, NumUsedRegisters),
+				// so the whole live span is exactly top-RA cells
+				// +inline-call L.reg.CopyRange base RA -1 reg.Top()-RA
 				cf.Base = base
-				cf.LocalBase = base + (cf.LocalBase - lbase + 1)
+				// U5b: no shift to undo — initCallFrame no longer shuffles
+				// vararg frames; the callee's own VARARGPREP (its first
+				// instruction) rebuilds the frame from Base
+				cf.LocalBase = base + 1
 			}
 			return 0
 		},
@@ -1056,7 +1062,50 @@ func init() {
 			lbase := cf.LocalBase
 			A := int(inst>>7) & 0xff //GETA
 			RA := lbase + A
+			B := int(inst>>16) & 0xff //GETB
 			C := int(inst>>24) & 0xff //GETC
+			k := int(inst>>15) & 1   //GETK
+			if k != 0 {
+				// U5b (luaT_getvarargs, table model): the count is the
+				// vararg table's 'n' and the values come from the table —
+				// raw reads (no metamethod consult for '...'), nil-padded;
+				// user edits of t.n/t[i] are honored. B is the table's
+				// register (the compiler's numparams).
+				tb, ok := reg.Get(lbase+B).(*LTable)
+				if !ok {
+					L.RaiseError("vararg table has no proper 'n'")
+				}
+				nargs := 0
+				switch nv := tb.RawGetString("n").(type) {
+				case LInteger:
+					// stock getnumargs: LUA_VNUMINT tag and the unsigned
+					// l_castS2U(ivalue) <= INT_MAX/2 (negatives fail)
+					if nv >= 0 && nv <= 1073741823 {
+						nargs = int(nv)
+					} else {
+						L.RaiseError("vararg table has no proper 'n'")
+					}
+				default:
+					L.RaiseError("vararg table has no proper 'n'")
+				}
+				nwant := C - 1
+				if C == 0 { // multret: all available, top moves
+					nwant = nargs
+				}
+				touse := nwant
+				if nargs < touse {
+					touse = nargs
+				}
+				for i := 0; i < nwant; i++ {
+					if i < touse {
+						reg.Set(RA+i, tb.RawGetInt(i+1))
+					} else {
+						reg.Set(RA+i, LNil)
+					}
+				}
+				reg.SetTop(RA + nwant)
+				return 0
+			}
 			nparams := int(cf.Fn.Proto.NumParameters)
 			nvarargs := cf.NArgs - nparams
 			if nvarargs < 0 {
@@ -1066,13 +1115,49 @@ func init() {
 			if C == 0 {
 				nwant = nvarargs
 			}
+			// hidden model: the extras live at [cf.Base+nparams+1,
+			// LocalBase) — the same cells VARARGPREP's shift left them in
 			// +inline-call reg.CopyRange RA cf.Base+nparams+1 cf.LocalBase nwant
 			return 0
 		},
 		func(L *LState, inst uint32, baseframe *callFrame) int { //OP_GETVARG
-			// 5.5 vararg parameters-as-tables; the parser does not
-			// produce this opcode yet (U5)
-			L.RaiseError("OP_GETVARG not supported until U5")
+			// U5b (luaT_getvararg): the named vararg parameter's indexed
+			// read in the hidden model — an integral key 1..nextra yields
+			// the hidden argument (tointegerns: a float with an exact
+			// integer value counts), the string "n" yields nextra as an
+			// INTEGER, anything else nil. Runs only hidden: a promoted
+			// function's GETVARGs were rewritten to GETTABLE at finish.
+			reg := L.reg
+			cf := L.currentFrame
+			lbase := cf.LocalBase
+			A := int(inst>>7) & 0xff  //GETA
+			C := int(inst>>24) & 0xff //GETC
+			RA := lbase + A
+			nextra := cf.NArgs - int(cf.Fn.Proto.NumParameters)
+			if nextra < 0 {
+				nextra = 0
+			}
+			n := int64(0)
+			isint := false
+			switch key := reg.Get(lbase + C).(type) {
+			case LInteger:
+				n, isint = int64(key), true
+			case LNumber:
+				if iv, ok := floatToIntExact(float64(key)); ok {
+					n, isint = iv, true
+				}
+			case LString:
+				if key == "n" {
+					reg.Set(RA, LInteger(nextra))
+					return 0
+				}
+			}
+			// stock's unsigned range check l_castS2U(n)-1 < nextra
+			if isint && n-1 >= 0 && n-1 < int64(nextra) {
+				reg.Set(RA, reg.Get(lbase-nextra+int(n)-1))
+				return 0
+			}
+			reg.Set(RA, LNil)
 			return 0
 		},
 		func(L *LState, inst uint32, baseframe *callFrame) int { //OP_ERRNNIL
@@ -1093,8 +1178,49 @@ func init() {
 			return 0
 		},
 		func(L *LState, inst uint32, baseframe *callFrame) int { //OP_VARARGPREP
-			// thin marker: the frame shuffle happens at call time (the
-			// 5.4+ vararg model is U5; ledger row)
+			// U5b (luaT_adjustvarargs): build the vararg frame. The
+			// operands are decorative (stock emits A=0) — the model comes
+			// from the proto's flag. Hidden (default): copy the fixed
+			// parameters above the extra arguments; the extras then live
+			// at [LocalBase-nextra, LocalBase), addressed by OP_VARARG/
+			// OP_GETVARG. cf.Base stays the original func cell — the
+			// fork's Base never moves (stock instead moves its func.p;
+			// the frame geometry below Base+1 is identical). Table
+			// (promoted): build {1..n, n=n} into the parameter slot
+			// (register np), no shift — the extras' cells die, the table
+			// owns their values.
+			reg := L.reg
+			cf := L.currentFrame
+			proto := cf.Fn.Proto
+			np := int(proto.NumParameters)
+			nextra := cf.NArgs - np
+			if nextra < 0 {
+				nextra = 0
+			}
+			lbase := cf.LocalBase
+			if proto.IsVarArg&VarArgTable != 0 {
+				// createvarargtab: raw {1..n, n=n}; 'n' is an INTEGER
+				// (stock setivalue — math.type(t.n) == "integer")
+				tb := newLTable(nextra, 1)
+				for i := 0; i < nextra; i++ {
+					tb.RawSetInt(i+1, reg.Get(lbase+np+i))
+				}
+				tb.RawSetString("n", LInteger(nextra))
+				reg.Set(lbase+np, tb)
+				return 0
+			}
+			newbase := lbase + np + nextra // just above all the arguments
+			// grow to the shifted window first: SetTop nil-fills the region
+			// the parameter copies land in (it always grows — the new top
+			// is never below the old one), and the copies stay disjoint
+			// from their sources (dst starts at src end + nextra)
+			reg.SetTop(newbase + int(proto.NumUsedRegisters))
+			for i := 0; i < np; i++ {
+				reg.array[newbase+i] = reg.array[lbase+i]
+				reg.array[lbase+i] = LNil // erase the original (stock parity, GC)
+			}
+			reg.array[newbase+np] = LNil // the vararg parameter slot
+			cf.LocalBase = newbase
 			return 0
 		},
 		func(L *LState, inst uint32, baseframe *callFrame) int { //OP_EXTRAARG

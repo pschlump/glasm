@@ -508,11 +508,16 @@ Local variable kinds (U4+U5; stock lparser.h's VDK* numbers).
 const (
 	varKindReg         = 0 // VDKREG — a regular local
 	varKindConst       = 1 // RDKCONST — <const>: assignment-locked
+	varKindVararg      = 2 // RDKVAVAR — the named vararg parameter (U5b): assignment-locked (check_readonly), indexed reads compile as OP_GETVARG, any whole-value use promotes the function to the table model
 	varKindTBC         = 3 // RDKTOCLOSE — <close>: assignment-locked + OP_TBC
 	varKindCTC         = 4 // RDKCTC — register-less compile-time constant (U5a)
 	varKindGlobalReg   = 5 // GDKREG — a declared global (U5a)
 	varKindGlobalConst = 6 // GDKCONST — a declared read-only global / collective
 )
+
+// varargTableName is the debug name of an unnamed vararg parameter
+// (stock's new_localvarliteral "(vararg table)").
+const varargTableName = "(vararg table)"
 
 // kindHasRegister reports whether an entry of this kind occupies a stack
 // slot (stock's adjustlocalvars vs. the register-less RDKCTC/GDK kinds).
@@ -606,6 +611,23 @@ type funcContext struct {
 	// owning block leaves). OP_TAILCALL promotion is suppressed while
 	// set — the frame's closes must not be skipped.
 	tbcActive int
+	// vatab (stock fs->needvatab): this vararg function needs the TABLE
+	// model — some whole-value use / index write / upvalue capture of the
+	// named vararg parameter promoted it (luaK_dischargevars/storevar/
+	// singlevaraux calls luaK_vapar2local; the fork records the need and
+	// finishes at function end). The finish pass flips IsVarArg to
+	// VarArgTable, rewrites GETVARG→GETTABLE and sets VARARG k=1; the
+	// interpreter's VARARGPREP then builds {1..n, n=n} into the param slot
+	// instead of hiding the extras below the frame base.
+	vatab bool
+}
+
+// promoteVatab marks a vararg function as needing the table model (stock
+// luaK_vapar2local's effect, deferred): the call sites are every whole-value
+// use of the named vararg parameter (compileExpr IdentExpr), its indexed
+// writes, and upvalue captures of it. Unnamed `...` functions stay hidden.
+func (fc *funcContext) promoteVatab() {
+	fc.vatab = true
 }
 
 func newFuncContext(sourcename string, parent *funcContext) *funcContext {
@@ -1965,6 +1987,12 @@ func compileReturnStmt(context *funcContext, stmt *ast.ReturnStmt) { // {{{
 			// U5a: an RDKCTC name has no register — return as a constant
 			// through the generic path, not RETURN1 of regOfVar's -1
 			if idx := context.FindLocalVar(ex.Value); idx > -1 && context.kindOfVar(idx) != varKindCTC {
+				// U5b: `return t` of the named vararg parameter is a
+				// whole-value use — promote (the table then sits in the
+				// slot the RETURN1/RETURN reads)
+				if context.kindOfVar(idx) == varKindVararg {
+					context.promoteVatab()
+				}
 				reg := context.regOfVar(idx)
 				if kc != 0 {
 					code.AddABCk(OP_RETURN, reg, 2, 0, 1, sline(stmt))
@@ -2422,21 +2450,48 @@ func compileExpr(context *funcContext, reg int, expr ast.Expr, ec *expcontext) i
 		case ecUpvalue:
 			code.AddABC(OP_GETUPVAL, sreg, context.Upvalues.RegisterUnique(ex.Value), 0, sline(ex))
 		case ecLocal:
-			b := context.regOfVar(context.FindLocalVar(ex.Value))
-			code.AddABC(OP_MOVE, sreg, b, 0, sline(ex))
+			idx := context.FindLocalVar(ex.Value)
+			// U5b (stock luaK_dischargevars' VVARGVAR arm): a whole-value
+			// use of the named vararg parameter promotes the function to
+			// the table model (luaK_vapar2local) — the register then holds
+			// the vararg table and the read is a plain MOVE like any local.
+			if context.kindOfVar(idx) == varKindVararg {
+				context.promoteVatab()
+			}
+			code.AddABC(OP_MOVE, sreg, context.regOfVar(idx), 0, sline(ex))
 		}
 		return sused
 	case *ast.Comma3Expr:
-		if context.Proto.IsVarArg == 0 {
+		if context.Proto.IsVarArg&VarArgAny == 0 {
 			raiseCompileError(context, sline(ex), "cannot use '...' outside a vararg function")
 		}
-		context.Proto.IsVarArg &= ^VarArgNeedsArg
-		code.AddABCk(OP_VARARG, sreg, 0, 2+ec.varargopt, 0, sline(ex))
+		// B = numparams: under the table model the vararg table sits in
+		// register np, and OP_VARARG's k bit (set by the finish pass for
+		// promoted functions) selects "count comes from the table" — the
+		// runtime reads it at ci->func.p + B + 1, i.e. register B (stock
+		// lparser.c:1291 emits B=numparams at the use site; luaT_getvarargs
+		// resolves hvalue(func.p+B+1)). Hidden model ignores B.
+		code.AddABCk(OP_VARARG, sreg, int(context.Proto.NumParameters), 2+ec.varargopt, 0, sline(ex))
 		if context.RegTop() > (sreg+2+ec.varargopt) || ec.varargopt < -1 {
 			return 0
 		}
 		return (sreg + 1 + ec.varargopt) - reg
 	case *ast.AttrGetExpr:
+		// U5b (stock luaK_indexed's VVARGIND arm): an indexed READ of the
+		// named vararg parameter compiles as OP_GETVARG — the key ALWAYS in
+		// a fresh register (stock luaK_exp2anyreg, even constants), B the
+		// vararg slot's register. It runs only in the hidden model; the
+		// finish pass rewrites it to GETTABLE for a promoted function
+		// (A=dest, B=table register, C=key register).
+		if ident, ok := ex.Object.(*ast.IdentExpr); ok {
+			if idx := context.FindLocalVar(ident.Value); idx > -1 && context.kindOfVar(idx) == varKindVararg {
+				keyreg := reg
+				reg++
+				compileExpr(context, keyreg, ex.Key, ecnone(0))
+				code.AddABC(OP_GETVARG, sreg, context.regOfVar(idx), keyreg, sline(ex))
+				return sused
+			}
+		}
 		a := sreg
 		b := reg
 		compileExprWithMVPropagation(context, ex.Object, &reg, &b)
@@ -2490,6 +2545,14 @@ func compileExpr(context *funcContext, reg int, expr ast.Expr, ec *expcontext) i
 		for _, upvalue := range childcontext.Upvalues.List() {
 			localidx, block := context.FindLocalVarAndBlock(upvalue.Name)
 			if localidx > -1 {
+				// U5b (stock singlevaraux's capture arm, lparser.c): an
+				// upvalue capture of the named vararg parameter promotes
+				// the OWNING function to the table model — the upvalue cell
+				// then holds the table. Passthrough levels need nothing:
+				// their own capture resolves at the owning level's walk.
+				if context.kindOfVar(localidx) == varKindVararg {
+					context.promoteVatab()
+				}
 				childcontext.Proto.Upvalues = append(childcontext.Proto.Upvalues,
 					Upvaldesc{InStack: true, Idx: uint8(context.regOfVar(localidx)), Name: upvalue.Name})
 				block.RefUpvalue = true
@@ -2661,21 +2724,38 @@ func compileFunctionExpr(context *funcContext, funcexpr *ast.FunctionExpr, ec *e
 		context.RegisterLocalVar(name)
 	}
 	if funcexpr.ParList.HasVargs {
-		if CompatVarArg {
-			context.Proto.IsVarArg = VarArgHasArg | VarArgNeedsArg
-			if context.Parent != nil {
-				context.RegisterLocalVar("arg")
-			}
+		// U5b (stock parlist, lparser.c): `...` reserves the after-params
+		// register slot via a pool entry AT NumParameters — named
+		// (RDKVAVAR: indexed reads are OP_GETVARG, whole-value uses /
+		// writes / captures promote the table model, assignment-locked)
+		// or the unnamed placeholder (stock's new_localvarliteral
+		// "(vararg table)"). NumParameters counts the fixed params only,
+		// so the slot is register np — the extras' first cell in the
+		// hidden layout, the vararg table's cell in the table layout.
+		context.Proto.IsVarArg = VarArgHidden
+		if name := funcexpr.ParList.VArgName; name != "" {
+			context.RegisterLocalVarKind(name, varKindVararg)
+		} else if context.Parent != nil {
+			context.RegisterLocalVar(varargTableName)
 		}
-		context.Proto.IsVarArg |= VarArgIsVarArg
+		// mainfunc exception (stock lparser.c): the main chunk calls
+		// setvararg directly — VARARGPREP but no locvar AND no
+		// reserved slot, so main's locals start at register 0 like
+		// stock's main proto. That keeps DbgLocals' entry order ==
+		// register order, which varinfo's localNameAt(reg+1)
+		// convention depends on ("(local 'x')" hints). The unnamed
+		// slot is unreferenceable anyway (no name to resolve).
 	}
-	// VARARGPREP opens every vararg proto (stock's first instruction).
-	// The fork's frame shuffle stays at call time — this is a marker the
-	// interpreter no-ops (the 5.4+ vararg model is U5; ledger row).
+	// VARARGPREP is every vararg proto's first instruction (stock
+	// setvararg: A=0,0,0 — the runtime reads numparams from the proto).
+	// U5b: the interpreter runs it for real — hidden model copies the
+	// fixed params above the extra arguments, table model (a promoted
+	// function) builds {1..n, n=n} into the param slot. Non-vararg protos
+	// emit nothing.
 	if context.Proto.IsVarArg != 0 {
-		context.Code.AddABC(OP_VARARGPREP, int(context.Proto.NumParameters), 0, 0, context.Proto.LineDefined)
+		context.Code.AddABC(OP_VARARGPREP, 0, 0, 0, context.Proto.LineDefined)
 	}
-	// the root block's entry level: parameters (+ compat 'arg') only
+	// the root block's entry level: parameters (+ the vararg slot) only
 	context.Block.entryNactvar = context.BlockLocalVarsCount()
 
 	compileChunk(context, funcexpr.Stmts, false)
@@ -2694,6 +2774,57 @@ func compileFunctionExpr(context *funcContext, funcexpr *ast.FunctionExpr, ec *e
 	// instruction that must still see the locals
 	context.EndScope(true)
 	context.finishFunctionGotos()
+	// U5b (stock luaK_finish, the vararg half): the deferred finalization,
+	// run only now — a promoting use or <close> declaration may follow an
+	// already-compiled return, so every RETURN0/1 must survive to here.
+	// A promoted function flips to the table model (VATAB clears VAHID);
+	// GETVARG becomes GETTABLE (A=dest, B=the table's register, C=key
+	// register) and VARARG gets k=1 (B already carries numparams, the
+	// table's register). Every return of a hidden-model function signals
+	// it via C=numparams+1 (the runtime un-shifts the frame); RETURN0/1 —
+	// which cannot carry C — become RETURN first (B=1/B=2, the fork's
+	// nres+1 convention, unlike stock's top-relative B=0) together with
+	// the close k bit.
+	np := int(context.Proto.NumParameters)
+	vahid := context.Proto.IsVarArg&VarArgHidden != 0
+	if context.vatab {
+		context.Proto.IsVarArg = VarArgTable
+		vahid = false
+	}
+	needret := context.NeedsClose || vahid
+	if needret || context.vatab {
+		for pc := 0; pc < context.Code.pc; pc++ {
+			switch op := opGetOpCode(context.Code.At(pc)); op {
+			case OP_RETURN0, OP_RETURN1:
+				if !needret {
+					break
+				}
+				context.Code.SetOpCode(pc, OP_RETURN)
+				context.Code.SetB(pc, boolInt(op == OP_RETURN1)+1)
+				if context.NeedsClose {
+					context.Code.Setk(pc, 1)
+				}
+				if vahid {
+					context.Code.SetC(pc, np+1)
+				}
+			case OP_RETURN, OP_TAILCALL:
+				if context.NeedsClose {
+					context.Code.Setk(pc, 1)
+				}
+				if vahid {
+					context.Code.SetC(pc, np+1)
+				}
+			case OP_GETVARG:
+				if context.vatab {
+					context.Code.SetOpCode(pc, OP_GETTABLE)
+				}
+			case OP_VARARG:
+				if context.vatab {
+					context.Code.Setk(pc, 1)
+				}
+			}
+		}
+	}
 	context.Proto.Code = context.Code.List()
 	context.Proto.DbgSourcePositions = context.Code.PosList()
 	context.Proto.DbgUpvalues = context.Upvalues.Names()
@@ -3229,7 +3360,13 @@ func compileLogicalOpExprAux(context *funcContext, reg int, expr ast.Expr, ec *e
 	isLastOr := thenlabel == lb.e && hasnextcond
 
 	if ident, ok := expr.(*ast.IdentExpr); ok && (isLastAnd || isLastOr) && getIdentRefType(context, context, ident) == ecLocal {
-		b := context.regOfVar(context.FindLocalVar(ident.Value))
+		idx := context.FindLocalVar(ident.Value)
+		// U5b: TESTSET/TEST of the named vararg parameter is a whole-value
+		// use (the truth test reads the table) — promote
+		if context.kindOfVar(idx) == varKindVararg {
+			context.promoteVatab()
+		}
+		b := context.regOfVar(idx)
 		op := OP_TESTSET
 		if sreg == b {
 			op = OP_TEST
@@ -3507,6 +3644,11 @@ func envAccess(context *funcContext) (localReg, upvalIdx int) {
 		// U5a: the consumers use this as a REGISTER operand (GETFIELD/
 		// SETFIELD B) — regOfVar, never the flat index (a `global *`
 		// preamble shifts flat indices without shifting registers)
+		// U5b: a vararg parameter named _ENV is used as a whole value
+		// (the environment table operand) — promote
+		if context.kindOfVar(idx) == varKindVararg {
+			context.promoteVatab()
+		}
 		return context.regOfVar(idx), -1
 	}
 	return -1, context.Upvalues.RegisterUnique(envUpvalueName)

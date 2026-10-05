@@ -5,11 +5,22 @@ import (
 	"strings"
 )
 
+// Vararg model flags (U5b, stock lobject.h PF_*): every vararg function
+// starts hidden-args (VARARGPREP copies func+params above the extras and
+// shifts the frame); a whole-value use / index write / upvalue capture of
+// the named parameter promotes the function to the table model at finish
+// time (needvatab — VARARGPREP then builds {1..n, n=n} into the param
+// slot, GETVARG rewrites to GETTABLE, VARARG gets k=1). NumParameters
+// counts the fixed params only — the vararg parameter itself occupies the
+// register AT NumParameters, reserved by parlist like stock's
+// `adjustlocalvars(ls, 1)` + `luaK_reserveregs`.
 const (
-	VarArgHasArg   uint8 = 1
-	VarArgIsVarArg uint8 = 2
-	VarArgNeedsArg uint8 = 4
+	VarArgHidden uint8 = 1 // PF_VAHID — hidden extra args (stock default)
+	VarArgTable  uint8 = 2 // PF_VATAB — materialized vararg table
 )
+
+// VarArgAny is the isvararg(p) test mask (either model marks the proto).
+const VarArgAny = VarArgHidden | VarArgTable
 
 type DbgLocalInfo struct {
 	Name    string

@@ -367,6 +367,11 @@ shape (the vararg.lua battery is the gate).
   fully green.
 - `collectgarbage("param")`: the 6 params, old-value return, optional set (D10: accepted,
   interp no-op storage — ledger row for the no-op).
+- `debug.getinfo` option-filtered fields (deferred from U5b, where §3 first named
+  `extraargs`): stock 'u' adds `nparams`/`isvararg`, 't' adds `istailcall`/`extraargs`
+  (ldblib.c:178-198) — the fork's getinfo returns one unconditional field set. Part of the
+  db.lua/debug surface this chunk owns (no U5b gate observes it — vararg.lua never calls
+  getinfo; the db.lua skip covers it until then).
 
 ### U5d — row-22 yields
 
@@ -510,3 +515,52 @@ history, this file's status log); memory; delete `testdiff/u5probe_test.go`.
   row 78e; nextvar (:937)/coroutine (:277, yield-inside-pcall leaves the thread "dead") →
   row 22 (U5d). **TestU5ProbeOfficialSuite 18/18 (100% of non-skipped).** En route:
   collectgarbage("generational"/"incremental") now tracks and returns the previous mode.
+- **U5b (2026-10-05)** — the vararg model rework landed (ledger row 81). Compiler: parlist
+  reserves the after-params slot (`...t` binds varKindVararg at register NumParameters —
+  NumParameters excludes the slot; the unnamed "(vararg table)" locvar for parlist
+  functions, and NOTHING for the main chunk — stock mainfunc parity, which also keeps
+  DbgLocals entry order == register order, the alignment varinfo's localNameAt(reg+1)
+  convention needs for `(local 'x')` hints); real OP_VARARGPREP first-instruction (A=0,
+  decorative operands — the model comes from the proto's VarArgHidden/VarArgTable flag);
+  the luaK_finish pass (whole-value use/capture/write promotes the function to the table
+  model, rewrites emitted GETVARGs to GETTABLEs, fixes RETURN C=numparams+1 and
+  RETURN0/1→RETURN B=1/2); the luaK_indexed port (t[expr] reads → OP_GETVARG). Interpreter:
+  no-shuffle initCallFrame (cf.Base never moves; nil-fill window max(nargs,
+  NumUsedRegisters)); VARARGPREP builds hidden (params copied above the extras, LocalBase
+  lifts — extras at [LocalBase-nextra, LocalBase)) or table ({1..n, n=INTEGER} into
+  register np, no shift); OP_GETVARG (integer/exact-integral-float 1..nextra, "n"→INTEGER
+  nextra, else nil); table-arm OP_VARARG validates t.n as a numint in [0, INT_MAX/2] else
+  `vararg table has no proper 'n'`; the tailcall dance re-calibrated (the live span to the
+  reused frame base is exactly reg.Top()-RA cells). **CompatVarArg and `arg` are dead** —
+  what remains is a host surface: every driver (cmd/glua, the testdiff interp engine,
+  luawasm55.c) seeds global `arg = {[0]=chunkname}` identically, invisible to gates; the
+  corpus clears it before asserting the language surface. En-route bug fixes: OP_VARARG's
+  k bit is bit 15 (was decoded from bit 25 — a C=2 single-value use took the table arm on
+  hidden frames, vararg.lua:51) and the tailcall count above (vararg.lua:61). Gate state:
+  TestU5Gate 15/15 with `_u5/var01–var09` added (named reads, the mutation battery, 'n'
+  validation incl. the 2^30 edges, shadowing/capture, tailcalls across the models,
+  promotion through returns, the official idioms); vararg.lua byte-identical
+  interp↔clua55; `_wasm-tests` var08/16/20 regenerated onto pack-table shapes and
+  un-skipped (row 60's rt_compat_arg clause closes — no engine compiles `arg` code);
+  TestCLua55Conformance 30/30 on both hosts; TestWasmFullMatrix/ErrorSuite/GluaFull and
+  the U1/U2/U2f gates all green; TestU5ProbeOfficialSuite 19/19 (vararg.lua returned to
+  the non-skipped set). Row 82 records the pre-existing check_match parser-diagnostics
+  family (`')' expected` et al. vs our `unexpected symbol`), surfaced by the var06
+  battery — those shapes stay out of the corpora until grammar error productions land.
+  Deviations from §3: IsNamedVarArg became the VarArgHidden/VarArgTable proto flags
+  (stock's PF_VAHID/PF_VATAB shape); VARARGPREP keeps stock's A=0 (not A=numparams);
+  `debug.getinfo 't' extraargs` deferred to U5c (above); the wasm backend still panics on
+  OP_GETVARG (row 81's open seam — named-vararg code is interp/clua55-only until the U6
+  blob work).
+  Late addendum (same day): the boundary probe found two corpus-masking
+  bugs — `select('#', ...)` pushed an LNumber where stock pushes an
+  INTEGER (baselib.go; invisible because `3 == 3.0` and %.14g prints
+  integral floats bare, and var02/var03's count prints sat after a
+  staging raise that killed the chunk in both engines), and both files'
+  `pcall(select, '#', ...)` batteries were uncatchable by construction
+  (the '...' staging raise belongs to the owning frame — the wrap must
+  be around the whole vararg function); var02/var03 rewritten
+  accordingly (var03's `mk(3)` pins the integer count; var02's
+  restored() pins the same-table restore), and the passing-boundary
+  capacity texts ("registry overflow" vs "stack overflow") are excluded
+  as row 81's e2 clause.

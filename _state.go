@@ -1138,66 +1138,24 @@ func (ls *LState) initCallFrame(cf *callFrame) { // +inline-start
 			nargs = np
 			ls.reg.top = newSize
 		}
-
-		if (proto.IsVarArg & VarArgIsVarArg) == 0 {
-			if nargs < int(proto.NumUsedRegisters) {
-				nargs = int(proto.NumUsedRegisters)
-			}
-			newSize := cf.LocalBase + nargs
-			// +inline-call ls.reg.checkSize newSize
-			for i := np; i < nargs; i++ {
-				ls.reg.array[cf.LocalBase+i] = LNil
-			}
-			ls.reg.top = cf.LocalBase + int(proto.NumUsedRegisters)
-		} else {
-			/* swap vararg positions:
-					   closure
-					   namedparam1 <- lbase
-					   namedparam2
-					   vararg1
-					   vararg2
-
-			           TO
-
-					   closure
-					   nil
-					   nil
-					   vararg1
-					   vararg2
-					   namedparam1 <- lbase
-					   namedparam2
-			*/
-			nvarargs := nargs - np
-			if nvarargs < 0 {
-				nvarargs = 0
-			}
-
-			ls.reg.SetTop(cf.LocalBase + nargs + np)
-			for i := 0; i < np; i++ {
-				//ls.reg.Set(cf.LocalBase+nargs+i, ls.reg.Get(cf.LocalBase+i))
-				ls.reg.array[cf.LocalBase+nargs+i] = ls.reg.array[cf.LocalBase+i]
-				//ls.reg.Set(cf.LocalBase+i, LNil)
-				ls.reg.array[cf.LocalBase+i] = LNil
-			}
-
-			if CompatVarArg {
-				ls.reg.SetTop(cf.LocalBase + nargs + np + 1)
-				if (proto.IsVarArg & VarArgNeedsArg) != 0 {
-					argtb := newLTable(nvarargs, 0)
-					for i := 0; i < nvarargs; i++ {
-						argtb.RawSetInt(i+1, ls.reg.Get(cf.LocalBase+np+i))
-					}
-					argtb.RawSetString("n", LNumber(nvarargs))
-					//ls.reg.Set(cf.LocalBase+nargs+np, argtb)
-					ls.reg.array[cf.LocalBase+nargs+np] = argtb
-				} else {
-					ls.reg.array[cf.LocalBase+nargs+np] = LNil
-				}
-			}
-			cf.LocalBase += nargs
-			maxreg := cf.LocalBase + int(proto.NumUsedRegisters)
-			ls.reg.SetTop(maxreg)
+		// U5b: no call-time vararg shuffle — the extra arguments stay in
+		// the window at registers np..nargs-1 (stock's layout: a callee's
+		// cells above its params hold the caller's extras until its own
+		// code overwrites them), and the frame is built by OP_VARARGPREP,
+		// every vararg proto's first instruction: hidden model copies the
+		// fixed params above the extras, table model builds {1..n, n=n}
+		// into register np. The nil window fill starts above ALL arguments
+		// so the extras survive until the prep runs.
+		lo := nargs
+		if nr := int(proto.NumUsedRegisters); nr > lo {
+			lo = nr
 		}
+		newSize := cf.LocalBase + lo
+		// +inline-call ls.reg.checkSize newSize
+		for i := nargs; i < lo; i++ {
+			ls.reg.array[cf.LocalBase+i] = LNil
+		}
+		ls.reg.top = newSize
 	}
 } // +inline-end
 

@@ -1,2 +1,2 @@
-local function f(...) return arg.n end
+local function f(...) local t = table.pack(...) return t.n end
 print(f())

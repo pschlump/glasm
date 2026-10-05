@@ -98,7 +98,7 @@ func (fe *funcEmitter) scratchAddr(k int) *wasm.Function {
 func (fe *funcEmitter) scratchDyn0() *wasm.Function {
 	f := fe.f
 	base := f.LocalGet(0).I32Const(int32(cellSize * frameCells(fe.nregs))).I32Add()
-	if fe.proto.IsVarArg&lua.VarArgIsVarArg == 0 {
+	if fe.proto.IsVarArg&lua.VarArgAny == 0 {
 		return base
 	}
 	// + 16 * max(0, nargs - np) — Select keeps live locals untouched
