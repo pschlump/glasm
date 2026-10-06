@@ -11,7 +11,7 @@ func diffCase(t *testing.T, name, src string) {
 	t.Helper()
 	interpLog := NewInterp("interp").Run(Case{Name: name, Dir: ".", Source: []byte(src)})
 	wasmLog := (&WasmEngine{name: "wasm", SkipUnsupported: true}).Run(Case{Name: name, Dir: ".", Source: []byte(src)})
-	if d := DiffLogs(interpLog, wasmLog, true); d != "" {
+	if d := DiffLogs(interpLog, wasmLog); d != "" {
 		t.Errorf("%s: %s", name, d)
 	}
 }

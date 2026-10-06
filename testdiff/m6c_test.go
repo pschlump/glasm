@@ -203,7 +203,7 @@ func TestM6cSandboxMatrix(t *testing.T) {
 	for _, c := range cases {
 		a := dev.Run(c)
 		b := prod.Run(c)
-		if diff := DiffLogs(a, b, true); diff != "" {
+		if diff := DiffLogs(a, b); diff != "" {
 			t.Errorf("%s: %s", c.Name, diff)
 		}
 	}

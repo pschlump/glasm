@@ -62,9 +62,35 @@ func (fe *funcEmitter) mmbinFallback(dest, pc int) {
 	p2()
 	fe.cellAddr(dest)
 	f.I32Const(fe.line(pc))
+	// row-71 hints: h1/h2 name p1/p2's registers (the immediate/constant
+	// operand carries none — the interp's r2 = -1 for the I/K forms, with
+	// the k flip swapping which side the register is); hcall is the MMBIN
+	// slot's funcnamefromcode answer ("metamethod '<event>'") for a
+	// non-callable metamethod value
+	f.I32Const(int32(fe.hintArith(mop, ma, mb, mk, pc+1, true)))
+	f.I32Const(int32(fe.hintArith(mop, ma, mb, mk, pc+1, false)))
+	f.I32Const(int32(fe.hintCallSite(pc + 1)))
 	f.Call(fe.b.imp("rt_arith"))
 	fe.checkStatus()
 	fe.bumpTop(dest + 1)
+}
+
+// hintArith: one MMBIN* fallback operand's hint — first=true asks for
+// p1. p1 is the register for MMBIN and the unflipped I/K forms, the
+// immediate/constant when the k flag flipped the operand order
+// (mirroring the interp's r1/r2 in opMMBIN*).
+func (fe *funcEmitter) hintArith(mop, ma, mb, mk, lastpc int, first bool) int32 {
+	reg, other := ma, mb // OP_MMBIN: (R[A], R[B])
+	if mop != lua.OP_MMBIN {
+		other = -1 // the imm/const operand carries no register
+		if mk != 0 {
+			reg, other = other, reg // flipped: the imm/const is p1
+		}
+	}
+	if !first {
+		reg = other
+	}
+	return fe.hintSite(lastpc, reg)
 }
 
 // scratchAddrCell: scratchAddr as a value-producer (for operand slots)
@@ -339,6 +365,11 @@ func (fe *funcEmitter) emitUnm(A, B, pc int) {
 	fe.cellAddr(B)
 	fe.cellAddr(A)
 	f.I32Const(fe.line(pc))
+	// both operand slots name R[B] (unary: p1 == p2); funcnamefromcode
+	// answers "metamethod 'unm'" for a non-callable __unm (row 71)
+	f.I32Const(int32(fe.hintSite(pc, B)))
+	f.I32Const(int32(fe.hintSite(pc, B)))
+	f.I32Const(int32(fe.hintCallSite(pc)))
 	f.Call(fe.b.imp("rt_arith"))
 	fe.checkStatus()
 	fe.bumpTop(A + 1)
@@ -364,6 +395,9 @@ func (fe *funcEmitter) emitBnot(A, B, pc int) {
 	fe.cellAddr(B)
 	fe.cellAddr(A)
 	f.I32Const(fe.line(pc))
+	f.I32Const(int32(fe.hintSite(pc, B)))
+	f.I32Const(int32(fe.hintSite(pc, B)))
+	f.I32Const(int32(fe.hintCallSite(pc)))
 	f.Call(fe.b.imp("rt_arith"))
 	fe.checkStatus()
 	fe.bumpTop(A + 1)
@@ -525,12 +559,16 @@ func (fe *funcEmitter) emitCall(A, B, C, pc int, tail bool) {
 		f.End()
 	}
 
-	// rt_call(dynScratch, &R(A), nargs, want, line)
+	// rt_call(dynScratch, &R(A), nargs, want, line, hcallee)
 	fe.scratchDyn0()
 	fe.cellAddr(A)
 	f.LocalGet(fe.lT0)
 	f.LocalGet(fe.lT1)
 	f.I32Const(fe.line(pc))
+	// row-71: the call-error hint — funcnamefromcode at the CALL/TAILCALL
+	// site ("global 'foo'", "method 'bar'", ...; -1 when unattributable,
+	// the interp's register value-scan residual)
+	f.I32Const(int32(fe.hintCallSite(pc)))
 	f.Call(fe.b.imp("rt_call")).LocalSet(fe.lSt)
 	f.LocalGet(fe.lSt).I32Const(1).I32Eq().If(wasm.Void)
 	f.I32Const(-1).Return()
@@ -710,6 +748,8 @@ func (fe *funcEmitter) emitTForcall(A, C, pc int) {
 	f.I32Const(2)
 	f.I32Const(int32(C))
 	f.I32Const(fe.line(pc))
+	// row-71: funcnamefromcode over TFORCALL names the for iterator
+	f.I32Const(int32(fe.hintCallSite(pc)))
 	f.Call(fe.b.imp("rt_call")).LocalSet(fe.lSt)
 	f.LocalGet(fe.lSt).I32Const(1).I32Eq().If(wasm.Void)
 	f.I32Const(-1).Return()
@@ -724,13 +764,56 @@ func (fe *funcEmitter) emitTForcall(A, C, pc int) {
 	f.End()
 }
 
-// emitVararg: R(A).. := the actual varargs (varargBase, above the
-// register window). nvarargs = max(0, nargs - np). C==0 → multret
-// (copy all, top = A+nvarargs); C==1 → zero values (top = A);
-// C>=2 → exactly C-1 values, copying min(C-1, nvarargs) and nil-padding
-// the rest (top = A+C-1 — registry CopyRange truncates to regv+n).
-func (fe *funcEmitter) emitVararg(A, C int) {
+// emitVararg: R(A).. := the actual varargs. k=0 (hidden model): the
+// extras at varargBase (above the register window); nvarargs =
+// max(0, nargs - np). C==0 → multret (copy all, top = A+nvarargs);
+// C==1 → zero values (top = A); C>=2 → exactly C-1 values, copying
+// min(C-1, nvarargs) and nil-padding the rest (top = A+C-1 — registry
+// CopyRange truncates to regv+n).
+//
+// k=1 (table model, U5e row 85 — the interp spec, _vm.go): B is the
+// vararg TABLE's register; rt_vararg_read reads t.n + the raw values
+// (raising "vararg table has no proper 'n'" under rt_run, so the raise
+// carries the site's position), nil-pads to nwant, and returns the
+// resolved count — multret (C==0, nwant=-1) sets top = A+count, fixed C
+// knows it statically.
+func (fe *funcEmitter) emitVararg(A, B, C, k, pc int) {
 	f := fe.f
+	if k != 0 {
+		fe.cellAddr(A)
+		fe.cellAddr(B)
+		if C == 0 {
+			f.I32Const(-1) // multret: all of t.n
+		} else {
+			f.I32Const(int32(C - 1))
+		}
+		// dstcap — the whole frame allocation past dst, mirroring the
+		// hidden model's multret posture (writes may reach past nregs
+		// into the slack push_frame sized for: framecells + extras):
+		// frameCells + max(0, nargs-np) - A. t.n is user-editable in
+		// the table model, so unlike the hidden model's nargs-bounded
+		// count it needs the explicit bound (the interp grows its
+		// register stack instead; unobservable in the corpus).
+		f.I32Const(int32(frameCells(fe.nregs))).I32Const(int32(A)).I32Sub()
+		f.LocalGet(2).I32Const(int32(fe.np)).I32Sub()
+		f.I32Const(0)
+		f.LocalGet(2).I32Const(int32(fe.np)).I32Sub().I32Const(0).I32GtS()
+		f.Select()
+		f.I32Add()
+		f.I32Const(fe.line(pc))
+		f.Call(fe.b.imp("rt_vararg_read")).LocalSet(fe.lSt)
+		// NOT checkStatus: a legitimate count can be 1 (RT_ERR's value)
+		f.LocalGet(fe.lSt).I32Const(0).I32LtS().
+			If(wasm.Void).
+			I32Const(-1).Return().
+			End()
+		if C == 0 {
+			f.I32Const(int32(A)).LocalGet(fe.lSt).I32Add().LocalSet(fe.lTop)
+		} else {
+			f.I32Const(int32(A + C - 1)).LocalSet(fe.lTop)
+		}
+		return
+	}
 	// lT0 = nvarargs
 	f.LocalGet(2).I32Const(int32(fe.np)).I32Sub().LocalSet(fe.lT0)
 	f.LocalGet(fe.lT0).I32Const(0).I32LtS().If(wasm.Void)
@@ -803,11 +886,15 @@ func (fe *funcEmitter) emitSetlist(inst uint32, A, pc int) {
 	fe.scratchAddr(0)
 	f.LocalGet(fe.lT1).I32Const(int32(base + 1)).I32Add().I64ExtendI32S()
 	f.Call(fe.b.imp("rt_mkinteger"))
-	// rt_settable(R(A), scratch0, R(A+1+i), line)
+	// rt_settable(R(A), scratch0, R(A+1+i), line) — no hints: A holds a
+	// fresh NEWTABLE result (no metamethod can be involved), so the
+	// interp's varinfo answer here is never consulted
 	fe.cellAddr(A)
 	fe.scratchAddr(0)
 	fe.dynCellAddr(A + 1)
 	f.I32Const(fe.line(pc))
+	f.I32Const(-1)
+	f.I32Const(-1)
 	f.Call(fe.b.imp("rt_settable")).LocalSet(fe.lSt)
 	f.LocalGet(fe.lSt).I32Const(1).I32Eq().If(wasm.Void)
 	f.I32Const(-1).Return()

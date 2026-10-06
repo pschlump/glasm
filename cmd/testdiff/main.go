@@ -60,8 +60,9 @@ func main() {
 	}
 	// the ledgered skip maps live in one place (skips.go) so this CLI leg
 	// and the go-test gates can never disagree about what is excluded
-	// (CorpusSkipsFor adds the row-71 seam skips when a wasm engine runs)
-	cases, skippedList := testdiff.FilterSkips(cases, testdiff.CorpusSkipsFor(*corpus, engines))
+	// (row-71 seam skips retired at U5e — the seam engines now raise
+	// with the full varinfo hints, so there are no wasm-leg-only skips)
+	cases, skippedList := testdiff.FilterSkips(cases, testdiff.CorpusSkips(*corpus))
 	results := testdiff.RunCorpus(cases, engines)
 
 	diffs := 0

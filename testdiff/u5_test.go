@@ -58,3 +58,44 @@ func TestU5Gate(t *testing.T) {
 		t.Fatalf("%d/%d cases diverge between interp and clua55", bad, len(cases))
 	}
 }
+
+// u5WasmLeg: interp vs one wasm engine over _u5 (row 85's gate — U5e
+// brought the backend onto the 5.5 surface: the Stage A opcodes, the
+// position seam, the hint registry, the msgh seam). Skips are the
+// u5WasmSkips map (CorpusSkips) — every one engine-seam, none language.
+func u5WasmLeg(t *testing.T, eng Engine) {
+	t.Helper()
+	cases, err := LoadCorpus("../_u5")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cases, skipped := FilterSkips(cases, CorpusSkips("../_u5"))
+	engines := []Engine{NewInterp("interp"), eng}
+	results := RunCorpus(cases, engines)
+	bad := 0
+	for _, r := range results {
+		if d := r.Diff(); d != "" {
+			bad++
+			t.Errorf("DIFF %s:\n%s", r.Name, indent(d))
+		} else {
+			t.Logf("[ok] %s", r.Name)
+		}
+	}
+	if len(cases) == 0 {
+		t.Fatal("no cases loaded")
+	}
+	t.Log("\n" + Summary(results, skipped))
+	if bad > 0 {
+		t.Fatalf("%d/%d cases diverge between interp and %s", bad, len(cases), engines[1].Name())
+	}
+}
+
+// TestU5WasmGate: the _u5 corpus on the U2e backend over wasmtime.
+func TestU5WasmGate(t *testing.T) {
+	u5WasmLeg(t, NewWasmEngine("wasm"))
+}
+
+// TestU5WazeroGate: the same leg on the production engine.
+func TestU5WazeroGate(t *testing.T) {
+	u5WasmLeg(t, wazeroEngine())
+}

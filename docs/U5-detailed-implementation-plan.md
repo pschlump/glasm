@@ -611,3 +611,125 @@ history, this file's status log); memory; delete `testdiff/u5probe_test.go`.
   _wasm-err-tests) green. Deviation from §3: the chunk's items landed via resolveCall in
   _state.go (not a metaCall loop edit — same file, same seam) and the errerr fix rode in
   from U5a's PCall structure.
+- **U5d (2026-10-05)** — the row-22 yield chunk landed (ledger row 84). **Marker frames as
+  data**: `callFrame.Pcall` kinds 1 (pcall) / 2 (xpcall, msgh in PcallHandler) / 3 (pairs'
+  `__pairs` continuation); `markerKind` intercepts on the BUILTIN OBJECTS (a replaced
+  `pcall` global never intercepts; degenerate arities/non-function handlers stay on the G
+  path so row 83's argument texts keep raising stock's), the marker window IS the call
+  site's, the body is an ordinary frame above it, a marker-builtin payload nests markers,
+  `completePcallMarker` stages prefix+results (pairscont pads to 4 and returns as-is) and
+  cascades through the tailcall seam / resume entry; the base-frame arm covers
+  `create(pcall)`. **Recovery**: `loopAttempt` completes the innermost in-scope marker at
+  the depth that owns it (minIdx scopes each recovery region — gsub callback pcall
+  completes inside the callback); `completeErrorMarker` runs msgh AT raise (dying frames
+  still visible), the nil-object fix, unwind + closeUpvalues + closeTBCProtected with the
+  object in flight, `[false, obj]`. **Two corpus-caught regressions, both fixed**: (1) the
+  marker path had LOST the U5a frame reserve — the old G-builtin xpcall ran msgh through
+  PCall's errfunc arm (which unwinds errorFrameReserve dying frames on a full stack), the
+  marker path's runMsgh PCalls bare, so ovfl01's handlers died of re-raised overflow and
+  collapsed to "error in error handling" — completeErrorMarker now carries the reserve;
+  (2) a tailcall INTO a marker (`return pcall(f)`) skipped the plain tailcall's window
+  slide, so the caller read its stale callee/arg cells ("got function:... function:..."
+  instead of "got true 7") — the marker window now CopyRanges down to the reused frame's
+  original base. Both shapes were the corpus cases added without a verified probe first —
+  the gate caught them (the corpus discipline pays). **noyieldDepth** (callR, callMM's G
+  arm, closeTBCVM's C arm): yield inside raises the CATCHABLE boundary error (sort/gsub/
+  __tostring callbacks — the thread survives under a pcall), `isyieldable` consults it.
+  **Kinds 4/5**: closeTBCVM runs VM-called `__close` as tagged frames (4 = OP_CLOSE,
+  ContB = level; 5 = RETURN, ContRA/ContB = the interrupted return's staging) — a Lua
+  `__close` yields and doReturn's continuation arm resumes; a C `__close` runs noyield.
+  **Kind 6**: `mmYieldable` = stock ltm.c's rule (the metamethod may yield when CALLED FROM
+  LUA CODE — the caller's property, not the callee's); all seventeen VM dispatch sites run
+  through `callMM`, which pushes the mm frame with contA/contB fold state and suspends the
+  owner's instruction; `vmFinishMM` (the luaV_finishOp port — §3's "no finishOp port"
+  design note is superseded: the kind-6 arms ARE the port, per-opcode) completes it: MMBIN
+  dest from *(savedpc-2), unary/get-family dest = lbase+GETA, order ops condJump on
+  LVAsBool(res), SET* no-op. The CONCAT resume: ContRA = the lhs cell, ContB = candidates
+  remaining INCLUDING it; the mm result lands AT ContRA (the folded pair collapses into the
+  lhs cell) and stringConcat(ContB, ContRA) re-enters the fold — the sync path's
+  `rhs=v; total--; i--` invariant; ContB==1 was the final pair. The shared helpers moved
+  to tuple signatures (`stringConcat (LValue,uint8)`, `lessThan/leValues/equals (bool,uint8)`,
+  `objectRational (int,uint8)`, ...); Go-context callers (sortComp, mathMax/Min,
+  lValueArraySorter, the host API) discard the state — always mmSync under noyield.
+  **Divergence (row 84g, open)**: a C-FUNCTION metamethod that yields from Lua code
+  (`__eq = coroutine.yield`) — stock suspends and finishes via finishOp; the fork raises
+  the boundary error and the thread dies (a C frame has no continuation). Ruled out of
+  scope; the excluded shapes are inlined in `_u5/coyield05.lua`'s header. **Closeout**:
+  nextvar.lua (:937 `__pairs`-yield) green and un-skipped; coroutine.lua green through
+  :409 (create(pcall) :277 + the mm-yield battery) — its skip narrows to sethook :410 (the
+  db.lua precedent family). Corpus: `_u5/coyield01..06` (marker yields, boundary errors +
+  isyieldable + main-thread yield, create/wrap flavors, `__pairs` + yielding iterators,
+  the kind-6 battery, kinds 4/5). Gates: TestU5Gate 25/25; TestU5ProbeOfficialSuite 21/21
+  (100% of non-skipped); full `go test ./...` green; wasm legs unchanged (interp-side; the
+  backend grows the yield surface at U6). Deviation from the §6 table: "VM-metamethod
+  noyield ruling" became the kind-6 yieldable model (only C-mms stay noyield — the row-84
+  divergence), matching stock's observable behavior for Lua metamethods.
+- **U5e (2026-10-05)** — the wasm backend + rt ABI v4 extensions + the row-60 marker seam
+  chunk landed (ledger rows 85 + 86). **Stage A ops**: OP_VARARGPREP's table model builds
+  the vararg table into R(np) via `rt_varargtab` over the trampoline-staged extras ({1..n}
+  plus n as INTEGER); the hidden model is a NO-OP — extras already sit above the wasm
+  window and registers are frame-relative, so the interp's param-lift (U5b) is structurally
+  absent. OP_GETVARG = `rt_getvarg` (plain like rt_getupval, never raises: integral
+  1..nextra, "n" → nextra, else nil); OP_ERRNNIL = `rt_errnnil` (the name from K[Bx−1],
+  "?" at Bx=0); OP_VARARG k=1 = `rt_vararg_read(dst, tabcell, nwant, dstcap, line)` —
+  t["n"] validated stock's way ("vararg table has no proper 'n'"), values raw-read
+  nil-padded, dstcap the frame slack past dst (t.n is user-editable; the interp grows its
+  register stack instead); TFORPREP = the swap + `rt_tbc` with a TFORPREP arm in the name
+  table. **The position seam (row 60(2) closes)**: `rt_seam55.c` — a glue object linked
+  BEFORE the stock `$SRC` with `-Wl,--allow-multiple-definition` (wasm-ld resolves to the
+  first definition; the oracle blob never links it) interposing luaL_where / lua_error /
+  luaG_runerror / luaG_errormsg / the typeerror family for the rt blob only; the rt-owned
+  **shadow line stack** (trampoline push/pop per compiled frame; the line cell at
+  frame+16*(nregs+4) with storeLine before every instruction; lua_main plants the bottom
+  entry keyed &base_ci) makes error(msg, level)'s walk resolve compiled frames incl. main
+  level. e003/e005/e010/e011/pc02 un-skipped byte-exact. **Still ruled**: e001 — level-0
+  error() gains the rt prefix (luaB_error's level-0 arm calls no where(); interposing the
+  static luaB_error would be needed) — `_cli-tests` kvdb/calc1's wasm legs re-pinned to
+  this residual (their error commands are error(msg, 0)); e006/e007 — nil error objects
+  (`<no error object>` + prefix vs the interp's "nil"). **The hint registry (row 71's
+  durable fix, §4.6)**: the backend precomputes the interp's own varinfo answers per raise
+  site at lowering (GetObjName/FuncNameFromCode/UpvalName exported from varinfo.go),
+  registers them via `rt_hint_put` in a NO-DEDUP table (concat runs index hbase+idx
+  densely), and every raising rt_* entry takes trailing hint indices (rt_arith both
+  operand hints + the mm-call hint with the MMBIN k-flip; gettable/settable/len/concat
+  object + call-site hints; GETTABUP/SETTABUP's upvalue hint; rt_call's funcnamefromcode).
+  DiffLogs' stripVarinfoHints + the seamHintless flag + seamHintPrintSkips are DELETED —
+  suffixes compare raw on every leg; pc10 un-skipped. Residual: unattributable call sites
+  (kind "") need a run-time register scan — not precomputable, pass −1; no corpus case
+  pins one. **RTW_STACKTRAP (−4)**: the engine's own wasm stack can exhaust below
+  RTW_MAX_DEPTH (chunk frame sizes vary); the host dispatch maps such traps to −4 and the
+  trampoline stages the same bare "stack overflow" the depth guard stages (row 20 family).
+  **The msgh seam**: interposed luaG_errormsg = stock + `rt_sea_msgh_ran` set before the
+  handler dispatch; rtw_reraise's handler arm runs xpcall handlers for directly-staged
+  raises at the C-land crossing. Two ruled divergences: the handler runs after
+  rt_frame_restore (the interp's completeErrorMarker runs msgh at the raise, dying frames
+  visible — handlers that introspect diverge; ovfl01's are deliberately order-insensitive)
+  and the H:-order (interp/clua55 return the handler's result with the position IN the
+  message; wasm's re-raise prefix lands AROUND it — the x1 probe; handler-transforms-
+  message shapes stay out of the wasm corpora; durable fix rides the U6 seam family).
+  **Row 86 (open)**: the extras live ABOVE the register window (stock/interp place them
+  below), so legitimate dynamic windows reaching past nregs trample them — vgap01
+  (multret VARARG flush tail lands on extra[0]) and var07 (call's arg-shift reads/clobbers
+  the saved callee at n≥12) skip the wasm gates on it; durable fix = U6 frame-layout
+  surgery (callee-address rt_call + extras-below-window). **Native tests**: the hint
+  parameters' arity migration (44 pre-existing call sites), the seam linked natively for
+  the first time (the nine interposition replicas macro-renamed — macOS ld has no
+  --allow-multiple-definition; the helpers keep real names), and the U5e battery
+  (rt_varargtab/getvarg/errnnil/vararg_read incl. the user-edit and overflow arms, plus
+  the shadow-stack/flag/rt_hint_put mechanics). **CLI**: ref/err1.w.out regenerated (the
+  wasm engine now emits the `(upvalue 't')` hint, matching the interp's row-70f form).
+  Note en route: `cmd/testdiff -corpus _glua-tests -engines interp,clua` exits 1 on
+  math.lua/table.lua — pre-existing U3b/U3d re-pin artifacts (rows 64/65: the interp
+  speaks the 5.5 lib surface, clua is the frozen 5.1 oracle; clua55 is that leg's
+  authority and is green; the wasm-family gates run both files byte-exact).
+  Gates: TestU5WasmGate/TestU5WazeroGate 13/13 + 13 row-cited skips (u5WasmSkips —
+  rows 84/23/61/60/86); TestU5Gate 26/26 unchanged; TestWasmFullMatrix 1500/1500 +
+  TestWasmErrorSuite/TestWazeroErrorSuite 96/96 (e001/e006/e007 remain) +
+  TestWasmGluaFull/TestWazeroGluaFull (pc10 un-skipped) ×{wasmtime,wazero} on the
+  rebuilt blob + `go clean -testcache`; RT-NATIVE55 ×{plain,ASan,UBSan}; `cmd/testdiff`
+  legs exit 0 (`_wasm-tests`/`_wasm-err-tests` ×{wasm,wazero}); `_cli-tests`
+  ×{wasmtime, WAZERO=1} PASS (4 ledgered xfails: life1/tsort1 row 61, kvdb/calc1 the
+  e001 residual); full `go test ./...` green — one operational note: a CLEAN-CACHE run of
+  the whole testdiff package no longer fits go-test's default 10m (it got through every
+  gate and died to the alarm mid-TestWazeroSpike; the spike itself passes standalone in
+  1.2s) — run `go test ./testdiff/ -timeout 45m` for the full suite.

@@ -102,7 +102,11 @@ RT_EXPORTS="$EXPORTS \
   -Wl,--export=rt_wasm_count -Wl,--export=rt_newclosure \
   -Wl,--export=rt_getupval -Wl,--export=rt_setupval \
   -Wl,--export=rt_close_upvals -Wl,--export=rt_clidx \
-  -Wl,--export=rt_name_put -Wl,--export=rt_tbc \
+  -Wl,--export=rt_varargtab -Wl,--export=rt_getvarg \
+  -Wl,--export=rt_errnnil -Wl,--export=rt_vararg_read \
+  -Wl,--export=rt_sea_setline -Wl,--export=rt_sea_main \
+  -Wl,--export=rt_sea_pop \
+  -Wl,--export=rt_name_put -Wl,--export=rt_hint_put -Wl,--export=rt_tbc \
   -Wl,--export=rt_close -Wl,--export=rt_close_err \
   -Wl,--export=rt_wasm_push_frame -Wl,--export=rt_frame_cursor \
   -Wl,--export=rt_frame_restore \
@@ -110,13 +114,21 @@ RT_EXPORTS="$EXPORTS \
   -Wl,--export=rt_tail_nargs -Wl,--export=rt_tail_funcell \
   -Wl,--export=rt_tail_restage"
 
+# U5e (row 60): the error-position seam — rt_seam55.c interposes
+# luaL_where/lua_error/luaG_runerror for the RT blob only. It must link
+# BEFORE the stock objects and the whole link needs --allow-multiple-
+# definition: GNU ld resolves a duplicated symbol to the FIRST
+# definition on the command line, so the seam's replicas win and the
+# stock tree stays untouched. No -flto in CFLAGS, so object-level
+# interposition holds (an LTO link would fold the duplicates first).
 "$CC" --sysroot="$SYSROOT" \
   $CFLAGS \
   -D'luai_makeseed()=0u' \
   -D'lua_tmpnam(b,e)={e=1;}' \
   $RT_EXPORTS \
+  -Wl,--allow-multiple-definition \
   -DLUA_RT_FLAVOR \
-  -o lua55_rt.wasm luawasm55.c rt_abi55.c $SRC
+  -o lua55_rt.wasm luawasm55.c rt_abi55.c rt_seam55.c $SRC
 
 cp lua55_rt.wasm ../testdiff/lua55_rt.wasm
 

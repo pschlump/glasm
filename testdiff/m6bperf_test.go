@@ -152,10 +152,10 @@ func TestM6bPerfSanity(t *testing.T) {
 			wtLog, wtDur := run(&WasmEngine{name: "wasmtime", Precompiled: bin, SkipUnsupported: true})
 			wzLog, wzDur := run(&WazeroEngine{name: "wazero", Precompiled: bin, SkipUnsupported: true})
 
-			if d := DiffLogs(wtLog, wzLog, true); d != "" {
+			if d := DiffLogs(wtLog, wzLog); d != "" {
 				t.Errorf("wasmtime vs wazero:\n%s", d)
 			}
-			if d := DiffLogs(itLog, wtLog, true); d != "" {
+			if d := DiffLogs(itLog, wtLog); d != "" {
 				t.Errorf("interp vs wasmtime:\n%s", d)
 			}
 			for _, lg := range [][]string{itLog, wtLog, wzLog} {

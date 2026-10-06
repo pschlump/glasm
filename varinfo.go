@@ -200,6 +200,34 @@ func LocalNameAt(p *FunctionProto, localnum, pc int) (string, bool) {
 	return localNameAt(p, localnum, pc)
 }
 
+// GetObjName is getobjname exported for the wasm backend's varinfo hints
+// (U5e, row 71): the backend precomputes the interp's debug-name answer
+// at compile time — the raise site's lastpc follows the cf.Pc-1 convention
+// (the instruction that raised; findSetReg itself steps back over an
+// MMBIN* slot at that pc).
+func GetObjName(p *FunctionProto, lastpc, reg int) (kind, name string) {
+	return getObjName(p, lastpc, reg)
+}
+
+// FuncNameFromCode is funcnamefromcode exported for the backend's
+// call-error hints (the callee name of the instruction at pc).
+func FuncNameFromCode(p *FunctionProto, pc int) (kind, name string) {
+	return funcNameFromCode(p, pc)
+}
+
+// UpvalName is upvalName exported for the backend's GETTABUP/SETTABUP
+// object hints (the table operand is an upvalue cell — varinfo's
+// getupvalname arm).
+func UpvalName(p *FunctionProto, uv int) string {
+	return upvalName(p, uv)
+}
+
+// FormatVarInfo is formatVarInfo exported so the backend renders the
+// identical " (%s '%s')" strings the interp raises.
+func FormatVarInfo(kind, name string) string {
+	return formatVarInfo(kind, name)
+}
+
 // upvalName — stock upvalname ("?" for unnamed captures).
 func upvalName(p *FunctionProto, uv int) string {
 	if uv >= 0 && uv < len(p.Upvalues) && p.Upvalues[uv].Name != "" {

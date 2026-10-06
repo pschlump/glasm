@@ -19,6 +19,51 @@
 #include "../rt_abi55.c"
 #include "lua55/src/lualib.h" /* luaL_openlibs (string metatable etc.) */
 
+/* Link the seam's HELPERS in (rt_abi55.c references the rt_sea_* family
+   since U5e) while keeping its interposition replicas out of the native
+   link: the renames below give the nine replicas private names, so the
+   stock tree's own definitions serve every other call (macOS ld has no
+   --allow-multiple-definition; wasm-ld's first-on-the-command-line rule
+   is what makes the replicas win in the blob). The renamed copies stay
+   compiled — the helpers and the replicas are one file — and the
+   replicas' BEHAVIOR (the position seam, the msgh flag at a real raise)
+   remains blob-side coverage: TestRT55BlobSmoke + e003/e005/e011. */
+#define luaL_where rt_sea_native_where
+#define lua_error rt_sea_native_error
+#define luaG_runerror rt_sea_native_runerror
+#define luaG_errormsg rt_sea_native_errormsg
+#define luaG_typeerror rt_sea_native_typeerror
+#define luaG_callerror rt_sea_native_callerror
+#define luaG_opinterror rt_sea_native_opinterror
+#define luaG_tointerror rt_sea_native_tointerror
+#define luaG_concaterror rt_sea_native_concaterror
+/* the stock headers above were consumed unrenamed (include guards), so
+   the replicas that call each other before their definitions need the
+   renamed prototypes re-issued here (in the blob build each file is its
+   own TU with fresh header inclusion; ldebug.h:42-60 / lauxlib.h:75
+   carry these) */
+LUAI_FUNC l_noret rt_sea_native_runerror(lua_State *L, const char *fmt, ...);
+LUAI_FUNC l_noret rt_sea_native_errormsg(lua_State *L);
+LUAI_FUNC l_noret rt_sea_native_typeerror(lua_State *L, const TValue *o,
+                                          const char *opname);
+LUAI_FUNC l_noret rt_sea_native_callerror(lua_State *L, const TValue *o);
+LUAI_FUNC l_noret rt_sea_native_concaterror(lua_State *L, const TValue *p1,
+                                            const TValue *p2);
+LUAI_FUNC l_noret rt_sea_native_opinterror(lua_State *L, const TValue *p1,
+                                           const TValue *p2, const char *msg);
+LUAI_FUNC l_noret rt_sea_native_tointerror(lua_State *L, const TValue *p1,
+                                           const TValue *p2);
+#include "../rt_seam55.c"
+#undef luaL_where
+#undef lua_error
+#undef luaG_runerror
+#undef luaG_errormsg
+#undef luaG_typeerror
+#undef luaG_callerror
+#undef luaG_opinterror
+#undef luaG_tointerror
+#undef luaG_concaterror
+
 static int failures = 0;
 #define CHECK(cond) do { \
 	if (!(cond)) { failures++; printf("FAIL %d: %s\n", __LINE__, #cond); } \
@@ -71,14 +116,14 @@ int32_t wasm_dispatch_host(int32_t idx, rt_addr frame, rt_addr cl,
   case IDX_SUM:
     if (nargs < 2) return -1;
     if (rt_arith(RT_OP_ADD, cell_of(&f[0]), cell_of(&f[1]), cell_of(&f[0]),
-                 0) != RT_OK)
+                 0, -1, -1, -1) != RT_OK)
       return -1; /* staged; the trampoline re-raises */
     return want < 0 ? 1 : want;
   case IDX_FAIL: {
     TValue t;
     rt_mkbool(cell_of(&t), 1);
     if (rt_arith(RT_OP_ADD, cell_of(&t), cell_of(&t), cell_of(&f[0]),
-                 7) != RT_OK)
+                 7, -1, -1, -1) != RT_OK)
       return -1;
     return 0;
   }
@@ -96,9 +141,9 @@ int32_t wasm_dispatch_host(int32_t idx, rt_addr frame, rt_addr cl,
     TValue one;
     rt_mkinteger(cell_of(&one), 1);
     if (rt_arith(RT_OP_SUB, cell_of(&f[0]), cell_of(&one), cell_of(&f[0]),
-                 0) != RT_OK)
+                 0, -1, -1, -1) != RT_OK)
       return -1;
-    return rt_call(cell_of(&g_recurse_closure), frame, 1, 1, 0) == RT_OK
+    return rt_call(cell_of(&g_recurse_closure), frame, 1, 1, 0, -1) == RT_OK
                ? 0
                : -1;
   }
@@ -113,7 +158,7 @@ int32_t wasm_dispatch_host(int32_t idx, rt_addr frame, rt_addr cl,
     rt_intern(cell_of(&k), (rt_addr)(uintptr_t)"error", 5);
     if (rt_getglobal(cell_of(&ef), cell_of(&k), 0) != RT_OK) return -1;
     rt_intern(cell_of(&arg), (rt_addr)(uintptr_t)"a-bad", 5);
-    if (rt_call(cell_of(&ef), cell_of(&arg), 1, 1, 4) != RT_OK) return -1;
+    if (rt_call(cell_of(&ef), cell_of(&arg), 1, 1, 4, -1) != RT_OK) return -1;
     return 0;
   }
   case IDX_TBCRAISE: {
@@ -190,102 +235,102 @@ int main(void) {
 
     rt_mkinteger(ra, 3);
     rt_mkinteger(rb, 4);
-    CHECK(rt_arith(RT_OP_ADD, ra, rb, rr, 10) == RT_OK);
+    CHECK(rt_arith(RT_OP_ADD, ra, rb, rr, 10, -1, -1, -1) == RT_OK);
     CHECK(ttisinteger(&r) && ivalue(&r) == 7);
 
     rt_mknumber(rb, 4.5);
-    CHECK(rt_arith(RT_OP_ADD, ra, rb, rr, 10) == RT_OK);
+    CHECK(rt_arith(RT_OP_ADD, ra, rb, rr, 10, -1, -1, -1) == RT_OK);
     CHECK(ttisfloat(&r) && fltvalue(&r) == 7.5);
 
     /* int/int '/' is a float (5.3+ rule) */
     rt_mkinteger(ra, 7);
     rt_mkinteger(rb, 2);
-    CHECK(rt_arith(RT_OP_DIV, ra, rb, rr, 10) == RT_OK);
+    CHECK(rt_arith(RT_OP_DIV, ra, rb, rr, 10, -1, -1, -1) == RT_OK);
     CHECK(ttisfloat(&r) && fltvalue(&r) == 3.5);
 
     /* floor idiv/mod keep the integer subtype */
-    CHECK(rt_arith(RT_OP_IDIV, ra, rb, rr, 10) == RT_OK);
+    CHECK(rt_arith(RT_OP_IDIV, ra, rb, rr, 10, -1, -1, -1) == RT_OK);
     CHECK(ttisinteger(&r) && ivalue(&r) == 3);
     rt_mkinteger(ra, -7);
-    CHECK(rt_arith(RT_OP_IDIV, ra, rb, rr, 10) == RT_OK);
+    CHECK(rt_arith(RT_OP_IDIV, ra, rb, rr, 10, -1, -1, -1) == RT_OK);
     CHECK(ttisinteger(&r) && ivalue(&r) == -4);
-    CHECK(rt_arith(RT_OP_MOD, ra, rb, rr, 10) == RT_OK);
+    CHECK(rt_arith(RT_OP_MOD, ra, rb, rr, 10, -1, -1, -1) == RT_OK);
     CHECK(ttisinteger(&r) && ivalue(&r) == 1); /* -7 % 2 == 1 (floor) */
 
     /* integer wrap-around (intop unsigned casts) */
     rt_mkinteger(ra, LUA_MAXINTEGER);
     rt_mkinteger(rb, 1);
-    CHECK(rt_arith(RT_OP_ADD, ra, rb, rr, 10) == RT_OK);
+    CHECK(rt_arith(RT_OP_ADD, ra, rb, rr, 10, -1, -1, -1) == RT_OK);
     CHECK(ttisinteger(&r) && ivalue(&r) == LUA_MININTEGER);
 
     /* shifts: logical right, negative shift flips direction */
     rt_mkinteger(ra, 1);
     rt_mkinteger(rb, 10);
-    CHECK(rt_arith(RT_OP_SHL, ra, rb, rr, 10) == RT_OK);
+    CHECK(rt_arith(RT_OP_SHL, ra, rb, rr, 10, -1, -1, -1) == RT_OK);
     CHECK(ttisinteger(&r) && ivalue(&r) == 1024);
     rt_mkinteger(ra, -1);
     rt_mkinteger(rb, 1);
-    CHECK(rt_arith(RT_OP_SHR, ra, rb, rr, 10) == RT_OK);
+    CHECK(rt_arith(RT_OP_SHR, ra, rb, rr, 10, -1, -1, -1) == RT_OK);
     CHECK(ttisinteger(&r) && ivalue(&r) == LUA_MAXINTEGER); /* logical */
     rt_mkinteger(ra, 1);
     rt_mkinteger(rb, -1);
-    CHECK(rt_arith(RT_OP_SHL, ra, rb, rr, 10) == RT_OK);
+    CHECK(rt_arith(RT_OP_SHL, ra, rb, rr, 10, -1, -1, -1) == RT_OK);
     CHECK(ttisinteger(&r) && ivalue(&r) == 0); /* 1 << -1 == 1 >> 1 */
 
     /* bnot / band */
     rt_mkinteger(ra, 0);
-    CHECK(rt_arith(RT_OP_BNOT, ra, ra, rr, 10) == RT_OK);
+    CHECK(rt_arith(RT_OP_BNOT, ra, ra, rr, 10, -1, -1, -1) == RT_OK);
     CHECK(ttisinteger(&r) && ivalue(&r) == -1);
     rt_mkinteger(ra, 0xf0);
     rt_mkinteger(rb, 0x3c);
-    CHECK(rt_arith(RT_OP_BAND, ra, rb, rr, 10) == RT_OK);
+    CHECK(rt_arith(RT_OP_BAND, ra, rb, rr, 10, -1, -1, -1) == RT_OK);
     CHECK(ttisinteger(&r) && ivalue(&r) == 0x30);
 
     /* unary minus on mininteger wraps to itself */
     rt_mkinteger(ra, LUA_MININTEGER);
-    CHECK(rt_arith(RT_OP_UNM, ra, ra, rr, 10) == RT_OK);
+    CHECK(rt_arith(RT_OP_UNM, ra, ra, rr, 10, -1, -1, -1) == RT_OK);
     CHECK(ttisinteger(&r) && ivalue(&r) == LUA_MININTEGER);
 
     /* pow is float; huge floats saturate */
     rt_mkinteger(ra, 2);
     rt_mkinteger(rb, 63);
-    CHECK(rt_arith(RT_OP_POW, ra, rb, rr, 10) == RT_OK);
+    CHECK(rt_arith(RT_OP_POW, ra, rb, rr, 10, -1, -1, -1) == RT_OK);
     CHECK(ttisfloat(&r) && fltvalue(&r) == 9223372036854775808.0);
 
     /* error texts, stock 5.5 wording */
     rt_mkinteger(ra, 1);
     rt_mkinteger(rb, 0);
-    CHECK(rt_arith(RT_OP_IDIV, ra, rb, rr, 100) == RT_ERR);
+    CHECK(rt_arith(RT_OP_IDIV, ra, rb, rr, 100, -1, -1, -1) == RT_ERR);
     CHECK(err_ends_with("attempt to divide by zero"));
     CHECK(rt_err_line() == 100);
     rt_err_clear();
-    CHECK(rt_arith(RT_OP_MOD, ra, rb, rr, 101) == RT_ERR);
+    CHECK(rt_arith(RT_OP_MOD, ra, rb, rr, 101, -1, -1, -1) == RT_ERR);
     CHECK(err_ends_with("attempt to perform 'n%0'"));
     rt_err_clear();
 
     /* floats with no integer representation (luaG_tointerror) */
     rt_mknumber(ra, 3.5);
     rt_mkinteger(rb, 1);
-    CHECK(rt_arith(RT_OP_BAND, ra, rb, rr, 102) == RT_ERR);
+    CHECK(rt_arith(RT_OP_BAND, ra, rb, rr, 102, -1, -1, -1) == RT_ERR);
     CHECK(err_ends_with("number has no integer representation"));
     rt_err_clear();
 
     /* non-number arith (stock luaG_opinterror wording) */
     rt_mkbool(ra, 1);
     rt_mkbool(rb, 1);
-    CHECK(rt_arith(RT_OP_ADD, ra, rb, rr, 103) == RT_ERR);
+    CHECK(rt_arith(RT_OP_ADD, ra, rb, rr, 103, -1, -1, -1) == RT_ERR);
     CHECK(err_ends_with("attempt to perform arithmetic on a boolean value"));
     rt_err_clear();
 
     /* numeric strings go through the string metatable (5.4+ model) */
     rt_intern(ra, (rt_addr)(uintptr_t)"10", 2);
     rt_mkinteger(rb, 5);
-    CHECK(rt_arith(RT_OP_ADD, ra, rb, rr, 10) == RT_OK);
+    CHECK(rt_arith(RT_OP_ADD, ra, rb, rr, 10, -1, -1, -1) == RT_OK);
     CHECK(ttisinteger(&r) && ivalue(&r) == 15);
     /* subtype-preserving: "2.5" + 1 is a float */
     rt_mkinteger(rb, 1);
     rt_intern(ra, (rt_addr)(uintptr_t)"2.5", 3);
-    CHECK(rt_arith(RT_OP_ADD, ra, rb, rr, 10) == RT_OK);
+    CHECK(rt_arith(RT_OP_ADD, ra, rb, rr, 10, -1, -1, -1) == RT_OK);
     CHECK(ttisfloat(&r) && fltvalue(&r) == 3.5);
   }
 
@@ -334,24 +379,24 @@ int main(void) {
 
     rt_intern(rk, (rt_addr)(uintptr_t)"x", 1);
     rt_mkinteger(rv, 42);
-    CHECK(rt_settable(rt_, rk, rv, 20) == RT_OK);
-    CHECK(rt_gettable(rt_, rk, rr, 21) == RT_OK);
+    CHECK(rt_settable(rt_, rk, rv, 20, -1, -1) == RT_OK);
+    CHECK(rt_gettable(rt_, rk, rr, 21, -1, -1) == RT_OK);
     CHECK(ttisinteger(&r) && ivalue(&r) == 42);
 
     /* t[2.0] and t[2] are the SAME key (5.4+ normalization) */
     rt_mknumber(rk, 2.0);
     rt_mkinteger(rv, 7);
-    CHECK(rt_settable(rt_, rk, rv, 22) == RT_OK);
+    CHECK(rt_settable(rt_, rk, rv, 22, -1, -1) == RT_OK);
     rt_mkinteger(rk, 2);
-    CHECK(rt_gettable(rt_, rk, rr, 23) == RT_OK);
+    CHECK(rt_gettable(rt_, rk, rr, 23, -1, -1) == RT_OK);
     CHECK(ttisinteger(&r) && ivalue(&r) == 7);
 
     /* 3.5 stays a distinct float key */
     rt_mknumber(rk, 3.5);
     rt_mkinteger(rv, 9);
-    CHECK(rt_settable(rt_, rk, rv, 24) == RT_OK);
+    CHECK(rt_settable(rt_, rk, rv, 24, -1, -1) == RT_OK);
     rt_mknumber(rk, 3.5);
-    CHECK(rt_gettable(rt_, rk, rr, 25) == RT_OK);
+    CHECK(rt_gettable(rt_, rk, rr, 25, -1, -1) == RT_OK);
     CHECK(ttisinteger(&r) && ivalue(&r) == 9);
 
     /* __index metamethod through the seam (a Lua closure runs under
@@ -367,7 +412,7 @@ int main(void) {
         L->top.p--;
       }
       rt_intern(rk, (rt_addr)(uintptr_t)"__index", 7);
-      CHECK(rt_settable(cell_of(&mt), rk, cell_of(&idx), 26) == RT_OK);
+      CHECK(rt_settable(cell_of(&mt), rk, cell_of(&idx), 26, -1, -1) == RT_OK);
       /* attach the metatable via the public API: t's cell -> stack */
       luaD_checkstack(L, 2);
       setobj2s(L, L->top.p, &t);
@@ -377,14 +422,14 @@ int main(void) {
       lua_setmetatable(L, -2);
       L->top.p--;
       rt_intern(rk, (rt_addr)(uintptr_t)"nope", 4);
-      CHECK(rt_gettable(rt_, rk, rr, 27) == RT_OK);
+      CHECK(rt_gettable(rt_, rk, rr, 27, -1, -1) == RT_OK);
       CHECK(ttisstring(&r) &&
             strcmp(getstr(tsvalue(&r)), "mm:nope") == 0);
     }
 
     /* nil index errors */
     rt_mknil(rk);
-    CHECK(rt_gettable(rt_, rk, rr, 77) == RT_ERR);
+    CHECK(rt_gettable(rt_, rk, rr, 77, -1, -1) == RT_ERR);
     CHECK(rt_err_pending() == 1);
     {
       static char buf[256];
@@ -401,13 +446,13 @@ int main(void) {
   {
     TValue s, t, r;
     rt_intern(cell_of(&s), (rt_addr)(uintptr_t)"hello", 5);
-    CHECK(rt_len(cell_of(&s), cell_of(&r), 24) == RT_OK);
+    CHECK(rt_len(cell_of(&s), cell_of(&r), 24, -1, -1) == RT_OK);
     CHECK(ttisinteger(&r) && ivalue(&r) == 5);
     CHECK(rt_newtable(cell_of(&t), 3, 0) == RT_OK);
-    CHECK(rt_len(cell_of(&t), cell_of(&r), 24) == RT_OK);
+    CHECK(rt_len(cell_of(&t), cell_of(&r), 24, -1, -1) == RT_OK);
     CHECK(ttisinteger(&r));
     rt_mkbool(cell_of(&s), 1);
-    CHECK(rt_len(cell_of(&s), cell_of(&r), 24) == RT_ERR);
+    CHECK(rt_len(cell_of(&s), cell_of(&r), 24, -1, -1) == RT_ERR);
     CHECK(err_ends_with("attempt to get length of a boolean value"));
     rt_err_clear();
   }
@@ -418,20 +463,20 @@ int main(void) {
     rt_addr pc[2] = {cell_of(&pair[0]), cell_of(&pair[1])};
     rt_intern(pc[0], (rt_addr)(uintptr_t)"x=", 2);
     rt_mkinteger(pc[1], 3);
-    CHECK(rt_concat(pc[0], 2, cell_of(&r), 41) == RT_OK);
+    CHECK(rt_concat(pc[0], 2, cell_of(&r), 41, -1, -1) == RT_OK);
     CHECK(ttisstring(&r) && strcmp(getstr(tsvalue(&r)), "x=3") == 0);
     rt_mknumber(pc[1], 3.0);
-    CHECK(rt_concat(pc[0], 2, cell_of(&r), 41) == RT_OK);
+    CHECK(rt_concat(pc[0], 2, cell_of(&r), 41, -1, -1) == RT_OK);
     CHECK(ttisstring(&r) && strcmp(getstr(tsvalue(&r)), "x=3.0") == 0);
     /* a huge integer concatenates exactly (f64 could not) */
     rt_intern(pc[0], (rt_addr)(uintptr_t)"", 0);
     rt_mkinteger(pc[1], 9007199254740993LL);
-    CHECK(rt_concat(pc[0], 2, cell_of(&r), 41) == RT_OK);
+    CHECK(rt_concat(pc[0], 2, cell_of(&r), 41, -1, -1) == RT_OK);
     CHECK(ttisstring(&r) &&
           strcmp(getstr(tsvalue(&r)), "9007199254740993") == 0);
     /* __concat on non-strings */
     rt_mkbool(pc[0], 1);
-    CHECK(rt_concat(pc[0], 2, cell_of(&r), 41) == RT_ERR);
+    CHECK(rt_concat(pc[0], 2, cell_of(&r), 41, -1, -1) == RT_ERR);
     rt_err_clear();
   }
 
@@ -540,7 +585,7 @@ int main(void) {
                                    C-stack TValue is invisible to the GC */
     rt_mkinteger(cell_of(&args[0]), 20);
     rt_mkinteger(cell_of(&args[1]), 22);
-    int32_t st = rt_call(cell_of(&fcell), cell_of(&args[0]), 2, 1, 60);
+    int32_t st = rt_call(cell_of(&fcell), cell_of(&args[0]), 2, 1, 60, -1);
     L->top.p--;
     CHECK(st == RT_OK);
     CHECK(ttisinteger(&args[0]) && ivalue(&args[0]) == 42);
@@ -553,7 +598,7 @@ int main(void) {
       f2 = *s2v(L->top.p - 1);
       rt_mkinteger(cell_of(&args[0]), 1);
       rt_mkinteger(cell_of(&args[1]), 2);
-      int32_t enc = rt_call(cell_of(&f2), cell_of(&args[0]), 2, -1, 60);
+      int32_t enc = rt_call(cell_of(&f2), cell_of(&args[0]), 2, -1, 60, -1);
       L->top.p--;
       CHECK(enc < 0 && rt_call_count(enc) == 2);
     }
@@ -663,7 +708,7 @@ int main(void) {
       rt_mkinteger(cell_of(&a), 1);
       rt_mkinteger(cell_of(&b), 2);
       CHECK(rt_arith(RT_OP_ADD, cell_of(&a), cell_of(&b), cell_of(&r),
-                     10) == RT_OK);
+                     10, -1, -1, -1) == RT_OK);
       CHECK(ttisinteger(&r) && ivalue(&r) == 3);
     }
 
@@ -827,6 +872,196 @@ int main(void) {
       rt_mkbool(cell_of(&cells[0]), 0);
       CHECK(rt_tbc(cell_of(&cells[0]), g_nameidx_v, 34) == RT_OK);
       CHECK(rt_tbc_count() == 0);
+    }
+  }
+
+  /* ---- U5e (row 85): the vararg-model + global-decl entries, and the
+  ** seam's link-time helpers ----
+  **
+  ** The seam's INTERPOSED behavior (the replicas winning the link —
+  ** where()-resolution over compiled frames, the nopos verdict, the
+  ** msgh flag at a real raise) is blob-side coverage: TestRT55BlobSmoke
+  ** + e003/e005/e011 + the hint-bearing error cases. The helpers
+  ** themselves (rt_sea_* above) link natively via the renamed include
+  ** and are pinned here. */
+  {
+    TValue extras[3], tab, dst[8], key, res;
+    int32_t r;
+    int j;
+
+    /* rt_varargtab: {1..n} + n as INTEGER over the staged extras */
+    rt_mkinteger(cell_of(&extras[0]), 10);
+    rt_mkinteger(cell_of(&extras[1]), 20);
+    rt_mkinteger(cell_of(&extras[2]), 30);
+    CHECK(rt_varargtab(cell_of(&tab), cell_of(&extras[0]), 3, 5) == RT_OK);
+    CHECK(ttistable(&tab));
+    for (j = 1; j <= 3; j++) {
+      luaH_getint(hvalue(&tab), j, &res);
+      CHECK(ttisinteger(&res) && ivalue(&res) == 10 * j);
+    }
+    setnilvalue(&res);
+    luaH_getstr(hvalue(&tab), luaS_new(L, "n"), &res);
+    CHECK(ttisinteger(&res) && ivalue(&res) == 3);
+
+    /* rt_getvarg: integral 1..nextra reads, "n" -> nextra INTEGER,
+       everything else nil (exact floats count; 0/negative/past-end don't) */
+    {
+      TValue k, out;
+      rt_addr vb = cell_of(&extras[0]);
+      rt_mkinteger(cell_of(&k), 2);
+      rt_getvarg(cell_of(&out), cell_of(&k), vb, 3);
+      CHECK(ttisinteger(&out) && ivalue(&out) == 20);
+      rt_mkinteger(cell_of(&k), 3);
+      rt_getvarg(cell_of(&out), cell_of(&k), vb, 3);
+      CHECK(ttisinteger(&out) && ivalue(&out) == 30);
+      rt_mknumber(cell_of(&k), 1.0); /* exact float key counts */
+      rt_getvarg(cell_of(&out), cell_of(&k), vb, 3);
+      CHECK(ttisinteger(&out) && ivalue(&out) == 10);
+      rt_mknumber(cell_of(&k), 1.5); /* non-integral -> nil */
+      rt_getvarg(cell_of(&out), cell_of(&k), vb, 3);
+      CHECK(ttisnil(&out));
+      rt_mkinteger(cell_of(&k), 0);
+      rt_getvarg(cell_of(&out), cell_of(&k), vb, 3);
+      CHECK(ttisnil(&out));
+      rt_mkinteger(cell_of(&k), 4); /* past nextra */
+      rt_getvarg(cell_of(&out), cell_of(&k), vb, 3);
+      CHECK(ttisnil(&out));
+      rt_intern(cell_of(&k), (rt_addr)(uintptr_t)"n", 1);
+      rt_getvarg(cell_of(&out), cell_of(&k), vb, 3);
+      CHECK(ttisinteger(&out) && ivalue(&out) == 3);
+      rt_intern(cell_of(&k), (rt_addr)(uintptr_t)"x", 1);
+      rt_getvarg(cell_of(&out), cell_of(&k), vb, 3);
+      CHECK(ttisnil(&out));
+    }
+
+    /* rt_errnnil: nil passes, non-nil raises with the name ("?" bare) */
+    {
+      TValue cell, name;
+      rt_mknil(cell_of(&cell));
+      CHECK(rt_errnnil(cell_of(&cell), 0, 40) == RT_OK);
+      rt_mkinteger(cell_of(&cell), 1);
+      rt_intern(cell_of(&name), (rt_addr)(uintptr_t)"g", 1);
+      CHECK(rt_errnnil(cell_of(&cell), cell_of(&name), 41) == RT_ERR);
+      CHECK(err_ends_with("script:41: global 'g' already defined"));
+      rt_err_clear();
+      CHECK(rt_errnnil(cell_of(&cell), 0, 42) == RT_ERR);
+      CHECK(err_ends_with("script:42: global '?' already defined"));
+      rt_err_clear();
+    }
+
+    /* rt_vararg_read (the k=1 table arm): count from t.n, raw reads,
+       nil-padding, user edits honored, the two raises */
+    r = rt_vararg_read(cell_of(&dst[0]), cell_of(&tab), 2, 8, 50);
+    CHECK(r == 2);
+    CHECK(ttisinteger(&dst[0]) && ivalue(&dst[0]) == 10);
+    CHECK(ttisinteger(&dst[1]) && ivalue(&dst[1]) == 20);
+
+    r = rt_vararg_read(cell_of(&dst[0]), cell_of(&tab), 5, 8, 51);
+    CHECK(r == 5); /* fixed count: nil-padded past n */
+    CHECK(ttisinteger(&dst[2]) && ivalue(&dst[2]) == 30);
+    CHECK(ttisnil(&dst[3]) && ttisnil(&dst[4]));
+
+    r = rt_vararg_read(cell_of(&dst[0]), cell_of(&tab), -1, 8, 52);
+    CHECK(r == 3); /* multret: all of t.n */
+
+    /* user edits are honored: t[2] = 99 raw (t.n still 3) */
+    rt_mkinteger(cell_of(&res), 99);
+    luaH_setint(L, hvalue(&tab), 2, &res);
+    r = rt_vararg_read(cell_of(&dst[0]), cell_of(&tab), -1, 8, 53);
+    CHECK(r == 3);
+    CHECK(ttisinteger(&dst[1]) && ivalue(&dst[1]) == 99);
+    rt_mkinteger(cell_of(&res), 2);
+    setsvalue(L, &key, luaS_new(L, "n"));
+    luaH_set(L, hvalue(&tab), &key, &res);
+    r = rt_vararg_read(cell_of(&dst[0]), cell_of(&tab), -1, 8, 54);
+    CHECK(r == 2);
+
+    /* t.n not a proper integer -> the stock raise */
+    rt_intern(cell_of(&res), (rt_addr)(uintptr_t)"x", 1);
+    luaH_set(L, hvalue(&tab), &key, &res);
+    CHECK(rt_vararg_read(cell_of(&dst[0]), cell_of(&tab), -1, 8, 55) ==
+          RT_ERR);
+    CHECK(err_ends_with("script:55: vararg table has no proper 'n'"));
+    rt_err_clear();
+    /* a non-table cell -> the same raise */
+    rt_mkinteger(cell_of(&extras[0]), 7);
+    CHECK(rt_vararg_read(cell_of(&dst[0]), cell_of(&extras[0]), -1, 8, 56) ==
+          RT_ERR);
+    CHECK(err_ends_with("vararg table has no proper 'n'"));
+    rt_err_clear();
+    /* an absurd t.n against the frame budget */
+    rt_mkinteger(cell_of(&res), 7);
+    luaH_set(L, hvalue(&tab), &key, &res);
+    CHECK(rt_vararg_read(cell_of(&dst[0]), cell_of(&tab), -1, 4, 57) ==
+          RT_ERR);
+    CHECK(err_ends_with("stack overflow"));
+    rt_err_clear();
+  }
+
+  /* ---- the seam helpers: the shadow line stack, the flags, the
+  ** no-dedup hint registry (the mechanics the replicas ride on; the
+  ** replicas' link-time interposition itself is blob-side) ---- */
+  {
+    int32_t linecell, maincell;
+    CallInfo fakeci;
+
+    /* the shadow stack: push binds entries by ci, setline binds the
+       CURRENT entry's line cell (and zeroes it — the first emitted
+       store brings in the real line), line reads back through the ci */
+    memset(&fakeci, 0, sizeof fakeci);
+    rt_sea_push(&fakeci);
+    CHECK(rt_sea_line(&fakeci) == 0); /* no cell bound yet */
+    linecell = 0; /* the cell starts zeroed by setline itself */
+    rt_sea_setline(cell_of((TValue *)(void *)&linecell));
+    linecell = 42; /* the "emitted store" */
+    CHECK(rt_sea_line(&fakeci) == 42);
+
+    /* two entries: the innermost (top) wins the lookup */
+    {
+      CallInfo innerci;
+      int32_t innercell;
+      memset(&innerci, 0, sizeof innerci);
+      rt_sea_push(&innerci);
+      rt_sea_setline(cell_of((TValue *)(void *)&innercell));
+      innercell = 7;
+      CHECK(rt_sea_line(&innerci) == 7);
+      CHECK(rt_sea_line(&fakeci) == 42); /* the outer entry intact */
+      rt_sea_pop();
+      CHECK(rt_sea_line(&innerci) == 0); /* popped: invisible */
+      CHECK(rt_sea_line(&fakeci) == 42); /* the survivor still live */
+    }
+
+    /* the main-chunk bottom entry: keyed &base_ci over the live state */
+    rt_sea_main(cell_of((TValue *)(void *)&maincell));
+    maincell = 3;
+    CHECK(rt_sea_line(&L->base_ci) == 3);
+    rt_sea_pop();
+    CHECK(rt_sea_line(&L->base_ci) == 0);
+
+    /* reset drains everything */
+    rt_sea_reset();
+    CHECK(rt_sea_line(&fakeci) == 0);
+
+    /* the two verdict flags round-trip (and reset clears them) */
+    rt_sea_nopos_set(1);
+    rt_sea_msgh_ran_set(1);
+    CHECK(rt_sea_nopos() == 1 && rt_sea_msgh_ran() == 1);
+    rt_sea_nopos_set(0);
+    rt_sea_msgh_ran_set(0);
+    CHECK(rt_sea_nopos() == 0 && rt_sea_msgh_ran() == 0);
+    rt_sea_nopos_set(1);
+    rt_sea_msgh_ran_set(1);
+    rt_sea_reset();
+    CHECK(rt_sea_nopos() == 0 && rt_sea_msgh_ran() == 0);
+
+    /* rt_hint_put is a NO-DEDUP table: the same bytes register twice
+       (positions are the identity — concat's operand runs index
+       hbase+idx densely; the name table's dedup would break that) */
+    {
+      int32_t h1 = rt_hint_put((rt_addr)(uintptr_t)" (local 'x')", 12);
+      int32_t h2 = rt_hint_put((rt_addr)(uintptr_t)" (local 'x')", 12);
+      int32_t h3 = rt_hint_put((rt_addr)(uintptr_t)" (global 'g')", 13);
+      CHECK(h1 >= 0 && h2 == h1 + 1 && h3 == h2 + 1);
     }
   }
 

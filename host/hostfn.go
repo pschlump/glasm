@@ -9,6 +9,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 )
 
 // ValueError lets a HostFunc raise a non-string Lua error value — e.g. a
@@ -43,7 +44,9 @@ func (vm *VM) hostEvent(kind, ptr, length int32) {
 // dispatches a compiled proto through the host into the script module's
 // lua_dispatch — a nested wasm Call on this same goroutine. A trap inside
 // the dispatch must not unwind through wasm: surface as a refused
-// dispatch (-3); the adapter re-raises it as a Lua error.
+// dispatch (-3); the adapter re-raises it as a Lua error. A
+// stack-exhaustion trap maps to RTW_STACKTRAP (-4) instead — the blob
+// stages its clean catchable "stack overflow" (U5e, row 20 family).
 func (vm *VM) hostDispatch(idx, frame, cl, nargs, want int32) int32 {
 	if vm.scriptInst == nil {
 		return -3
@@ -54,6 +57,9 @@ func (vm *VM) hostDispatch(idx, frame, cl, nargs, want int32) int32 {
 	}
 	res, err := fn.Call(vm.runCtx(), u32v(idx), u32v(frame), u32v(cl), u32v(nargs), u32v(want))
 	if err != nil {
+		if strings.Contains(err.Error(), "call stack exhausted") {
+			return -4
+		}
 		return -3
 	}
 	return int32(res[0])

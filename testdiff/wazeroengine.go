@@ -161,7 +161,9 @@ func (e *WazeroEngine) Run(c Case) (log []string) {
 	// adapter dispatches compiled protos through the host into the script
 	// module's lua_dispatch (same goroutine, nested call). A trap inside
 	// the dispatch must not unwind through wasm: surface as a refused
-	// dispatch (-3); the adapter re-raises it as a Lua error.
+	// dispatch (-3); the adapter re-raises it as a Lua error. U5e (row 20
+	// family): a stack-exhaustion trap maps to RTW_STACKTRAP instead —
+	// the blob stages its clean catchable "stack overflow".
 	var scriptInst api.Module
 	dispatch := func(idx, frame, cl, nargs, want int32) int32 {
 		if scriptInst == nil {
@@ -173,6 +175,9 @@ func (e *WazeroEngine) Run(c Case) (log []string) {
 		}
 		res, err := fn.Call(ctx, u32(idx), u32(frame), u32(cl), u32(nargs), u32(want))
 		if err != nil {
+			if strings.Contains(err.Error(), "call stack exhausted") {
+				return rtwStackTrap
+			}
 			return -3
 		}
 		return int32(res[0])

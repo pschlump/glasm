@@ -122,6 +122,12 @@ typedef int32_t rt_addr;
 #define RTW_ERR (-1)
 #define RTW_TAIL (-2)
 #define RTW_REFUSED (-3)
+/* U5e (row 20 family): the host's wasm_dispatch returns this when the
+   engine trapped the nested call with "call stack exhausted" — chunk
+   frame sizes vary, so the trap can fire below RTW_MAX_DEPTH. The
+   trampoline stages the same bare "stack overflow" the depth guard
+   stages (the catching rt_run adds the position). */
+#define RTW_STACKTRAP (-4)
 
 /* Lua-level wasm frame guard: bounds pure wasm-frame nesting (direct
    dispatch chains). Calls interleaved with C (rt_call through Lua) also
@@ -151,24 +157,33 @@ int32_t rt_intern(rt_addr cell, rt_addr ptr, int32_t len);
 int32_t rt_newtable(rt_addr cell, int32_t narr, int32_t nrec);
 
 /* tables, arith, length, compares, concat — all metamethod-complete and
-   protected (an error stages and returns RT_ERR) */
+   protected (an error stages and returns RT_ERR).
+   U5e (row 71): the raising entries carry trailing varinfo-hint indexes
+   (rt_hint_put's positions; -1 = none) — the backend's precomputed
+   interp answers for the typeerror/callerror/concaterror hints stock's
+   varinfo cannot produce over CClosure frames. Additive trailing i32s:
+   LUA_RT_ABI deliberately stays 4 (the blob and the backend evolve
+   together in-tree; there is no external producer of either side). */
 int32_t rt_gettable(rt_addr tblcell, rt_addr keycell, rt_addr dstcell,
-                    int32_t line);
+                    int32_t line, int32_t hobj, int32_t hcall);
 int32_t rt_settable(rt_addr tblcell, rt_addr keycell, rt_addr valcell,
-                    int32_t line);
+                    int32_t line, int32_t hobj, int32_t hcall);
 int32_t rt_arith(int32_t op, rt_addr lhscell, rt_addr rhscell, rt_addr dstcell,
-                 int32_t line);
-int32_t rt_len(rt_addr cell, rt_addr dstcell, int32_t line);
+                 int32_t line, int32_t h1, int32_t h2, int32_t hcall);
+int32_t rt_len(rt_addr cell, rt_addr dstcell, int32_t line, int32_t hobj,
+               int32_t hcall);
 int32_t rt_eq(rt_addr a, rt_addr b, rt_addr dst, int32_t line);
 int32_t rt_lt(rt_addr a, rt_addr b, rt_addr dst, int32_t line);
 int32_t rt_le(rt_addr a, rt_addr b, rt_addr dst, int32_t line);
-int32_t rt_concat(rt_addr cells, int32_t count, rt_addr dstcell, int32_t line);
+int32_t rt_concat(rt_addr cells, int32_t count, rt_addr dstcell, int32_t line,
+                  int32_t hbase, int32_t hcall);
 
 /* calls: the universal fallback for dynamic callees. Results overwrite
    the arg cells; want<0 means multret and the negative result count is
-   returned (rt_call_count decodes). */
+   returned (rt_call_count decodes). hcallee = the call-error hint
+   (funcnamefromcode's answer for the call site; U5e, row 71). */
 int32_t rt_call(rt_addr funcell, rt_addr argcells, int32_t nargs, int32_t want,
-                int32_t line);
+                int32_t line, int32_t hcallee);
 int32_t rt_call_count(int32_t encoded);
 
 /* numeric-for preparation on the three control cells (init, limit, step),
@@ -211,6 +226,25 @@ void rt_setupval(rt_addr cl, int32_t idx, rt_addr cell);
 void rt_close_upvals(rt_addr level);
 int32_t rt_clidx(rt_addr funcell);
 
+/* U5e (row 85): the 5.5 vararg / global-decl entries. rt_varargtab is
+   the table model's OP_VARARGPREP (stock createvarargtab): builds
+   {1..n, n=n-INTEGER} from the extras at src into dst, under rt_run.
+   rt_getvarg is OP_GETVARG (stock luaT_getvararg, hidden model) —
+   never raises, plain like rt_getupval: an integral key 1..nextra
+   reads the extra at vabase, "n" yields nextra, else nil.
+   rt_errnnil is OP_ERRNNIL (stock luaG_errnnil's raise): errors when
+   cell is non-nil, naming it from namecell (0 => "?"), under rt_run. */
+int32_t rt_varargtab(rt_addr dst, rt_addr src, int32_t n, int32_t line);
+void rt_getvarg(rt_addr dst, rt_addr key, rt_addr vabase, int32_t nextra);
+int32_t rt_errnnil(rt_addr cell, rt_addr namecell, int32_t line);
+/* OP_VARARG's k=1 arm (the table model — the interp spec, _vm.go): dst
+   cells receive min(nwant, t.n) raw table reads, nil-padded to nwant;
+   the count is t.n as an exact integer 0..INT_MAX/2 (else the raise).
+   nwant < 0 = multret (all n, count returned); dstcap bounds the write
+   to the fixed register window. Returns the resolved count or RT_ERR. */
+int32_t rt_vararg_read(rt_addr dst, rt_addr tabcell, int32_t nwant,
+                       int32_t dstcap, int32_t line);
+
 /* to-be-closed variables (U4f) — the rt-owned registry keyed by frame-cell
    address (stock threads L->tbclist through the Lua stack slots; compiled
    frames' registers live in the wasm frame region instead). rt_name_put
@@ -241,5 +275,58 @@ int32_t rt_tail_clidx(void);
 int32_t rt_tail_nargs(void);
 rt_addr rt_tail_funcell(void);
 rt_addr rt_tail_restage(void);
+
+/* the row-60 error-position seam (U5e; runtime/rt_seam55.c — linked only
+   into lua55_rt.wasm, ahead of the stock objects, so its luaL_where/
+   lua_error/luaG_runerror replicas win the link). The shadow line stack:
+   every dispatch trampoline pushes an entry keyed by its CallInfo, the
+   wasm function's prologue binds its line cell (frame+16*(nregs+4), the
+   spare inside frameCells) via rt_sea_setline, and each emitted
+   instruction stores its source line there first — the seam's luaL_where
+   reads it instead of stock's C-frame-blind getinfo. rt_sea_main plants
+   the main chunk's bottom entry (keyed &base_ci — lua_main runs cl=0
+   with no CallInfo, so stock lua_getstack fails at main level); the
+   emitted main pops it at both exits. rt_sea_nopos is the interposed
+   lua_error's verdict consulted by rt_run's prefix rule (a bare string
+   raised without a resolvable position gets no rt prefix). rt_curL
+   hands rt_seam55.c the static running state. */
+void rt_sea_push(struct CallInfo *ci);
+void rt_sea_pop(void);
+void rt_sea_setline(rt_addr linecell);
+void rt_sea_main(rt_addr linecell);
+void rt_sea_reset(void);
+int rt_sea_line(struct CallInfo *ci);
+int32_t rt_sea_nopos(void);
+void rt_sea_nopos_set(int32_t v);
+/* the msgh seam (U5e, row 85): the interposed luaG_errormsg sets this
+   when it dispatched an in-flight error's handler at a C-land raise;
+   rtw_reraise's handler arm reads it to avoid a double run (errors that
+   entered flight by direct staging never passed through errormsg — the
+   arm runs their handler at the crossing into C-land, guarded on the
+   rp shadow so exactly one reraise in a cascade does). */
+int32_t rt_sea_msgh_ran(void);
+void rt_sea_msgh_ran_set(int32_t v);
+struct lua_State;
+struct lua_State *rt_curL(void);
+
+/* the varinfo hint seam (U5e, row 71 — same replica family as above).
+   rt_hint_put registers one formatted " (local 'x')"-class hint at init
+   (rt_name_put's pattern; index = position, embedded in the emitted
+   code). rt_sea_hint_set arms the three raise slots — rt_run funnels it
+   for every entry, so a raise can never read a stale hint. tgtop is the
+   entry's typeerror operand (a TValue copy taken here; NULL when the
+   entry arms none): the interp applies a table-op hint only when the
+   RAISED object is the original operand (chain iteration 0 — _state.go
+   getField/setField's `i == 0` guard), so the seam's luaG_typeerror
+   replica value-compares o against the snapshot before using h1. The
+   concat window stack maps luaG_concaterror's stack pointers back to a
+   run index: rt_concat pushes (hbase, savestack offset of operand 0)
+   before its protected body and pops after (rt_run folds the error
+   status, so the pop always runs; a __concat metamethod may nest
+   rt_concat). */
+int32_t rt_hint_put(rt_addr ptr, int32_t len);
+void rt_sea_hint_set(int32_t h1, int32_t h2, int32_t hc, const void *tgtop);
+void rt_sea_concat_push(int32_t hbase, int64_t winoff);
+void rt_sea_concat_pop(void);
 
 #endif /* RT_ABI55_H */

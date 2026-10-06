@@ -35,6 +35,12 @@ import (
 //go:embed lua55_rt.wasm
 var lua55RtWasm []byte
 
+// rtwStackTrap mirrors the blob's RTW_STACKTRAP (-4, rt_abi55.h): the
+// host dispatch returns it when the engine trapped the nested call with
+// "call stack exhausted", and the blob's trampoline stages the same
+// bare "stack overflow" its depth guard stages (U5e, row 20 family).
+const rtwStackTrap = int32(-4)
+
 // gcStop runs collectgarbage('stop') in the runtime state via the M2
 // driver's ldostring (v1 mitigation — see the Run comment).
 func (e *WasmEngine) gcStop(store *wt.Store, rtInst *wt.Instance, call func(*wt.Instance, string, ...interface{}) (interface{}, error), L interface{}, name string) error {
@@ -355,8 +361,15 @@ func (e *WasmEngine) Run(c Case) (log []string) {
 		}
 		res, err := fn.Call(store, idx, frame, cl, nargs, want)
 		if err != nil {
-			// a trap inside the dispatch must not unwind through wasm:
-			// surface as a refused dispatch; the adapter raises it
+			// a trap inside the dispatch must not unwind through wasm.
+			// U5e (row 20 family): a stack-exhaustion trap is the depth
+			// bound for chunks whose per-level frames beat RTW_MAX_DEPTH
+			// to the engine limit — map it to the sentinel the blob
+			// stages as a clean catchable "stack overflow"; every other
+			// trap surfaces as a refused dispatch.
+			if strings.Contains(err.Error(), "call stack exhausted") {
+				return rtwStackTrap
+			}
 			return -3
 		}
 		if n, ok := res.(int32); ok {

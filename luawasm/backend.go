@@ -70,12 +70,15 @@ func Compile(main *lua.FunctionProto, chunkName string) ([]byte, error) {
 	b.layoutProtos(protos)
 	b.collectTBCNames()
 	b.declareImports()
-	b.emitInit()
 	for _, pi := range b.protos {
 		fe := b.newFuncEmitter(pi.proto)
 		fe.emitBody()
 		b.protoFuncs = append(b.protoFuncs, fe.f)
 	}
+	// U5e: emitInit runs AFTER the bodies — the varinfo hint registry is
+	// collected while lowering (the same GetObjName walk the interp
+	// resolves lazily at raise time, precomputed per raise site here)
+	b.emitInit()
 	b.emitDispatch()
 	b.emitMain()
 	return b.m.Encode(), nil
@@ -102,6 +105,63 @@ type backend struct {
 	// tbcNames (U4f): the OP_TBC variable names, init-registered via
 	// rt_name_put in this order — the OP_TBC lowering embeds the index
 	tbcNames []string
+	// hints (U5e, row 71): the formatted varinfo hint strings the raising
+	// rt_* entries reference by index — the interp's own findsetreg/
+	// getobjname answers (varinfo.go), precomputed per raise site and
+	// registered via rt_hint_put in this order. NO dedup: concat runs
+	// need hbase+idx to address contiguous entries, so every site appends
+	hints []string
+}
+
+// hint appends s to the hint registry and returns its index (the emitted
+// code embeds it; -1 means "no hint" and never enters the table).
+func (b *backend) hint(s string) int32 {
+	b.hints = append(b.hints, s)
+	return int32(len(b.hints) - 1)
+}
+
+// hintSite: the interp's protoVarinfo answer for register reg at lastpc
+// (the raise site's cf.Pc-1) — -1 when the operand carries no name.
+func (b *backend) hintSite(p *lua.FunctionProto, lastpc, reg int) int32 {
+	kind, name := lua.GetObjName(p, lastpc, reg)
+	if kind == "" {
+		return -1
+	}
+	return b.hint(lua.FormatVarInfo(kind, name))
+}
+
+// hintUpv: the GETTABUP/SETTABUP object hint — the table operand is an
+// upvalue cell (varinfo's getupvalname arm; upvalHint on the interp).
+func (b *backend) hintUpv(p *lua.FunctionProto, uv int) int32 {
+	return b.hint(lua.FormatVarInfo("upvalue", lua.UpvalName(p, uv)))
+}
+
+// hintCallSite: the call-error hint — funcnamefromcode's answer for the
+// instruction at pc (the interp's raiseCallError naming; ""-kind — an
+// unattributable call site the interp's register VALUE scan would have
+// to resolve — is not precomputable, so -1: the wasm raise carries no
+// hint, the one known row-71 residual).
+func (b *backend) hintCallSite(p *lua.FunctionProto, pc int) int32 {
+	kind, name := lua.FuncNameFromCode(p, pc)
+	if kind == "" {
+		return -1
+	}
+	return b.hint(lua.FormatVarInfo(kind, name))
+}
+
+// hintRun: OP_CONCAT's operand run — registers hints for regs
+// [base, base+count) CONTIGUOUSLY (unnamed operands take the empty
+// string, so the seam's hbase+idx mapping stays dense) and returns the
+// base index.
+func (b *backend) hintRun(p *lua.FunctionProto, pc, base, count int) int32 {
+	h := int32(-1)
+	for r := base; r < base+count; r++ {
+		kind, name := lua.GetObjName(p, pc, r)
+		if idx := b.hint(lua.FormatVarInfo(kind, name)); h < 0 {
+			h = idx
+		}
+	}
+	return h
 }
 
 func (b *backend) imp(name string) uint32 { return b.imports[name] }
@@ -132,11 +192,20 @@ func (b *backend) collectTBCNames() {
 	for i := range b.protos {
 		pi := &b.protos[i]
 		for pc, inst := range pi.proto.Code {
-			if lua.OpGetOpCode(inst) != lua.OP_TBC {
+			// OP_TFORPREP registers its closing value too (U5e, row 85):
+			// after the swap, the closing variable sits at A+2 and its
+			// debug name at A+3 — the interp's registerTBC(RA+2, A+3).
+			dreg := 0
+			switch lua.OpGetOpCode(inst) {
+			case lua.OP_TBC:
+				dreg = int(lua.OpGetArgA(inst)) + 1
+			case lua.OP_TFORPREP:
+				dreg = int(lua.OpGetArgA(inst)) + 3
+			default:
 				continue
 			}
 			name := "?"
-			if nm, ok := lua.LocalNameAt(pi.proto, int(lua.OpGetArgA(inst))+1, pc); ok {
+			if nm, ok := lua.LocalNameAt(pi.proto, dreg, pc); ok {
 				name = nm
 			}
 			if pi.tbcIdx == nil {
@@ -166,6 +235,8 @@ func (b *backend) declareImports() {
 	iii := []wasm.ValueType{wasm.I32, wasm.I32, wasm.I32}
 	iiii := []wasm.ValueType{wasm.I32, wasm.I32, wasm.I32, wasm.I32}
 	iiiii := []wasm.ValueType{wasm.I32, wasm.I32, wasm.I32, wasm.I32, wasm.I32}
+	iiiiii := []wasm.ValueType{wasm.I32, wasm.I32, wasm.I32, wasm.I32, wasm.I32, wasm.I32}
+	iiiiiiii := []wasm.ValueType{wasm.I32, wasm.I32, wasm.I32, wasm.I32, wasm.I32, wasm.I32, wasm.I32, wasm.I32}
 	i32f64 := []wasm.ValueType{wasm.I32, wasm.F64}
 	i32i64 := []wasm.ValueType{wasm.I32, wasm.I64}
 
@@ -175,15 +246,15 @@ func (b *backend) declareImports() {
 	// cells — the reason the 5.1 blob could not serve U2).
 	b.imports = map[string]uint32{
 		"rt_newtable":      m.ImportFunc("rt", "rt_newtable", iii, i32v),
-		"rt_gettable":      m.ImportFunc("rt", "rt_gettable", iiii, i32v),
-		"rt_settable":      m.ImportFunc("rt", "rt_settable", iiii, i32v),
-		"rt_arith":         m.ImportFunc("rt", "rt_arith", iiiii, i32v),
-		"rt_len":           m.ImportFunc("rt", "rt_len", iii, i32v),
+		"rt_gettable":      m.ImportFunc("rt", "rt_gettable", iiiiii, i32v),
+		"rt_settable":      m.ImportFunc("rt", "rt_settable", iiiiii, i32v),
+		"rt_arith":         m.ImportFunc("rt", "rt_arith", iiiiiiii, i32v),
+		"rt_len":           m.ImportFunc("rt", "rt_len", iiiii, i32v),
 		"rt_eq":            m.ImportFunc("rt", "rt_eq", iiii, i32v),
 		"rt_lt":            m.ImportFunc("rt", "rt_lt", iiii, i32v),
 		"rt_le":            m.ImportFunc("rt", "rt_le", iiii, i32v),
-		"rt_concat":        m.ImportFunc("rt", "rt_concat", iiii, i32v),
-		"rt_call":          m.ImportFunc("rt", "rt_call", iiiii, i32v),
+		"rt_concat":        m.ImportFunc("rt", "rt_concat", iiiiii, i32v),
+		"rt_call":          m.ImportFunc("rt", "rt_call", iiiiii, i32v),
 		"rt_call_count":    m.ImportFunc("rt", "rt_call_count", i32v, i32v),
 		"rt_forprep":       m.ImportFunc("rt", "rt_forprep", ii, i32v),
 		"rt_frame_alloc":   m.ImportFunc("rt", "rt_frame_alloc", i32v, i32v),
@@ -198,8 +269,16 @@ func (b *backend) declareImports() {
 		"rt_newclosure":    m.ImportFunc("rt", "rt_newclosure", iiiii, i32v),
 		"rt_getupval":      m.ImportFunc("rt", "rt_getupval", iii, nil),
 		"rt_setupval":      m.ImportFunc("rt", "rt_setupval", iii, nil),
+		"rt_varargtab":     m.ImportFunc("rt", "rt_varargtab", iiii, i32v),
+		"rt_getvarg":       m.ImportFunc("rt", "rt_getvarg", iiii, nil),
+		"rt_errnnil":       m.ImportFunc("rt", "rt_errnnil", iii, i32v),
+		"rt_vararg_read":   m.ImportFunc("rt", "rt_vararg_read", iiiii, i32v),
+		"rt_sea_setline":   m.ImportFunc("rt", "rt_sea_setline", i32v, nil),
+		"rt_sea_main":      m.ImportFunc("rt", "rt_sea_main", i32v, nil),
+		"rt_sea_pop":       m.ImportFunc("rt", "rt_sea_pop", nil, nil),
 		"rt_close_upvals":  m.ImportFunc("rt", "rt_close_upvals", i32v, nil),
 		"rt_name_put":      m.ImportFunc("rt", "rt_name_put", ii, i32v),
+		"rt_hint_put":      m.ImportFunc("rt", "rt_hint_put", ii, i32v),
 		"rt_tbc":           m.ImportFunc("rt", "rt_tbc", iii, i32v),
 		"rt_close":         m.ImportFunc("rt", "rt_close", i32v, i32v),
 		"rt_close_err":     m.ImportFunc("rt", "rt_close_err", i32v, nil),
@@ -241,7 +320,9 @@ func (b *backend) emitInit() {
 	for _, nm := range b.tbcNames { // U4f: the OP_TBC name table
 		strBytes += len(nm)
 	}
-
+	for _, h := range b.hints { // U5e: the varinfo hint table
+		strBytes += len(h)
+	}
 	f.I32Const(int32(strBytes)).Call(b.imp("rt_frame_alloc")).LocalSet(lS)
 	f.I32Const(int32(cellSize * total)).Call(b.imp("rt_frame_alloc")).LocalSet(lK)
 	f.LocalGet(lK).GlobalSet(b.gKCells)
@@ -264,6 +345,15 @@ func (b *backend) emitInit() {
 		writeStrBytes(f, lS, lC, nm)
 		f.LocalGet(lS).LocalGet(lC).I32Const(int32(len(nm))).I32Sub().I32Add()
 		f.I32Const(int32(len(nm))).Call(b.imp("rt_name_put")).Drop()
+	}
+
+	// the varinfo hint table (U5e, row 71): same pattern — the raising
+	// entries embed rt_hint_put's position for the precomputed
+	// " (local 'x')"-class strings (no dedup: concat runs index densely)
+	for _, h := range b.hints {
+		writeStrBytes(f, lS, lC, h)
+		f.LocalGet(lS).LocalGet(lC).I32Const(int32(len(h))).I32Sub().I32Add()
+		f.I32Const(int32(len(h))).Call(b.imp("rt_hint_put")).Drop()
 	}
 
 	for _, pi := range b.protos {
@@ -390,12 +480,21 @@ func (b *backend) emitDispatch() {
 func (b *backend) emitMain() {
 	f := b.m.NewFunction([]wasm.ValueType{wasm.I32}, []wasm.ValueType{wasm.I32})
 	f.Local(wasm.I32) // 1: the dispatch status
+	// U5e (row 60): plant the main chunk's bottom shadow entry — keyed
+	// &base_ci (lua_main runs cl=0 with no CallInfo, so stock
+	// lua_getstack cannot resolve main level) and bound to main's line
+	// cell at frame+16*(nregs_main+4). The dispatch's first wasm
+	// instruction rebinding the same cell is harmless; the pop at the
+	// single exit keeps the stack balanced for the next run.
+	f.LocalGet(0).I32Const(int32(cellSize * (int(b.main.NumUsedRegisters) + 4))).
+		I32Add().Call(b.imp("rt_sea_main"))
 	f.I32Const(0).LocalGet(0).I32Const(0).I32Const(0).I32Const(-1).
 		Call(b.dispatchFn)
 	f.LocalSet(1)
 	f.LocalGet(1).I32Const(-1).I32Eq().If(wasm.Void)
 	f.LocalGet(0).Call(b.imp("rt_close_err"))
 	f.End()
+	f.Call(b.imp("rt_sea_pop"))
 	f.LocalGet(1)
 	f.End()
 	f.Export("lua_main")

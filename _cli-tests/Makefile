@@ -239,15 +239,15 @@ define kvdb_seq
 	$(1) tmp/kvdb.db frobnicate $(2)
 endef
 
-# U2e (ledger row 60's error-position seam): kvdb raises error(msg, 0) —
-# level 0, deliberately position-free so all engines agree — but the
-# zero-patch rt layer cannot distinguish a level-0 error() from a C-frame
-# core raise (both arrive unprefixed; rt_run prefixes core raises so
-# "attempt to index..." texts match). The wasm leg carries the position
-# until the U5 error/EH pass adds the marker seam. Interp/clua legs stay
-# golden-checked; the wasm leg runs but its diff is expected to fail.
+# U5e (ledger row 85) landed the position seam — the where() family now
+# resolves compiled frames — but kvdb raises error(msg, 0), and the
+# level-0 arm calls NO where() at all, so the seam's nopos verdict never
+# fires and the wasm leg still gains the rt prefix (the e001 residual —
+# same row; interposing the static luaB_error would be needed). The
+# interp/clua legs stay golden-checked; the wasm leg runs but its diff
+# is expected to fail.
 test027:
-	@echo "== kvdb (interp / clua golden; wasm xfail: row 60 error-position seam)"
+	@echo "== kvdb (interp / clua golden; wasm xfail: row 85 e001 residual)"
 	$(GLUA) -w tmp/kvdb.wasm ./kvdb.lua > /dev/null
 	rm -f tmp/kvdb.db $(KVDB_OUT)
 	$(call kvdb_seq,$(GLUA) ./kvdb.lua,>> $(KVDB_OUT))
@@ -260,16 +260,16 @@ test027:
 	if diff -q $(KVDB_OUT) ref/kvdb.out >/dev/null; then \
 		echo "kvdb: wasm now matches — promote to full check3"; \
 	else \
-		echo "  kvdb wasm diverges as expected (row 60 error-position seam)"; \
+		echo "  kvdb wasm diverges as expected (row 85 e001 residual)"; \
 	fi
 	rm -f tmp/kvdb.db $(KVDB_OUT)
 
 # ---- calc (row 31 fixed: call_body rebasing across stack growth) ----
 
-# calc's error legs hit the same row-60 error-position seam as kvdb
-# (error(msg, 0)): interp+clua stay golden-checked, the wasm leg xfails.
+# calc's error legs hit the same e001 residual as kvdb (error(msg, 0)):
+# interp+clua stay golden-checked, the wasm leg xfails (row 85).
 test028:
-	@echo "== calc1 (interp / clua golden; wasm xfail: row 60 error-position seam)"
+	@echo "== calc1 (interp / clua golden; wasm xfail: row 85 e001 residual)"
 	$(GLUA) -w tmp/calc.wasm ./calc.lua > /dev/null
 	$(GLUA) ./calc.lua -f data/exprs.txt > out/calc1.i.out
 	$(CLUA) ./calc.lua -f data/exprs.txt > out/calc1.c.out
@@ -279,7 +279,7 @@ test028:
 	if diff -q out/calc1.w.out ref/calc1.out >/dev/null; then \
 		echo "calc1: wasm now matches — promote to full check3"; \
 	else \
-		echo "  calc1 wasm diverges as expected (row 60 error-position seam)"; \
+		echo "  calc1 wasm diverges as expected (row 85 e001 residual)"; \
 	fi
 test029:
 	$(call check3,calc2,calc,'2*(3+4)' '10 % 3' '2^0.5' '-3^-2')

@@ -29,13 +29,13 @@ func TestWasmErrorSuite(t *testing.T) {
 		t.Skip("error suite corpus empty — run TestGenM5ErrCorpus")
 	}
 	skipped := 0
-	seamSkips := CorpusSkipsFor(dir, []Engine{NewInterp("interp"), &WasmEngine{name: "wasm"}})
+	skips := CorpusSkips(dir)
 	for _, name := range names {
 		src, err := os.ReadFile(filepath.Join(dir, name))
 		if err != nil {
 			t.Fatal(err)
 		}
-		if why, ok := seamSkips[name]; ok {
+		if why, ok := skips[name]; ok {
 			skipped++
 			t.Logf("skip %s (%s)", name, why)
 			continue
@@ -48,7 +48,7 @@ func TestWasmErrorSuite(t *testing.T) {
 				t.Errorf("%s: %s", name, l)
 			}
 		}
-		if d := DiffLogs(a, b, true); d != "" {
+		if d := DiffLogs(a, b); d != "" {
 			t.Errorf("%s:\n%s", name, d)
 		}
 	}

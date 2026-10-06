@@ -69,13 +69,13 @@ io.write("line two\n")`},
 			wazero := (&WazeroEngine{name: "wazero", SkipUnsupported: true}).Run(c)
 			if tc.name == "iowrite" {
 				wasmtime := (&WasmEngine{name: "wasm"}).Run(c)
-				if d := DiffLogs(wasmtime, wazero, true); d != "" {
+				if d := DiffLogs(wasmtime, wazero); d != "" {
 					t.Errorf("ENGINE PARITY DIFF wasmtime vs wazero: %s\n  wasmtime: %v\n  wazero: %v", d, wasmtime, wazero)
 				}
 				return
 			}
 			want := interp.Run(c)
-			if d := DiffLogs(want, wazero, true); d != "" {
+			if d := DiffLogs(want, wazero); d != "" {
 				t.Errorf("DIFF interp vs wazero: %s\n  interp: %v\n  wazero: %v", d, want, wazero)
 			}
 		})

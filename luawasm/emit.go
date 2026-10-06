@@ -80,6 +80,24 @@ func (fe *funcEmitter) cellAddr(k int) *wasm.Function {
 	return fe.f.LocalGet(0).I32Const(int32(cellSize * k)).I32Add()
 }
 
+// hint wrappers (U5e, row 71): the varinfo-hint registry indexes for
+// this proto's raise sites — the backend's precomputed interp answers.
+func (fe *funcEmitter) hintSite(lastpc, reg int) int32 {
+	return fe.b.hintSite(fe.pi.proto, lastpc, reg)
+}
+
+func (fe *funcEmitter) hintUpv(uv int) int32 {
+	return fe.b.hintUpv(fe.pi.proto, uv)
+}
+
+func (fe *funcEmitter) hintCallSite(pc int) int32 {
+	return fe.b.hintCallSite(fe.pi.proto, pc)
+}
+
+func (fe *funcEmitter) hintRun(pc, base, count int) int32 {
+	return fe.b.hintRun(fe.pi.proto, pc, base, count)
+}
+
 // static scratch cell k (k=0,1): frame+16*(nregs+2+k) — per-instruction
 // lowering temporaries (compare results, materialized immediates, env
 // cells, SETLIST keys). Safe because every such use lives entirely
@@ -156,6 +174,23 @@ func (fe *funcEmitter) varargCellDyn() *wasm.Function {
 		LocalGet(fe.lT1).I32Const(16).I32Mul().I32Add()
 }
 
+// varargBase: the extras' first cell — rt_wasm_push_frame staged the
+// call's extra arguments at frame+16*framecells (U5e's rt_varargtab/
+// rt_getvarg src/vabase operand)
+func (fe *funcEmitter) varargBase() *wasm.Function {
+	return fe.f.LocalGet(0).I32Const(int32(cellSize * frameCells(fe.nregs))).I32Add()
+}
+
+// pushNextra: max(0, nargs - np) — the live extra count (the same
+// Select idiom as scratchDyn0, as a count not a byte offset)
+func (fe *funcEmitter) pushNextra() {
+	f := fe.f
+	f.LocalGet(2).I32Const(int32(fe.np)).I32Sub()
+	f.I32Const(0)
+	f.LocalGet(2).I32Const(int32(fe.np)).I32Sub().I32Const(0).I32GtS()
+	f.Select()
+}
+
 // bumpTop: if top < n { top = n } (interpreter registry semantics)
 func (fe *funcEmitter) bumpTop(n int) {
 	f := fe.f
@@ -225,6 +260,24 @@ func (fe *funcEmitter) line(pc int) int32 {
 	return int32(fe.proto.DbgSourcePositions[pc])
 }
 
+// lineCell: the spare cell inside frameCells (nregs+4) carries the
+// function's CURRENT source line for the row-60 seam (U5e). Its value
+// word (offset 0) is the line; the tag word stays untouched (the cell
+// is never a TValue).
+func (fe *funcEmitter) lineCellAddr() *wasm.Function {
+	return fe.f.LocalGet(0).I32Const(int32(cellSize * (fe.nregs + 4))).I32Add()
+}
+
+// storeLine: publish pc's source line into the line cell — emitted
+// first for EVERY real instruction, so any rt_* dispatch (call,
+// metamethod, close, return) resolves error()'s level target to the
+// line of the instruction in flight (the seam's luaL_where reads the
+// cell through the shadow stack).
+func (fe *funcEmitter) storeLine(pc int) {
+	fe.lineCellAddr()
+	fe.f.I32Const(fe.line(pc)).I32Store(0)
+}
+
 /* ---------- body ---------- */
 
 func (fe *funcEmitter) emitBody() {
@@ -238,7 +291,16 @@ func (fe *funcEmitter) emitBody() {
 		fe.b.m.ExportGlobal("gFrameCells", fe.b.m.GlobalI32(int32(frameCells(fe.nregs)+1), false))
 	}
 
-	// prologue: nil-fill R(min(nargs,np) .. nregs). The trampoline copied
+	// prologue: bind this frame's line cell into the CURRENT shadow
+	// entry (row 60 seam, U5e). The trampoline pushed the entry; its
+	// linecell pointer is NULL until here, so no C code running between
+	// the push and this call can see a stale line (none runs). The
+	// M5c restage re-dispatches a successor proto at the same entry —
+	// this call rebinds it to the successor's cell.
+	fe.lineCellAddr()
+	f.Call(fe.b.imp("rt_sea_setline"))
+
+	// nil-fill R(min(nargs,np) .. nregs). The trampoline copied
 	// actual params into R(0..np-1) (and dropped extras for non-vararg
 	// protos, like stock luaD_precall), so the fill starts at min(nargs,
 	// np) — covering missing params and unused registers alike.
@@ -457,6 +519,7 @@ func (fe *funcEmitter) emitBlockBody(start, end int) {
 	pc := start
 	for pc < end {
 		inst := code[pc]
+		fe.storeLine(pc) // row-60 seam: the in-flight line for where()
 		op := lua.OpGetOpCode(inst)
 		A := lua.OpGetArgA(inst)
 		B := lua.OpGetArgB(inst)
@@ -535,6 +598,10 @@ func (fe *funcEmitter) emitBlockBody(start, end int) {
 				fe.kcell(C)
 				fe.cellAddr(A)
 				fe.f.I32Const(fe.line(pc))
+				// row-71 hints: the object is the upvalue cell B; the
+				// __index-not-callable call error names "metamethod 'index'"
+				fe.f.I32Const(int32(fe.hintUpv(B)))
+				fe.f.I32Const(int32(fe.hintCallSite(pc)))
 				fe.f.Call(fe.b.imp("rt_gettable"))
 				fe.checkStatus()
 			}
@@ -554,6 +621,8 @@ func (fe *funcEmitter) emitBlockBody(start, end int) {
 				fe.kcell(B)
 				fe.vcCell(C, k)
 				fe.f.I32Const(fe.line(pc))
+				fe.f.I32Const(int32(fe.hintUpv(A)))
+				fe.f.I32Const(int32(fe.hintCallSite(pc)))
 				fe.f.Call(fe.b.imp("rt_settable"))
 				fe.checkStatus()
 			}
@@ -562,6 +631,8 @@ func (fe *funcEmitter) emitBlockBody(start, end int) {
 			fe.cellAddr(C)
 			fe.cellAddr(A)
 			fe.f.I32Const(fe.line(pc))
+			fe.f.I32Const(int32(fe.hintSite(pc, B)))
+			fe.f.I32Const(int32(fe.hintCallSite(pc)))
 			fe.f.Call(fe.b.imp("rt_gettable"))
 			fe.checkStatus()
 			fe.bumpTop(A + 1)
@@ -571,6 +642,8 @@ func (fe *funcEmitter) emitBlockBody(start, end int) {
 			fe.scratchAddr(1)
 			fe.cellAddr(A)
 			fe.f.I32Const(fe.line(pc))
+			fe.f.I32Const(int32(fe.hintSite(pc, B)))
+			fe.f.I32Const(int32(fe.hintCallSite(pc)))
 			fe.f.Call(fe.b.imp("rt_gettable"))
 			fe.checkStatus()
 			fe.bumpTop(A + 1)
@@ -579,6 +652,8 @@ func (fe *funcEmitter) emitBlockBody(start, end int) {
 			fe.kcell(C)
 			fe.cellAddr(A)
 			fe.f.I32Const(fe.line(pc))
+			fe.f.I32Const(int32(fe.hintSite(pc, B)))
+			fe.f.I32Const(int32(fe.hintCallSite(pc)))
 			fe.f.Call(fe.b.imp("rt_gettable"))
 			fe.checkStatus()
 			fe.bumpTop(A + 1)
@@ -587,6 +662,8 @@ func (fe *funcEmitter) emitBlockBody(start, end int) {
 			fe.cellAddr(B)
 			fe.vcCell(C, k)
 			fe.f.I32Const(fe.line(pc))
+			fe.f.I32Const(int32(fe.hintSite(pc, A)))
+			fe.f.I32Const(int32(fe.hintCallSite(pc)))
 			fe.f.Call(fe.b.imp("rt_settable"))
 			fe.checkStatus()
 		case lua.OP_SETI:
@@ -595,6 +672,8 @@ func (fe *funcEmitter) emitBlockBody(start, end int) {
 			fe.scratchAddr(1)
 			fe.vcCell(C, k)
 			fe.f.I32Const(fe.line(pc))
+			fe.f.I32Const(int32(fe.hintSite(pc, A)))
+			fe.f.I32Const(int32(fe.hintCallSite(pc)))
 			fe.f.Call(fe.b.imp("rt_settable"))
 			fe.checkStatus()
 		case lua.OP_SETFIELD:
@@ -602,6 +681,8 @@ func (fe *funcEmitter) emitBlockBody(start, end int) {
 			fe.kcell(B)
 			fe.vcCell(C, k)
 			fe.f.I32Const(fe.line(pc))
+			fe.f.I32Const(int32(fe.hintSite(pc, A)))
+			fe.f.I32Const(int32(fe.hintCallSite(pc)))
 			fe.f.Call(fe.b.imp("rt_settable"))
 			fe.checkStatus()
 		case lua.OP_NEWTABLE:
@@ -629,6 +710,8 @@ func (fe *funcEmitter) emitBlockBody(start, end int) {
 			fe.kcell(C)
 			fe.cellAddr(A)
 			fe.f.I32Const(fe.line(pc))
+			fe.f.I32Const(int32(fe.hintSite(pc, B)))
+			fe.f.I32Const(int32(fe.hintCallSite(pc)))
 			fe.f.Call(fe.b.imp("rt_gettable"))
 			fe.checkStatus()
 			fe.copyCell(fe.cell(A+1), fe.scratchAddrCell(0))
@@ -662,15 +745,21 @@ func (fe *funcEmitter) emitBlockBody(start, end int) {
 			fe.cellAddr(B)
 			fe.cellAddr(A)
 			fe.f.I32Const(fe.line(pc))
+			fe.f.I32Const(int32(fe.hintSite(pc, B)))
+			fe.f.I32Const(int32(fe.hintCallSite(pc)))
 			fe.f.Call(fe.b.imp("rt_len"))
 			fe.checkStatus()
 			fe.bumpTop(A + 1)
 		case lua.OP_CONCAT:
-			// R[A] := R[A] .. ... .. R[A+B-1] — cells base R(A), count B
+			// R[A] := R[A] .. ... .. R[A+B-1] — cells base R(A), count B;
+			// the hint run covers every operand (the seam maps the faulty
+			// slot back to its index by stack position, row 71)
 			fe.cellAddr(A)
 			fe.f.I32Const(int32(B))
 			fe.cellAddr(A)
 			fe.f.I32Const(fe.line(pc))
+			fe.f.I32Const(int32(fe.hintRun(pc, A, B)))
+			fe.f.I32Const(int32(fe.hintCallSite(pc)))
 			fe.f.Call(fe.b.imp("rt_concat"))
 			fe.checkStatus()
 			fe.bumpTop(A + 1)
@@ -750,10 +839,16 @@ func (fe *funcEmitter) emitBlockBody(start, end int) {
 			fe.emitForprep(A, Bx, pc)
 			terminal = true
 		case lua.OP_TFORPREP:
-			// swap the control (R[A+3]) and closing (R[A+2]) cells; the
-			// to-be-closed registration is U5 (the compiler passes only
-			// nil closings until then) — then jump to the TFORCALL
+			// U5e (row 85): swap the control (R[A+3]) and closing
+			// (R[A+2]) cells, then register the closing value
+			// to-be-closed (the interp's registerTBC(RA+2, A+3) —
+			// nil/false exempt inside rt_tbc) — then jump to the TFORCALL
 			fe.swapCells(A+2, A+3)
+			fe.cellAddr(A + 2)
+			fe.f.I32Const(int32(fe.pi.tbcIdx[pc]))
+			fe.f.I32Const(fe.line(pc))
+			fe.f.Call(fe.b.imp("rt_tbc"))
+			fe.checkStatus()
 			fe.setBlk(fe.blockOf(fe.tforprepTarget(pc)))
 			terminal = true
 		case lua.OP_TFORCALL:
@@ -779,15 +874,56 @@ func (fe *funcEmitter) emitBlockBody(start, end int) {
 			fe.checkStatus()
 			fe.bumpTop(A + 1)
 		case lua.OP_VARARG:
-			fe.emitVararg(A, C)
+			fe.emitVararg(A, B, C, k, pc)
 		case lua.OP_VARARGPREP:
-			// thin marker over the trampoline's call-time arg split —
-			// nothing to lower (the 5.4+ vararg model is U5)
+			// U5e (row 85): table model builds the vararg table into
+			// R(np) (stock createvarargtab over the staged extras);
+			// hidden model is a no-op — the trampoline already staged
+			// the extras at the vararg base and wasm registers are
+			// frame-relative, so the interp's param shift has nothing
+			// to do
+			if fe.proto.IsVarArg&lua.VarArgTable != 0 {
+				fe.cellAddr(fe.np)
+				fe.varargBase()
+				fe.pushNextra()
+				fe.f.I32Const(fe.line(pc))
+				fe.f.Call(fe.b.imp("rt_varargtab"))
+				fe.checkStatus()
+				fe.bumpTop(fe.np + 1)
+			}
 		case lua.OP_EXTRAARG:
 			// consumed by its primary (LOADKX/NEWTABLE/SETLIST)
 			panic("luawasm: EXTRAARG reached as real code (pairing bug)")
-		case lua.OP_GETVARG, lua.OP_ERRNNIL:
-			panic(fmt.Sprintf("luawasm: opcode %d never compiles until U5", op))
+		case lua.OP_GETVARG:
+			// U5e (row 85): the hidden model's named `...t[i]` read —
+			// never raises (rt_getvarg is plain like rt_getupval):
+			// integral key 1..nextra reads the extra, "n" yields nextra,
+			// else nil
+			fe.cellAddr(A)
+			fe.cellAddr(C)
+			fe.varargBase()
+			fe.pushNextra()
+			fe.f.Call(fe.b.imp("rt_getvarg"))
+			fe.bumpTop(A + 1)
+		case lua.OP_ERRNNIL:
+			// U5e (row 85): a global declaration whose register is
+			// already non-nil raises (stock luaG_errnnil) — name from
+			// K[Bx-1] when the compiler recorded a string constant
+			fe.tagIs(A, rtTagNil).I32Eqz().If(wasm.Void)
+			fe.cellAddr(A)
+			if Bx > 0 && Bx-1 < len(fe.proto.Constants) {
+				if _, ok := fe.proto.Constants[Bx-1].(lua.LString); ok {
+					fe.kcell(Bx - 1)
+				} else {
+					fe.f.I32Const(0)
+				}
+			} else {
+				fe.f.I32Const(0)
+			}
+			fe.f.I32Const(fe.line(pc))
+			fe.f.Call(fe.b.imp("rt_errnnil"))
+			fe.checkStatus()
+			fe.f.End()
 		default:
 			panic(fmt.Sprintf("luawasm: unhandled opcode %d", op))
 		}

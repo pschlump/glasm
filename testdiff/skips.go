@@ -19,43 +19,44 @@ func CorpusSkips(dir string) map[string]string {
 		return wasmTestsSkips
 	case "_wasm-err-tests":
 		return ledgeredErrSkips
+	case "_u5":
+		return u5WasmSkips
 	default:
 		return nil
 	}
 }
 
-// CorpusSkipsFor: CorpusSkips plus the skips that apply only when the
-// engine set includes a hintless seam engine (row 71 — the wasm legs).
-func CorpusSkipsFor(dir string, engines []Engine) map[string]string {
-	skips := CorpusSkips(dir)
-	seam := false
-	for _, e := range engines {
-		if seamHintless(e) {
-			seam = true
-			break
-		}
-	}
-	if !seam {
-		return skips
-	}
-	merged := make(map[string]string, len(skips)+len(seamHintPrintSkips))
-	for k, v := range skips {
-		merged[k] = v
-	}
-	for k, v := range seamHintPrintSkips {
-		merged[k] = v
-	}
-	return merged
+// u5WasmSkips (U5e, row 85): _u5 cases whose interp↔wasm divergence is
+// ruled — everything else on the corpus must be byte-exact on the wasm
+// legs, the Stage A/B/C surfaces included. The oracle gate (TestU5Gate,
+// interp↔clua55) runs the corpus whole: every skip here is an
+// engine-seam divergence, not a language one.
+var u5WasmSkips = map[string]string{
+	// the U5d yield surface is interp-side; the backend grows it at U6
+	// (row 84's wasm clause)
+	"coyield01.lua": "yield through marker frames is interp-side; backend at U6 — row 84",
+	"coyield02.lua": "noyield boundary error is interp-side; backend at U6 — row 84",
+	"coyield03.lua": "yield through marker frames is interp-side; backend at U6 — row 84",
+	"coyield04.lua": "yield through marker frames is interp-side; backend at U6 — row 84",
+	"coyield05.lua": "kind-6 metamethod yields are interp-side; backend at U6 — row 84",
+	"coyield06.lua": "kinds 4/5 close continuations are interp-side; backend at U6 — row 84",
+	// debug introspection over wasm frames (the row-23 family)
+	"dbg01.lua":    "debug.getlocal level walk over wasm frames — row 23",
+	"rdkctc01.lua": "debug.getlocal level walk over wasm frames (:54) — row 23",
+	// the row-61 GC freeze
+	"gcparam01.lua": "collectgarbage inert under the per-run GC freeze — row 61",
+	// the row-60 CClosure seam presentation
+	"getinfo01.lua": "getinfo over the CClosure seam (no `name`, isvararg false) — row 60",
+	"udata01.lua":   "upvalueid identity across the rt-owned upvalue registry — row 60",
+	// the row-86 frame layout (extras above the register window vs
+	// multret destinations that legitimately reach past nregs)
+	"var07.lua":  "call's arg shift clobbers the saved callee at n>=12 (extras-above-window) — row 86",
+	"vgap01.lua": "multret VARARG flush tramples extra[0] (extras-above-window) — row 86",
 }
 
-// seamHintPrintSkips: cases that PRINT a pcall-captured runtime error
-// whose message carries a row-70 varinfo hint. The hint rides a PRINT
-// line, beyond the row-71 ERROR-line seam strip, and the wasm seam
-// raises hint-less — so these skip on wasm-family legs only; the oracle
-// legs (interp ↔ clua55, both hint-bearing) run them in full.
-var seamHintPrintSkips = map[string]string{
-	"pc10.lua": "printed error message carries a varinfo hint on interp only — row 71 seam (U6)",
-}
+// CorpusSkipsFor was retired with the row-71 seam strip (U5e): the seam
+// engines now raise with the same varinfo hints as the oracles, so there
+// are no wasm-leg-only skips — callers use CorpusSkips directly.
 
 // gluaWasmSkips: _glua-tests cases with a ruled divergence (each cites
 // its row in docs/Lua-Wasm-Divergence-Ledger.md).
@@ -97,22 +98,18 @@ var wasmTestsSkips = map[string]string{
 // ledgeredErrSkips: _wasm-err-tests cases whose divergence has a ruling
 // (each skip cites its row in docs/Lua-Wasm-Divergence-Ledger.md).
 var ledgeredErrSkips = map[string]string{
-	// U2f re-pinned the interp's error texts to stock (concat/index/call/
-	// compare shapes, string-arith opnames, assert passthrough, error()
-	// level semantics) — those families run un-skipped now. What remains
-	// is the row 60 error-position seam: the wasm rt layer cannot see
-	// error()'s level target (its walk stops at the C frame) and cannot
-	// distinguish a level-0 raise from a core raise, so positions land
-	// on the CALL line instead of the level-target frame, level-0 errors
-	// gain a prefix, and nil error objects render "<no error object>"
-	// with a prefix where the interp renders "nil". The U5 error/EH pass
-	// (marker seam, row 52 family) re-pins these.
-	"e001.lua": "level-0 error gains the rt prefix on wasm — row 60 seam (U5 re-pin)",
-	"e003.lua": "error() level walk stops at wasm C frames — row 60 seam (U5 re-pin)",
-	"e005.lua": "error() level walk stops at wasm C frames — row 60 seam (U5 re-pin)",
+	// U5e landed the row-60 error-position seam (rt_seam55.c: shadow line
+	// stack + interposed luaL_where/lua_error/luaG_runerror): error()'s
+	// level walk now resolves compiled frames through the shadow stack —
+	// e003/e005/e011 run un-skipped and byte-exact. What remains: level-0
+	// raises still gain the rt prefix (luaB_error's level-0 arm calls no
+	// where(), so the seam's nopos verdict never fires — the position
+	// would have to come from interposing the static luaB_error itself),
+	// and nil error objects render "<no error object>" + the rt prefix
+	// where the interp renders "nil".
+	"e001.lua": "level-0 error gains the rt prefix on wasm — row 60 seam (level-0 arm calls no where)",
 	"e006.lua": "nil error object renders differently on wasm — row 60 seam (U5 re-pin)",
 	"e007.lua": "nil error object renders differently on wasm — row 60 seam (U5 re-pin)",
-	"e011.lua": "error() level walk stops at wasm C frames — row 60 seam (U5 re-pin)",
 }
 
 // skipRtSurfacesUntilU6: the row-59 retirement window closed with the

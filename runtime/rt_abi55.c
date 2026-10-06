@@ -72,7 +72,42 @@ _Static_assert(RT_OP_ADD == LUA_OPADD && RT_OP_MOD == LUA_OPMOD &&
 static lua_State *curL;
 static int rt_wasm_depth; /* trampoline nesting (RTW_MAX_DEPTH guard) */
 
+/* U5e (row 85): the protect shadow — every protect WE install (rt_run_raw's
+   luaD_rawrunprotected, the msgh dispatch in rtw_reraise) records its
+   lua_longjmp here; the push reads L->errorJmp from inside the body, where
+   it IS ours, and the pop runs where control always resumes (after
+   rawrunprotected returns — a longjmp lands inside its LUAI_TRY and returns
+   normally, so the pairing holds on every exit path). rtw_reraise compares
+   L->errorJmp against the shadow to decide whether its throw will be caught
+   by a STOCK protect (a pcall/resume — run the message handler now, stock's
+   luaG_errormsg-at-raise for errors that entered flight by direct staging)
+   or by one of ours (the error keeps cascading as staged returns; a later
+   reraise decides). Saturation answers "ours" — never risk a double run. */
+#define RT_RP_MAX 512 /* > RTW_MAX_DEPTH * in-flight rt_run per level */
+static void *rt_rp_stack[RT_RP_MAX];
+static int rt_rp_n;
+
+static void rt_rp_push(lua_State *L) {
+  if (rt_rp_n < RT_RP_MAX) rt_rp_stack[rt_rp_n] = L->errorJmp;
+  rt_rp_n++;
+}
+
+static int rt_rp_ours(void *lj) {
+  int i;
+  if (lj == NULL) return 0;
+  if (rt_rp_n > RT_RP_MAX) return 1; /* saturated: conservative */
+  for (i = 0; i < rt_rp_n; i++)
+    if (rt_rp_stack[i] == lj) return 1;
+  return 0;
+}
+
+/* rt_curL: the seam file (rt_seam55.c) needs the running state for its
+   rt_sea_main bottom entry; curL is static here, so hand it out */
+lua_State *rt_curL(void) { return curL; }
+
 static int rt_wasm_trampoline(lua_State *L); /* the CClosure seam (below) */
+static void rtw_dispatch_body(lua_State *L, void *ud); /* U5e seam order */
+static void rtw_reraise(lua_State *L);
 
 /* ---- staged-error machinery (v3 contract, unchanged) ----
 **
@@ -163,6 +198,7 @@ static void stage_c_error(int status) {
   err_buf_len = (int)n;
   err_prefixed = 1;
   err_pending = 1;
+  rt_sea_msgh_ran_set(0); /* fresh error: its handler has not run */
 }
 
 /* stage a string error in one step (no Lua stack traffic — used by the
@@ -177,6 +213,7 @@ static void stage_str_error(const char *msg, int prefixed) {
   err_buf_len = (int)n;
   err_prefixed = prefixed;
   err_pending = 1;
+  rt_sea_msgh_ran_set(0); /* fresh error: its handler has not run */
 }
 
 int32_t rt_err_pending(void) { return err_pending; }
@@ -188,6 +225,8 @@ void rt_err_clear(void) {
   err_line_set = 0;
   err_prefixed = 0;
   setnilvalue(&err_value);
+  rt_sea_nopos_set(0); /* U5e: the verdict is per-staging */
+  rt_sea_msgh_ran_set(0); /* row 85: no in-flight error anymore */
 }
 
 int32_t rt_err_stage_copy(rt_addr dst, int32_t cap) {
@@ -218,26 +257,38 @@ typedef void (*body_fn)(void);
 static body_fn cur_body;
 
 static void protect_trampoline(lua_State *L, void *ud) {
-  (void)L;
   (void)ud;
+  rt_rp_push(L); /* row 85: L->errorJmp is ours inside the body */
   cur_body();
 }
 
 /* rt_run_raw is the protection without rt_run's err_pending gate, staging
    or prefixing (U4f): bodies that must run while an error is already
-   staged — the error-path close loop — fold failures themselves. */
+   staged — the error-path close loop — fold failures themselves. It does
+   NOT touch the hint slots: rt_run arms them right before calling here,
+   and re-arming "none" inside would strip every entry's hints (the raw
+   close callers arm "none" themselves — see rt_close_call). */
 static int rt_run_raw(body_fn fn) {
   TStatus status;
   cur_body = fn;
   lua_lock(curL);
   status = luaD_rawrunprotected(curL, protect_trampoline, NULL);
+  if (rt_rp_n > 0) rt_rp_n--; /* pairs the push even across a longjmp */
   lua_unlock(curL);
   return (int)status;
 }
 
-static int rt_run(body_fn fn, int32_t line) {
+/* rt_run (U5e): every protected entry funnels its varinfo hints through
+   here — armed BEFORE the body runs, so the seam's typeerror/callerror
+   replicas read exactly this entry's precomputed answers and a raise can
+   never see a stale hint from an earlier dispatch. tgtop is the entry's
+   typeerror operand (the value its luaG_typeerror raises would name);
+   the table-op entries pass their operand static, everyone else NULL. */
+static int rt_run(body_fn fn, int32_t line, int32_t h1, int32_t h2,
+                  int32_t hc, const void *tgtop) {
   int prefixed;
   if (err_pending) return RT_ERR;
+  rt_sea_hint_set(h1, h2, hc, tgtop);
   TStatus status = (TStatus)rt_run_raw(fn);
   if (status != LUA_OK) {
     if (status == LUA_ERRMEM || status == LUA_ERRERR)
@@ -245,7 +296,12 @@ static int rt_run(body_fn fn, int32_t line) {
     else
       stage_error(); /* value + message bytes */
     prefixed = err_prefixed;
-    if (line != 0 && !prefixed && err_buf_len > 0) {
+    /* U5e (row 60): rt_sea_nopos — the interposed lua_error's verdict
+       that this string was raised WITHOUT a resolvable position (level
+       0, past the bottom, a where() miss): stock adds no prefix there,
+       so neither does the rt. Core raises (luaG_runerror through the
+       seam) clear the flag and keep the rt prefix. */
+    if (line != 0 && !prefixed && !rt_sea_nopos() && err_buf_len > 0) {
       char tmp[sizeof err_buf];
       int w = snprintf(tmp, sizeof tmp, "%.*s:%d: %s", chunk_name_len,
                        chunk_name, (int)line, err_buf);
@@ -280,6 +336,7 @@ void rt_set_state(rt_addr p) {
   err_line_set = 0;
   setnilvalue(&err_value);
   rt_wasm_depth = 0;
+  rt_sea_reset(); /* U5e: no shadow entries survive a state reset */
   /* U2e: make the v1 "GC stopped per run" posture airtight. The host
      stops the collector (collectgarbage('stop') => GCSTPUSR), but
      5.5's luaL_pushresult calls lua_gc(LUA_GCSTEP) after building any
@@ -294,6 +351,7 @@ void rt_set_state(rt_addr p) {
      the same surface unobservable). The U6 arena retires this freeze
      with real rooting. */
   G(curL)->gcstp |= GCSTPGC;
+  rt_rp_n = 0; /* row 85: no protects of ours survive a state reset */
 }
 
 /* ---- value construction ---- */
@@ -352,11 +410,11 @@ static void gettable_body(void) {
 }
 
 int32_t rt_gettable(rt_addr tblcell, rt_addr keycell, rt_addr dstcell,
-                    int32_t line) {
+                    int32_t line, int32_t hobj, int32_t hcall) {
   gt_t = *(TValue *)(size_t)tblcell;
   gt_k = *(TValue *)(size_t)keycell;
   gt_dst = (TValue *)(size_t)dstcell;
-  return rt_run(gettable_body, line);
+  return rt_run(gettable_body, line, hobj, -1, hcall, &gt_t);
 }
 
 static TValue st_t, st_k, st_v;
@@ -374,11 +432,11 @@ static void settable_body(void) {
 }
 
 int32_t rt_settable(rt_addr tblcell, rt_addr keycell, rt_addr valcell,
-                    int32_t line) {
+                    int32_t line, int32_t hobj, int32_t hcall) {
   st_t = *(TValue *)(size_t)tblcell;
   st_k = *(TValue *)(size_t)keycell;
   st_v = *(TValue *)(size_t)valcell;
-  return rt_run(settable_body, line);
+  return rt_run(settable_body, line, hobj, -1, hcall, &st_t);
 }
 
 /* ---- arithmetic: 5.5's own engine, stock texts ----
@@ -404,12 +462,12 @@ static void arith_body(void) {
 }
 
 int32_t rt_arith(int32_t op, rt_addr lhscell, rt_addr rhscell, rt_addr dstcell,
-                 int32_t line) {
+                 int32_t line, int32_t h1, int32_t h2, int32_t hcall) {
   ar_op = (int)op;
   ar_l = *(TValue *)(size_t)lhscell;
   ar_r = *(TValue *)(size_t)rhscell;
   ar_dst = (TValue *)(size_t)dstcell;
-  return rt_run(arith_body, line);
+  return rt_run(arith_body, line, h1, h2, hcall, NULL);
 }
 
 /* ---- length (#): luaV_objlen (strings/tables integer, __len honored) */
@@ -426,10 +484,11 @@ static void len_body(void) {
   curL->top.p--;
 }
 
-int32_t rt_len(rt_addr cell, rt_addr dstcell, int32_t line) {
+int32_t rt_len(rt_addr cell, rt_addr dstcell, int32_t line, int32_t hobj,
+               int32_t hcall) {
   len_v = *(TValue *)(size_t)cell;
   len_dst = (TValue *)(size_t)dstcell;
-  return rt_run(len_body, line);
+  return rt_run(len_body, line, hobj, -1, hcall, &len_v);
 }
 
 /* ---- comparisons: luaV_equalobj/lessthan/lessequal (mixed int/float
@@ -464,7 +523,7 @@ static int cmp_entry(int op, rt_addr acell, rt_addr bcell, rt_addr dstcell,
   cmp_b = *(TValue *)(size_t)bcell;
   cmp_dst = (TValue *)(size_t)dstcell;
   cmp_op = op;
-  return rt_run(cmp_body, line);
+  return rt_run(cmp_body, line, -1, -1, -1, NULL);
 }
 
 int32_t rt_eq(rt_addr a, rt_addr b, rt_addr dst, int32_t line) {
@@ -499,7 +558,8 @@ static void concat_body(void) {
   curL->top.p--; /* the single result */
 }
 
-int32_t rt_concat(rt_addr cells, int32_t count, rt_addr dstcell, int32_t line) {
+int32_t rt_concat(rt_addr cells, int32_t count, rt_addr dstcell, int32_t line,
+                  int32_t hbase, int32_t hcall) {
   if (count < 2) {
     if (count == 1)
       *(TValue *)(size_t)dstcell = *(TValue *)(size_t)cells;
@@ -508,7 +568,17 @@ int32_t rt_concat(rt_addr cells, int32_t count, rt_addr dstcell, int32_t line) {
   cc_cells = (TValue *)(size_t)cells;
   cc_n = (int)count;
   cc_dst = (TValue *)(size_t)dstcell;
-  return rt_run(concat_body, line);
+  /* U5e (row 71): the concat window for luaG_concaterror — operand 0
+     lands at the CURRENT top (the body's pushes start there); the
+     savestack offset survives the stack growth a metamethod may cause
+     (row 31). hcall is funcnamefromcode's OP_CONCAT answer
+     ("metamethod 'concat'" — the non-callable-__concat call error). */
+  rt_sea_concat_push(hbase, (int64_t)savestack(curL, curL->top.p));
+  {
+    int st = rt_run(concat_body, line, -1, -1, hcall, NULL);
+    rt_sea_concat_pop();
+    return st;
+  }
 }
 
 /* ---- calls: the universal fallback (v3 posture). Results overwrite the
@@ -555,14 +625,14 @@ static void call_body(void) {
 }
 
 int32_t rt_call(rt_addr funcell, rt_addr argcells, int32_t nargs, int32_t want,
-                int32_t line) {
+                int32_t line, int32_t hcallee) {
   int w = (int)want, nres;
   ca_f = *(TValue *)(size_t)funcell;
   ca_args = (TValue *)(size_t)argcells;
   ca_n = (int)nargs;
   ca_w = w;
   ca_nres = 0;
-  int st = rt_run(call_body, line);
+  int st = rt_run(call_body, line, -1, -1, hcallee, NULL);
   if (st != RT_OK) return RT_ERR;
   nres = ca_nres; /* read before encoding — a nested call may follow */
   return w < 0 ? -(nres + 1) : RT_OK; /* encode count; -1 means zero */
@@ -656,7 +726,7 @@ int32_t rt_forprep(rt_addr cells, int32_t line) {
   if (err_pending) return RT_ERR;
   fp_cells = (TValue *)(size_t)cells;
   fp_skip = 0;
-  int st = rt_run(forprep_body, line);
+  int st = rt_run(forprep_body, line, -1, -1, -1, NULL);
   if (st != RT_OK) return RT_ERR;
   return fp_skip ? RT_FORPREP_SKIP : RT_OK;
 }
@@ -677,6 +747,7 @@ void rt_error(rt_addr msgptr, int32_t msglen, int32_t line) {
   err_buf_len = w > 0 ? w : 0;
   err_prefixed = 1;
   err_pending = 1;
+  rt_sea_msgh_ran_set(0); /* fresh error: its handler has not run */
   stage_err_line((int)line);
   /* v4: stage the exact string value too — the trampoline re-raises from
      err_value, so a pcall that catches a wasm error() sees the string */
@@ -700,7 +771,7 @@ static void getglobal_body(void) {
 int32_t rt_getglobal(rt_addr dstcell, rt_addr keycell, int32_t line) {
   gg_k = *(TValue *)(size_t)keycell;
   gg_dst = (TValue *)(size_t)dstcell;
-  return rt_run(getglobal_body, line);
+  return rt_run(getglobal_body, line, -1, -1, -1, NULL);
 }
 
 static void setglobal_body(void) {
@@ -714,7 +785,7 @@ static void setglobal_body(void) {
 int32_t rt_setglobal(rt_addr keycell, rt_addr valcell, int32_t line) {
   sg_k = *(TValue *)(size_t)keycell;
   sg_v = *(TValue *)(size_t)valcell;
-  return rt_run(setglobal_body, line);
+  return rt_run(setglobal_body, line, -1, -1, -1, NULL);
 }
 
 void rt_set_chunkname(rt_addr ptr, int32_t len) {
@@ -999,7 +1070,7 @@ static void tbc_body(void) {
 int32_t rt_tbc(rt_addr celladdr, int32_t nameidx, int32_t line) {
   tbc_cell = celladdr;
   tbc_nameidx = nameidx;
-  return rt_run(tbc_body, line);
+  return rt_run(tbc_body, line, -1, -1, -1, NULL);
 }
 
 int32_t rt_tbc_count(void) {
@@ -1035,6 +1106,8 @@ static void close_body(void) {
    luaD_throw — the staging discipline's invariant); ERRMEM/ERRERR leave
    nothing on the stack. */
 static int rt_close_call(TValue *obj, TValue *err) {
+  rt_sea_hint_set(-1, -1, -1, NULL); /* raw body: a non-closable __close raises
+                                  luaG_callerror with no site hint */
   cl_obj = *obj;
   if (err != NULL) {
     cl_err = *err;
@@ -1139,7 +1212,7 @@ static void globals_table_body(void) {
 
 static const TValue *rt_globals_table(void) {
   nc_gtdst = &nc_gt;
-  if (rt_run(globals_table_body, 0) != RT_OK) return NULL;
+  if (rt_run(globals_table_body, 0, -1, -1, -1, NULL) != RT_OK) return NULL;
   return &nc_gt;
 }
 
@@ -1227,7 +1300,7 @@ int32_t rt_newclosure(rt_addr dstcell, int32_t protoidx, rt_addr parentcl,
   nc_parent = parentcl;
   nc_frame = frameaddr;
   {
-    int st = rt_run(newclosure_body, line);
+    int st = rt_run(newclosure_body, line, -1, -1, -1, NULL);
     if (st != RT_OK) return st;
     /* a nested failure (the _ENV seed's own rt_run) stages without
        raising — carry it out as this call's RT_ERR */
@@ -1243,6 +1316,158 @@ void rt_getupval(rt_addr cl, int32_t idx, rt_addr cell) {
 void rt_setupval(rt_addr cl, int32_t idx, rt_addr cell) {
   UpVal *uv = ((struct rt_wcl *)(size_t)cl)->upvals[idx];
   *uv->v.p = *(TValue *)(size_t)cell; /* write-through: open -> the cell */
+}
+
+/* ---- U5e (row 85): the 5.5 vararg / global-decl entries ---- */
+
+/* rt_varargtab mirrors stock createvarargtab (ltm.c) for the table
+   model's OP_VARARGPREP: the table anchors at the C top while filled,
+   'n' first as an INTEGER (math.type(t.n) == "integer"), then the
+   extras raw, luaC_checkGC to close. src = the frame's vararg base
+   (the extras' cells, above the register window); the built table
+   lands in dst (register np). The reentrancy law is respected: the
+   body copies the statics to C locals before anything that could
+   dispatch. */
+static TValue *vt_dst;
+static TValue *vt_src;
+static int vt_n;
+
+static void varargtab_body(void) {
+  lua_State *L = curL;
+  TValue *dst = vt_dst;
+  TValue *src = vt_src;
+  int i, n = vt_n;
+  TValue key, value;
+  Table *t = luaH_new(L);
+  sethvalue(L, s2v(L->top.p), t);
+  L->top.p++;
+  luaH_resize(L, t, cast_uint(n), 1);
+  setsvalue(L, &key, luaS_new(L, "n")); /* key is "n" */
+  setivalue(&value, n);                 /* value is n */
+  luaH_set(L, t, &key, &value);         /* t.n = n */
+  for (i = 0; i < n; i++)
+    luaH_setint(L, t, i + 1, src + i);
+  luaC_checkGC(L);
+  *dst = *s2v(L->top.p - 1); /* the built table */
+  L->top.p--;                /* pop the anchor */
+}
+
+int32_t rt_varargtab(rt_addr dst, rt_addr src, int32_t n, int32_t line) {
+  vt_dst = (TValue *)(size_t)dst;
+  vt_src = (TValue *)(size_t)src;
+  vt_n = n;
+  return rt_run(varargtab_body, line, -1, -1, -1, NULL);
+}
+
+/* rt_getvarg mirrors stock luaT_getvararg for OP_GETVARG (hidden
+   model): an integral key 1..nextra (tointegerns — exact floats count)
+   reads the hidden extra, the string "n" yields nextra as an INTEGER,
+   anything else nil. Never raises: plain and unprotected like
+   rt_getupval. vabase = the frame's vararg base; the extras live at
+   vabase+16*(k-1) (the trampoline staged them there). */
+void rt_getvarg(rt_addr dst, rt_addr key, rt_addr vabase, int32_t nextra) {
+  TValue *rc = (TValue *)(size_t)key;
+  TValue *ra = (TValue *)(size_t)dst;
+  lua_Integer n;
+  if (tointegerns(rc, &n)) { /* integral value? */
+    if (l_castS2U(n) - 1 < cast_uint(nextra)) {
+      TValue *slot = (TValue *)(size_t)(vabase +
+                                        sizeof(TValue) * (cast_int(n) - 1));
+      *ra = *slot;
+      return;
+    }
+  } else if (ttisstring(rc)) { /* string value? */
+    size_t len;
+    const char *s = getlstr(tsvalue(rc), len);
+    if (len == 1 && s[0] == 'n') { /* key is "n"? */
+      setivalue(ra, nextra);
+      return;
+    }
+  }
+  setnilvalue(ra); /* else produce nil */
+}
+
+/* rt_errnnil mirrors stock luaG_errnnil's raise for OP_ERRNNIL: a
+   global declaration whose register is already non-nil. Stock's own
+   helper takes the LClosure (to read the name constant); the wasm side
+   has no LClosure, so the name rides a cell — kcell(Bx-1) when the
+   compiler recorded a string constant, else 0 ("?"). */
+static TValue nn_v, nn_name;
+
+static void errnnil_body(void) {
+  if (!ttisnil(&nn_v)) {
+    const char *name = "?";
+    if (ttisstring(&nn_name))
+      name = getstr(tsvalue(&nn_name));
+    luaG_runerror(curL, "global '%s' already defined", name);
+  }
+}
+
+int32_t rt_errnnil(rt_addr cell, rt_addr namecell, int32_t line) {
+  nn_v = *(TValue *)(size_t)cell;
+  if (namecell != 0)
+    nn_name = *(TValue *)(size_t)namecell;
+  else
+    setnilvalue(&nn_name);
+  return rt_run(errnnil_body, line, -1, -1, -1, NULL);
+}
+
+/* rt_vararg_read is OP_VARARG's k=1 arm (the table model — the interp
+   spec, _vm.go): the count comes from the table's raw "n" (an exact
+   integer 0..INT_MAX/2, stock getnumargs's unsigned test), the values
+   from raw integer reads 1..n — no metamethod consult, user edits of
+   t.n/t[i] honored, nil-padded to nwant. nwant < 0 means multret (C==0:
+   all n, top moves by the returned count); dstcap is the frame's cell
+   budget past dst — the register window is a fixed allocation, so an
+   absurd t.n cannot write past it (the interp grows its register stack
+   instead; unobservable in the corpus, defensive here). */
+static TValue *vr_dst, vr_tab;
+static int32_t vr_nwant, vr_dstcap, vr_ret;
+
+static void vararg_read_body(void) {
+  lua_State *L = curL;
+  TValue *dst = vr_dst;
+  int32_t nwant = vr_nwant;
+  Table *t;
+  TValue tvn;
+  lua_Integer n;
+  int32_t i, touse;
+  if (!ttistable(&vr_tab))
+    luaG_runerror(L, "vararg table has no proper 'n'");
+  t = hvalue(&vr_tab);
+  setnilvalue(&tvn);
+  luaH_getstr(t, luaS_new(L, "n"), &tvn);
+  if (!ttisinteger(&tvn) ||
+      l_castS2U(ivalue(&tvn)) > (lua_Unsigned)(INT_MAX / 2))
+    luaG_runerror(L, "vararg table has no proper 'n'");
+  n = ivalue(&tvn);
+  if (nwant < 0) nwant = (int32_t)n; /* multret: all available */
+  if (nwant > vr_dstcap) /* the fixed frame's budget — see above */
+    luaG_runerror(L, "stack overflow");
+  touse = nwant < (int32_t)n ? nwant : (int32_t)n;
+  for (i = 0; i < nwant; i++) {
+    if (i < touse) {
+      TValue res;
+      setnilvalue(&res);
+      luaH_getint(t, (lua_Integer)i + 1, &res);
+      dst[i] = res;
+    } else {
+      setnilvalue(&dst[i]);
+    }
+  }
+  vr_ret = nwant;
+}
+
+int32_t rt_vararg_read(rt_addr dst, rt_addr tabcell, int32_t nwant,
+                       int32_t dstcap, int32_t line) {
+  if (err_pending) return RT_ERR;
+  vr_dst = (TValue *)(size_t)dst;
+  vr_tab = *(TValue *)(size_t)tabcell;
+  vr_nwant = nwant;
+  vr_dstcap = dstcap;
+  return rt_run(vararg_read_body, line, -1, -1, -1, NULL) != RT_OK
+             ? RT_ERR
+             : vr_ret;
 }
 
 int32_t rt_clidx(rt_addr funcell) {
@@ -1338,7 +1563,113 @@ struct rtw_ctx {
   int32_t idx;
   rt_addr frame, cl;
   int32_t nargs, want, nret;
+  rt_addr saved_cursor;
+  rt_addr ci_funcbase; /* the args' stack slot (push_frame source) */
 };
+
+/* rtw_trampoline_arms is folded away (U5e): a second protect per
+   dispatch pushed wasmtime's wasm-frame budget past the RTW_MAX_DEPTH
+   guard — deep recursion trapped "call stack exhausted" before the
+   clean "stack overflow" raise (so00/so01). The single-protect shape
+   keeps the pre-seam per-level cost; the shadow entry is popped the
+   moment the protect returns, BEFORE any arm below can raise, so no
+   entry can outlive its CallInfo: every deeper longjmp folds into
+   `status` at this protect, and the reraise paths that run after it
+   (rtw_reraise's checkstack included) execute with the entry already
+   gone. */
+static int rt_wasm_trampoline(lua_State *L) {
+  CallInfo *ci = L->ci;
+  CClosure *ccl = clCvalue(s2v(ci->func.p));
+  struct rt_wcl *rec = (struct rt_wcl *)pvalue(&ccl->upvalue[0]);
+  struct rtw_ctx ctx;
+  TStatus status;
+
+  ctx.idx = rec->mdidx;
+  ctx.cl = (rt_addr)(size_t)rec;
+  ctx.nargs = cast_int(L->top.p - (ci->func.p + 1));
+  ctx.want = get_nresults(ci->callstatus);
+  ctx.nret = RTW_ERR;
+  ctx.saved_cursor = rt_frame_cursor();
+  ctx.ci_funcbase = (rt_addr)(size_t)(ci->func.p + 1);
+
+  if (rt_wasm_enter(ctx.idx) != 0) { /* over RTW_MAX_DEPTH: staged */
+    rt_frame_restore(ctx.saved_cursor);
+    rtw_reraise(L);
+  }
+  ctx.frame = rt_wasm_push_frame(L, (void *)(size_t)ctx.ci_funcbase,
+                                 ctx.idx, ctx.nargs);
+  if (ctx.frame == 0) { /* frame region exhausted */
+    rt_wasm_leave();
+    stage_str_error("not enough memory", 1);
+    rt_frame_restore(ctx.saved_cursor);
+    rtw_reraise(L);
+  }
+
+  /* U5e (row 60): the shadow entry for this dispatch — visible to the
+     seam's luaL_where from before the first wasm instruction (whose
+     lowering stores the line into the bound cell) until the pop below.
+     The M5c restage re-dispatches successor protos at this same entry;
+     each successor prologue's rt_sea_setline rebinds its own cell. */
+  rt_sea_push(ci);
+  status = luaD_rawrunprotected(L, rtw_dispatch_body, &ctx);
+  rt_sea_pop(); /* before any arm below can raise (comment above) */
+  rt_wasm_leave();
+  if (status != LUA_OK) {
+    /* a deeper luaD_throw crossed the boundary (a C-side throw inside
+       the dispatch — e.g. the result copy's checkstack): restore this
+       level and re-raise. The error object stays wherever the thrower
+       left it; luaD_seterrorobj reads it there (v3 posture).
+       U4f: when this dispatch's dying frames hold to-be-closed variables,
+       the boundary must run the protected closes FIRST (stock luaD_pcall:
+       closeprotected, then seterrorobj) — the staged object folds into
+       the 2-arg __close calls and a failing close replaces it (last
+       error wins). Cells must stay allocated while __close runs (its
+       dispatches push frames above the cursor), so the close precedes
+       rt_frame_restore; guarded on pending entries so the no-tbc posture
+       is byte-identical to before (an ERRMEM/ERRERR status re-raises as
+       LUA_ERRRUN on this arm only). */
+    if (rt_tbclist != NULL && rt_tbclist->v >= ctx.saved_cursor) {
+      if (status == LUA_ERRMEM || status == LUA_ERRERR)
+        stage_c_error(status); /* no stack value: stage the literal */
+      else
+        stage_error();
+      rt_close_err(ctx.saved_cursor);
+      rt_frame_restore(ctx.saved_cursor);
+      rtw_reraise(L);
+    }
+    rt_frame_restore(ctx.saved_cursor);
+    luaD_throw(L, status);
+  }
+  if (ctx.nret == RTW_ERR) {
+    /* U4f: the dispatch staged the error — close this dispatch's dying
+       frames with the error-path form BEFORE the region goes away (see
+       the arm above), then re-raise the (possibly replaced) object */
+    rt_close_err(ctx.saved_cursor);
+    rt_frame_restore(ctx.saved_cursor);
+    rtw_reraise(L);
+  }
+  if (ctx.nret == RTW_REFUSED) {
+    /* host-contract violation (no script module): surface as an ordinary
+       catchable error, never a trap */
+    stage_str_error("wasm dispatch refused (no script module)", 1);
+    rt_frame_restore(ctx.saved_cursor);
+    rtw_reraise(L);
+  }
+  if (ctx.nret == RTW_STACKTRAP) {
+    /* U5e (row 20 family): the engine's own wasm stack exhausted inside
+       the nested dispatch — wasmtime/wazero trap "call stack exhausted",
+       which the host maps to this sentinel. Chunk frame sizes vary, so
+       this can fire BELOW RTW_MAX_DEPTH (the plain-CALL recursion shape
+       traps ~2 levels early); stage the same bare "stack overflow" the
+       depth guard stages and let the catching rt_run cascade add the
+       position — byte-identical to the guard path (so00/so01). */
+    stage_str_error("stack overflow", 1);
+    rt_frame_restore(ctx.saved_cursor);
+    rtw_reraise(L);
+  }
+  rt_frame_restore(ctx.saved_cursor);
+  return (int)ctx.nret;
+}
 
 static void rtw_dispatch_body(lua_State *L, void *ud) {
   struct rtw_ctx *c = (struct rtw_ctx *)ud;
@@ -1372,85 +1703,75 @@ static void rtw_dispatch_body(lua_State *L, void *ud) {
 
 /* re-raise the staged value: push it, clear the staging, throw. The
    checkstack may itself throw — the cursor is already restored by then
-   and the error unwinds to the caller's protect (v3 posture). */
+   and the error unwinds to the caller's protect (v3 posture).
+**
+** U5e (row 85) — the message-handler arm: stock runs the handler at the
+   RAISE (luaG_errormsg), which C-land raises still funnels through (the
+   seam's errormsg replica). Errors that enter flight by DIRECT staging —
+   the depth guard, the engine stack trap, rt_error — bypass it, so the
+   handler runs HERE, at the crossing into C-land, exactly once:
+**
+**   - only when the throw will be caught by a STOCK protect (a
+**     pcall/resume): L->errorJmp is none of ours (the rp shadow). When
+**     one of ours catches instead, the error keeps cascading as staged
+**     returns and a later reraise re-decides;
+**   - only when no handler already ran for THIS in-flight error (the
+       replica's msgh-ran flag — a C-land raise ran it at the raise;
+**     consuming it here would be a double run);
+**   - under our own protect (an rp-shadow entry), so a handler that
+**     itself raises lands in the collapse below instead of looping —
+**     its nested reraise sees the catcher as ours and plain-throws.
+**
+** The handler runs after the dying frames are restored (this arm sits
+** past rt_wasm_leave/rt_frame_restore, and the cascade decremented the
+** depth level by level), so it has full frame budget — the interp's
+   row-78e reserve problem cannot arise. Stock runs it with the dying
+   frames still on the stack; observable only to stack-inspecting
+   handlers (row 85). A FAILING handler's object replaces the in-flight
+   one (last-error-wins — rt_close_err's ruling; stock never defines
+   this path, it recurses in errormsg until the C-stack guard fires).
+*/
+static TValue msgh_ev; /* the in-flight object, snapshotted past the arm */
+
+static void msgh_body(lua_State *L, void *ud) {
+  (void)ud;
+  rt_rp_push(L); /* row 85: this protect is ours */
+  luaD_callnoyield(L, L->top.p - 2, 1);
+}
+
 static void rtw_reraise(lua_State *L) {
-  TValue *ev = (TValue *)(size_t)rt_err_value_ptr();
+  int ran = rt_sea_msgh_ran() != 0;
+  msgh_ev = err_value; /* snapshot: the handler re-enters and re-stages */
+  if (!ran && L->errfunc != 0 && !rt_rp_ours(L->errorJmp)) {
+    TStatus st;
+    rt_err_clear(); /* re-entrancy: the handler's rt entries must not
+                       refuse on a pending staging */
+    luaD_checkstack(L, 2);
+    setobj2s(L, L->top.p, &msgh_ev); /* the error object */
+    L->top.p++;
+    setobjs2s(L, L->top.p, L->top.p - 1); /* move argument up (stock) */
+    setobjs2s(L, L->top.p - 1, restorestack(L, L->errfunc)); /* push h */
+    L->top.p++;
+    st = luaD_rawrunprotected(L, msgh_body, NULL);
+    if (rt_rp_n > 0) rt_rp_n--; /* pairs msgh_body's push on every exit */
+    if (st == LUA_OK) {
+      /* the handler's result sits at top-1 (callnoyield moved it onto
+         the func slot); the nil-object fix is stock errormsg's tail */
+      if (ttisnil(s2v(L->top.p - 1)))
+        setsvalue2s(L, L->top.p - 1,
+                    luaS_newliteral(L, "<no error object>"));
+      luaD_throw(L, LUA_ERRRUN); /* the catcher reads top-1 */
+    }
+    if (st == LUA_ERRMEM || st == LUA_ERRERR)
+      luaD_throw(L, st); /* no object on the stack: seterrorobj stages */
+    /* the handler raised: its object is at top-1 (the raiser pushed it
+       before its throw; the nil-fix ran in its own errormsg pass) */
+    luaD_throw(L, LUA_ERRRUN);
+  }
   luaD_checkstack(L, 1);
-  setobj2s(L, L->top.p, ev);
+  setobj2s(L, L->top.p, &msgh_ev);
   L->top.p++;
   rt_err_clear(); /* the zero-patch rt_pcall_caught */
   luaD_throw(L, LUA_ERRRUN);
 }
 
-static int rt_wasm_trampoline(lua_State *L) {
-  CallInfo *ci = L->ci;
-  CClosure *ccl = clCvalue(s2v(ci->func.p));
-  struct rt_wcl *rec = (struct rt_wcl *)pvalue(&ccl->upvalue[0]);
-  struct rtw_ctx ctx;
-  rt_addr saved_cursor = rt_frame_cursor();
-  TStatus status;
-
-  ctx.idx = rec->mdidx;
-  ctx.cl = (rt_addr)(size_t)rec;
-  ctx.nargs = cast_int(L->top.p - (ci->func.p + 1));
-  ctx.want = get_nresults(ci->callstatus);
-  ctx.nret = RTW_ERR;
-
-  if (rt_wasm_enter(ctx.idx) != 0) { /* over RTW_MAX_DEPTH: staged */
-    rt_frame_restore(saved_cursor);
-    rtw_reraise(L);
-  }
-  ctx.frame = rt_wasm_push_frame(L, ci->func.p + 1, ctx.idx, ctx.nargs);
-  if (ctx.frame == 0) { /* frame region exhausted */
-    rt_wasm_leave();
-    stage_str_error("not enough memory", 1);
-    rt_frame_restore(saved_cursor);
-    rtw_reraise(L);
-  }
-
-  status = luaD_rawrunprotected(L, rtw_dispatch_body, &ctx);
-  rt_wasm_leave();
-  if (status != LUA_OK) {
-    /* a deeper luaD_throw crossed the boundary (a C-side throw inside
-       the dispatch — e.g. the result copy's checkstack): restore this
-       level and re-raise. The error object stays wherever the thrower
-       left it; luaD_seterrorobj reads it there (v3 posture).
-       U4f: when this dispatch's dying frames hold to-be-closed variables,
-       the boundary must run the protected closes FIRST (stock luaD_pcall:
-       closeprotected, then seterrorobj) — the staged object folds into
-       the 2-arg __close calls and a failing close replaces it (last
-       error wins). Cells must stay allocated while __close runs (its
-       dispatches push frames above the cursor), so the close precedes
-       rt_frame_restore; guarded on pending entries so the no-tbc posture
-       is byte-identical to before (an ERRMEM/ERRERR status re-raises as
-       LUA_ERRRUN on this arm only). */
-    if (rt_tbclist != NULL && rt_tbclist->v >= saved_cursor) {
-      if (status == LUA_ERRMEM || status == LUA_ERRERR)
-        stage_c_error(status); /* no stack value: stage the literal */
-      else
-        stage_error();
-      rt_close_err(saved_cursor);
-      rt_frame_restore(saved_cursor);
-      rtw_reraise(L);
-    }
-    rt_frame_restore(saved_cursor);
-    luaD_throw(L, status);
-  }
-  if (ctx.nret == RTW_ERR) {
-    /* U4f: the dispatch staged the error — close this dispatch's dying
-       frames with the error-path form BEFORE the region goes away (see
-       the arm above), then re-raise the (possibly replaced) object */
-    rt_close_err(saved_cursor);
-    rt_frame_restore(saved_cursor);
-    rtw_reraise(L);
-  }
-  if (ctx.nret == RTW_REFUSED) {
-    /* host-contract violation (no script module): surface as an ordinary
-       catchable error, never a trap */
-    stage_str_error("wasm dispatch refused (no script module)", 1);
-    rt_frame_restore(saved_cursor);
-    rtw_reraise(L);
-  }
-  rt_frame_restore(saved_cursor);
-  return (int)ctx.nret;
-}
