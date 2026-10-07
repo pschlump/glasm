@@ -179,6 +179,9 @@ type callFrame struct {
 	//   4/5  close continuation: a VM-called __close (4 = from OP_CLOSE,
 	//        5 = from a RETURN; ContRA/ContB resume the interrupted
 	//        instruction's tail)
+	//   7    error-path close continuation: a __close(obj, errobj) from a
+	//        marker catch's yieldable sweep (stock finishpcallk); the
+	//        in-flight object rides the marker's LocalBase slot
 	//   6    metamethod continuation: a VM-dispatched Lua metamethod
 	//        (MMBIN/getfield/order/concat/...); vmFinishMM completes the
 	//        owner's interrupted instruction when it returns
@@ -189,6 +192,30 @@ type callFrame struct {
 	PcallHandler LValue
 	ContRA       int
 	ContB        int
+	// Hooked is stock's CIST_HOOKED (U5f, luaD_hook): the frame an event
+	// fired ON is marked while the hook function runs, so name resolution
+	// reports ("?", "hook") for the hook's own frame (funcnamefromcall's
+	// first arm) and getinfo 'r' reports the thread's transfer window.
+	// Frame slots are stable (segment arrays never move), so the flag is
+	// safe to hold across the hook's nested frames.
+	Hooked bool
+	// Fin is stock's CIST_FIN (U5f, GCTM): the frame a __gc finalizer is
+	// being called on behalf of is marked while the metamethod runs, so
+	// the finalizer's own frame resolves ("__gc", "metamethod") in name
+	// queries (funcnamefromcall's FIN arm — checked before any call-site
+	// walk, and whatever the caller's current instruction is). Transient:
+	// set/cleared around the call, like the stock bit.
+	Fin bool
+	// PendRet/PendBase (U5f, stock resume → unroll → finishCfunc →
+	// luaD_poscall): a plain G call that suspended mid-body
+	// (coroutine.yield) left this Lua frame mid-instruction; the resume
+	// stages its arguments at the interrupted call's result window, and
+	// mainLoop's entry replays the poscall — adjusting the staged values
+	// to the call's wanted count. PendRet holds want+1 (0 = none,
+	// MultRet records nothing — all staged values are kept), PendBase the
+	// window's absolute register (the suspended G frame's ReturnBase).
+	PendRet  int
+	PendBase int
 }
 
 type callFrameStack interface {
@@ -717,7 +744,7 @@ func newGlobal() *Global {
 
 func panicWithTraceback(L *LState) {
 	err := newApiError(ApiErrorRun, L.Get(-1))
-	err.StackTrace = L.stackTrace(0)
+	err.StackTrace = L.stackTrace(nil, 0)
 	panic(err)
 }
 
@@ -840,7 +867,10 @@ func (ls *LState) findLocal(frame *callFrame, no int) string {
 	} else {
 		return ""
 	}
-	if top-frame.LocalBase >= no {
+	// U5f: stock's temporary arm requires n > 0 — index 0 is not a
+	// local (luaF_getlocalname counts from 1 and the generic-slot test
+	// guards n > 0), so getlocal(l, 0) answers no name (db.lua:413)
+	if no > 0 && top-frame.LocalBase >= no {
 		// U5a (stock 5.5.1 luaG_findlocal): a valid slot past the named
 		// locals is "(temporary)" — 5.5 dropped 5.4's asterisk — and a
 		// C frame's is "(C temporary)"
@@ -862,14 +892,26 @@ func (ls *LState) where(level int, skipg bool) string {
 	sourcename := "[G]"
 	if proto != nil {
 		// U1: source names follow stock's sigil convention (@file,
-		// =literal, or [string "..."]) — ChunkID is the shared renderer
-		sourcename = parse.ChunkID(proto.SourceName)
+		// =literal, or [string "..."]) — ChunkID is the shared renderer;
+		// U5f: a stripped chunk's NULL source renders "?" (stock
+		// luaG_addinfo's no-source chunkid). An explicit empty chunkname
+		// (load(s, "")) is NOT NULL — it renders `[string ""]`
+		if proto.SourceName == "" && proto.SourceIsNull {
+			sourcename = "?"
+		} else {
+			sourcename = parse.ChunkID(proto.SourceName)
+		}
 	} else if skipg {
 		return ls.where(level+1, skipg)
 	}
 	line := ""
 	if proto != nil {
-		line = fmt.Sprintf("%v:", proto.DbgSourcePositions[cf.Pc-1])
+		// U5f: no lineinfo (a stripped chunk) → luaG_getfuncline's -1
+		if len(proto.DbgSourcePositions) == 0 {
+			line = "-1:"
+		} else {
+			line = fmt.Sprintf("%v:", proto.DbgSourcePositions[cf.Pc-1])
+		}
 	}
 	return fmt.Sprintf("%v:%v", sourcename, line)
 }
@@ -889,36 +931,154 @@ func (ls *LState) stockWhere(level int) string {
 	if cf.Fn == nil || cf.Fn.IsG || cf.Fn.Proto == nil {
 		return ""
 	}
-	return fmt.Sprintf("%v:%v:", parse.ChunkID(cf.Fn.Proto.SourceName), cf.Fn.Proto.DbgSourcePositions[cf.Pc-1])
+	p := cf.Fn.Proto
+	// U5f: a stripped chunk's NULL source is luaG_addinfo's fixed literal
+	// "?:?:" (the line does not print at all); a source without lineinfo
+	// renders luaG_getfuncline's answer, -1. An explicit empty chunkname
+	// (load(s, "")) is a real source — it takes the ChunkID path
+	// (`[string ""]:N:`), db.lua:73's battery
+	if p.SourceName == "" && p.SourceIsNull {
+		return "?:?:"
+	}
+	if len(p.DbgSourcePositions) == 0 {
+		return fmt.Sprintf("%v:-1:", parse.ChunkID(p.SourceName))
+	}
+	return fmt.Sprintf("%v:%v:", parse.ChunkID(p.SourceName), p.DbgSourcePositions[cf.Pc-1])
 }
 
-func (ls *LState) stackTrace(level int) string {
-	buf := []string{}
-	header := "stack traceback:"
-	if ls.currentFrame != nil {
-		i := 0
-		for dbg, ok := ls.GetStack(i); ok; dbg, ok = ls.GetStack(i) {
-			cf := dbg.frame
-			buf = append(buf, fmt.Sprintf("\t%v in %v", ls.Where(i), ls.formattedFrameFuncName(cf)))
-			if !cf.Fn.IsG && cf.TailCall > 0 {
-				for tc := cf.TailCall; tc > 0; tc-- {
-					buf = append(buf, "\t(tailcall): ?")
-					i++
-				}
-			}
-			i++
+// tbLevels1/tbLevels2 are lauxlib's LEVELS1/LEVELS2: the traceback shows
+// the first 10 and the last 11 levels when the stack is deeper than 21.
+const (
+	tbLevels1 = 10
+	tbLevels2 = 11
+)
+
+// lastLevel is lauxlib's lastlevel: the number of levels the thread's
+// stack answers (doubling then binary search over GetStack).
+func (ls *LState) lastLevel() int {
+	li, le := 1, 1
+	for {
+		if _, ok := ls.GetStack(le); !ok {
+			break
+		}
+		li = le
+		le *= 2
+	}
+	for li < le {
+		m := (li + le) / 2
+		if _, ok := ls.GetStack(m); ok {
+			li = m + 1
+		} else {
+			le = m
 		}
 	}
-	buf = append(buf, fmt.Sprintf("\t%v: %v", "[G]", "?"))
-	buf = buf[intMax(0, intMin(level, len(buf))):len(buf)]
-	if len(buf) > 20 {
-		newbuf := make([]string, 0, 20)
-		newbuf = append(newbuf, buf[0:7]...)
-		newbuf = append(newbuf, "\t...")
-		newbuf = append(newbuf, buf[len(buf)-7:len(buf)]...)
-		buf = newbuf
+	return le - 1
+}
+
+// stackTrace is luaL_traceback (U5f): "stack traceback:" then one line
+// per level — "\t<short_src>[:<line>]: in <funcname>" — with a
+// "\t...\t(skipping N levels)" seam between the first 10 and last 11
+// levels of a deep stack, and a "\t(...tail calls...)" marker after a
+// tail-called frame. msg nil = C's NULL (no message — an empty-string
+// message still prefixes "\n"); the db.traceback wrapper owns the
+// message handling.
+func (ls *LState) stackTrace(msg *string, level int) string {
+	last := ls.lastLevel()
+	limit2show := -1
+	if last-level > tbLevels1+tbLevels2 {
+		limit2show = tbLevels1
 	}
-	return fmt.Sprintf("%s\n%s", header, strings.Join(buf, "\n"))
+	var buf strings.Builder
+	if msg != nil {
+		buf.WriteString(*msg)
+		buf.WriteByte('\n')
+	}
+	buf.WriteString("stack traceback:")
+	for {
+		dbg, ok := ls.GetStack(level)
+		if !ok {
+			break
+		}
+		level++
+		if limit2show >= 0 {
+			if limit2show == 0 {
+				n := last - level - tbLevels2 + 1
+				fmt.Fprintf(&buf, "\n\t...\t(skipping %d levels)", n)
+				level += n
+				limit2show = -1
+				continue
+			}
+			limit2show--
+		}
+		fn, _ := ls.GetInfo("Slntf", dbg, LNil)
+		shortSrc := parse.ChunkID(dbg.Source)
+		if dbg.CurrentLine > 0 {
+			fmt.Fprintf(&buf, "\n\t%s:%d: in ", shortSrc, dbg.CurrentLine)
+		} else {
+			fmt.Fprintf(&buf, "\n\t%s: in ", shortSrc)
+		}
+		buf.WriteString(ls.tbFuncName(dbg, fn, shortSrc))
+		if dbg.IsTailCall {
+			buf.WriteString("\n\t(...tail calls...)")
+		}
+	}
+	return buf.String()
+}
+
+// tbFuncName is lauxlib's pushfuncname: the call-site name
+// ("global 'x'", "method 'x'", "hook '?'", ...) if any; else "main
+// chunk"; else the function's name in package.loaded ("function
+// 'io.write'" — "_G." stripped); else "function <src:line>" for a Lua
+// function or "?" for a C one.
+func (ls *LState) tbFuncName(dbg *Debug, fn LValue, shortSrc string) string {
+	if dbg.NameWhat != "" {
+		return fmt.Sprintf("%s '%s'", dbg.NameWhat, dbg.Name)
+	}
+	if dbg.What == "main" {
+		return "main chunk"
+	}
+	if f, ok := fn.(*LFunction); ok {
+		if name, found := ls.findLoadedFuncName(f); found {
+			return fmt.Sprintf("function '%s'", name)
+		}
+	}
+	if dbg.What != "C" {
+		return fmt.Sprintf("function <%s:%d>", shortSrc, dbg.LineDefined)
+	}
+	return "?"
+}
+
+// findLoadedFuncName is lauxlib's pushglobalfuncname/findfield: the
+// function's path in the registry's _LOADED table, one module level
+// deep ("io.write"); a "_G." prefix is stripped. Iteration follows table
+// order (Next), as stock's lua_next does.
+func (ls *LState) findLoadedFuncName(fn *LFunction) (string, bool) {
+	loaded, ok := ls.G.Registry.RawGetString("_LOADED").(*LTable)
+	if !ok {
+		return "", false
+	}
+	for k1, v1 := loaded.Next(LNil); k1 != LNil; k1, v1 = loaded.Next(k1) {
+		if k1.Type() != LTString {
+			continue
+		}
+		if v1 == LValue(fn) {
+			return string(k1.(LString)), true
+		}
+		if mod, ok := v1.(*LTable); ok {
+			for k2, v2 := mod.Next(LNil); k2 != LNil; k2, v2 = mod.Next(k2) {
+				if k2.Type() == LTString && v2 == LValue(fn) {
+					name := string(k1.(LString)) + "." + string(k2.(LString))
+					// pushglobalfuncname strips a leading "_G." (register-
+					// module "_G" holds the globals table itself)
+					if strings.HasPrefix(name, "_G.") {
+						name = name[3:]
+					}
+					return name, true
+				}
+			}
+		}
+	}
+	return "", false
 }
 
 func (ls *LState) formattedFrameFuncName(fr *callFrame) string {
@@ -927,8 +1087,9 @@ func (ls *LState) formattedFrameFuncName(fr *callFrame) string {
 		return name
 	}
 	// U5a: VM-dispatched frames (metamethods, for iterators) render
-	// stock's namewhat form ("in metamethod 'close'"), not "function '...'"
-	if strings.HasPrefix(name, "metamethod '") || name == "for iterator" {
+	// stock's namewhat form ("in metamethod 'close'"), not "function '...'";
+	// U5f: so does the hook frame's "?" ("in hook '?'", db.lua:313)
+	if strings.HasPrefix(name, "metamethod '") || name == "for iterator" || name == "hook '?'" {
 		return name
 	}
 	if name[0] != '(' && name[0] != '<' {
@@ -963,6 +1124,20 @@ func (ls *LState) frameFuncNameFull(fr *callFrame) (string, bool, bool) {
 		} else {
 			return "corountine", false, true
 		}
+	}
+	// U5f (stock funcnamefromcall's first arm): a frame called while its
+	// caller ran a hook — the hook function itself — is named "?" with
+	// namewhat "hook" (checked before any call-site/metamethod walk, and
+	// whatever the traced caller is). db.lua:312-314's assert + traceback
+	// pin the rendering "in hook '?'".
+	if frame.Hooked {
+		return "hook '?'", false, false
+	}
+	// U5f (funcnamefromcall's CIST_FIN arm): the caller is running this
+	// frame as a __gc finalizer — the frame is the metamethod, named
+	// before any call-site walk and whatever the caller's instruction
+	if frame.Fin {
+		return "metamethod '__gc'", false, false
 	}
 	if !frame.Fn.IsG {
 		pc := frame.Pc - 1
@@ -1458,23 +1633,65 @@ func (ls *LState) findPcallMarker(minIdx int) *callFrame {
 
 // runMsgh runs an xpcall message handler AT RAISE (U5d; stock
 // luaG_errormsg invokes the errfunc before any unwinding, so a traceback
-// handler sees the full dying stack). A failing handler collapses to
-// exactly "error in error handling" (row 78e); its object is discarded.
+// handler sees the full dying stack). U5f: stock re-invokes the handler
+// for EVERY error, including one raised inside the running handler, with
+// each invocation costing one luaD_callnoyield C-call unit: at
+// LUAI_MAXCCALLS the pending object is REPLACED by luaG_runerror's
+// "C stack overflow" (which still passes through the handler once, in
+// "handling" mode), and at LUAI_MAXCCALLS/10*11 luaD_errerr fires
+// WITHOUT the handler (errors.lua:636's counting handler terminates
+// with "END" at 170, "C stack overflow" at 300). A handler dying of
+// REGISTER-stack exhaustion is the other dialect (ldo.c:369 — a stack
+// error while already handling one collapses immediately; row 78e).
 func (ls *LState) runMsgh(handler LValue, obj LValue) LValue {
 	fn, ok := handler.(*LFunction)
 	if !ok {
 		return obj
 	}
 	top := ls.reg.Top()
-	ls.reg.Push(fn)
-	ls.reg.Push(obj)
-	if perr := ls.PCall(1, 1, nil); perr != nil {
+	for count := 1; ; count++ {
+		if count == luaMaxCCalls {
+			obj = LString("C stack overflow")
+		} else if count >= luaMaxCCalls/10*11 {
+			ls.reg.SetTop(top)
+			return LString("error in error handling")
+		}
 		ls.reg.SetTop(top)
-		return LString("error in error handling")
+		ls.reg.Push(fn)
+		ls.reg.Push(obj)
+		if perr := ls.PCall(1, 1, nil); perr != nil {
+			// the handler raised: a plain object re-enters the handler
+			// (stock luaG_errormsg); a register-stack overflow is
+			// luaD_errerr — collapse without re-invoking
+			pobj := LValue(LString(perr.Error()))
+			if ae, ok := perr.(*ApiError); ok {
+				pobj = ae.Object
+			}
+			if msghObjIsStackOverflow(pobj) {
+				ls.reg.SetTop(top)
+				return LString("error in error handling")
+			}
+			obj = pobj
+			continue
+		}
+		v := ls.reg.Get(top)
+		ls.reg.SetTop(top)
+		return v
 	}
-	v := ls.reg.Get(top)
-	ls.reg.SetTop(top)
-	return v
+}
+
+// msghObjIsStackOverflow classifies a message-handler failure as the
+// register-stack overflow — RaiseError's "stack overflow" with its
+// optional position prefix ("src:line: "). A user error() whose text
+// happens to end the same way would take the errerr path too; nothing
+// in the oracles pins that pathological shape.
+func msghObjIsStackOverflow(obj LValue) bool {
+	s, ok := obj.(LString)
+	if !ok {
+		return false
+	}
+	t := string(s)
+	return t == "stack overflow" || strings.HasSuffix(t, ": stack overflow")
 }
 
 // completePcallMarker completes the pcall/xpcall/pairs marker that is
@@ -1564,20 +1781,33 @@ func (ls *LState) completePcallMarker(ok bool, errobj LValue) int {
 	}
 }
 
+// errObjectOf extracts a recovered panic's error object (the shared
+// shape of completeErrorMarker's head and its close-error re-entry).
+func errObjectOf(rcv interface{}) LValue {
+	if ae, ok := rcv.(*ApiError); ok {
+		return ae.Object
+	}
+	return LString(fmt.Sprint(rcv))
+}
+
 // completeErrorMarker is the error arm of the marker catch (U5d): the
 // innermost in-scope pcall/xpcall marker swallows rcv — msgh AT raise
 // while the dying frames are still on the stack (xpcall), then the
 // unwind to the marker, the dying frames' upvalue/tbc closes with the
 // object in flight (a failing __close replaces it; the nil-object fix
 // after the handler, stock luaD_pcall's order) — and the marker
-// completes [false, obj].
+// completes [false, obj]. U5f: the remaining tbc closes run YIELDABLE
+// as kind-7 VM frames (stock precover -> finishCcall -> finishpcallk
+// closes through luaF_close(func, status, 1) — official locals.lua's
+// after-error battery yields inside them), with the in-flight object
+// riding the marker's completion slot (m.LocalBase). A Go __close that
+// raises synchronously here is caught per-close and the close loop
+// restarts with the replaced object (stock precover's re-entry at the
+// same marker: last error wins, closing continues, the msgh re-runs per
+// raise); a Lua close's raise is caught by the driving loop's
+// loopAttempt, which re-enters here for the SAME marker.
 func (ls *LState) completeErrorMarker(rcv interface{}, m *callFrame) int {
-	var obj LValue
-	if ae, ok := rcv.(*ApiError); ok {
-		obj = ae.Object
-	} else {
-		obj = LString(fmt.Sprint(rcv))
-	}
+	obj := errObjectOf(rcv)
 	if m.Pcall == 2 {
 		// U5a's frame reserve, carried into the marker path (row 84): a
 		// stack overflow leaves the frame stack FULL, so the handler's
@@ -1604,10 +1834,52 @@ func (ls *LState) completeErrorMarker(rcv interface{}, m *callFrame) int {
 	ls.stack.SetSp(m.Idx + 1)
 	ls.currentFrame = ls.stack.Last()
 	ls.closeUpvalues(m.Base)
-	if o2, failed := ls.closeTBCProtected(m.Base, obj); failed {
-		obj = o2
+	// stage the in-flight object at the marker's completion slot WITHOUT
+	// SetTop's nil-fill: the dying frames' cells above top still hold the
+	// tbc values the sweep reads by absolute index (cells beyond top are
+	// "may be nil", never "must be")
+	ls.reg.top = m.LocalBase
+	ls.reg.Push(obj)
+	for {
+		st, retry := 0, false
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					if _, isunwind := r.(*closeSelfUnwind); isunwind {
+						panic(r)
+					}
+					// a Go __close raised mid-close (stock: the error
+					// escapes luaF_close and precover re-enters recovery at
+					// the same marker): re-derive the object (msgh at raise),
+					// unwind the close frames above the marker, and restart
+					// the sweep for the remaining entries
+					retry = true
+					obj = errObjectOf(r)
+					if m.Pcall == 2 {
+						obj = ls.runMsgh(m.PcallHandler, obj)
+					}
+					if obj == LNil {
+						obj = LString("<no error object>")
+					}
+					ls.stack.SetSp(m.Idx + 1)
+					ls.currentFrame = ls.stack.Last()
+					ls.reg.top = m.LocalBase
+					ls.reg.Push(obj)
+				}
+			}()
+			st = ls.closeTBCVM(m.Base, 7, 0, 0, obj)
+		}()
+		if retry {
+			continue
+		}
+		switch st {
+		case 1:
+			return 0 // a close frame was pushed — the loop enters it
+		case 2:
+			return 1 // suspended inside a Go __close
+		}
+		return ls.completePcallMarker(false, obj)
 	}
-	return ls.completePcallMarker(false, obj)
 }
 
 // markerKind classifies a call-site callee for the U5d marker
@@ -1740,10 +2012,20 @@ func pushPcallMarker(L *LState, cf *callFrame, lv LValue, RA, nargs, nret int, k
 // LocalBase) — so a yield inside a Lua __close suspends through it
 // (stock luaF_close from Lua code calls metamethods yieldable) and the
 // owner's close/return resumes via doReturn's continuation arm. A C
-// __close runs noyield (stock callclosemethod -> luaD_callnoyield): its
-// Go frame cannot survive a suspend. Returns true when a close frame
-// was pushed (the caller returns 0 so the loop enters it).
-func (ls *LState) closeTBCVM(level int, kind uint8, contRA, contB int) bool {
+// __close dispatched from Go context runs noyield (stock callclosemethod
+// -> luaD_callnoyield): its Go frame cannot survive a suspend. U5f: from
+// the VM it runs yieldable like stock's luaD_call arm — coroutine.yield
+// AS __close suspends with the tagged frame kept, and the resume
+// finishes it (stock resume's poscall of a NULL-continuation C frame)
+// before continuing the close list. Kind 7 (U5f) is the error-path form:
+// errval != LNil stages the 2-argument __close(obj, errobj) call of
+// stock's finishpcallk (luaF_close(func, status, 1) — yieldable, running
+// from the resume's clean C stack), with the in-flight object riding the
+// catching marker's completion slot; when the list drains doReturn's
+// kind-7 arm completes the marker. Returns 0 when the whole list ran
+// synchronously, 1 when a close frame was pushed (the loop enters it),
+// 2 when the thread suspended inside a Go __close (the loop must stop).
+func (ls *LState) closeTBCVM(level int, kind uint8, contRA, contB int, errval LValue) int {
 	for ls.tbclist != nil && ls.tbclist.idx >= level {
 		e := ls.tbclist
 		ls.tbclist = e.prev
@@ -1753,8 +2035,30 @@ func (ls *LState) closeTBCVM(level int, kind uint8, contRA, contB int) bool {
 		}
 		op := ls.metaOp1(lv, "__close")
 		base := ls.reg.Top()
+		// U5f: the close window must sit ABOVE every remaining entry's
+		// cell. A kind-7 sweep reuses the dead owner's register region —
+		// the plain reg.Top() lands inside it, and the close body's own
+		// registers would trash a not-yet-dispatched entry's cell (its
+		// later dispatch — or doReturn's plain closeTBC(lbase) sweep of the
+		// body's own entries — reads garbage). Kinds 4/5 keep the owner's
+		// cells below the window already; the max is a no-op there.
+		for rem := ls.tbclist; rem != nil; rem = rem.prev {
+			if rem.idx >= base {
+				base = rem.idx + 1
+			}
+		}
+		// the pushes below land at reg.top, so the window actually sits at
+		// the raised base only if top moves there first — a direct write,
+		// NOT SetTop: its nil-fill would wipe the very cells this guard
+		// exists to protect
+		ls.reg.top = base
 		ls.reg.Push(op)
 		ls.reg.Push(lv)
+		nargs := 1
+		if errval != LNil {
+			ls.reg.Push(errval)
+			nargs = 2
+		}
 		bfn, callee, ccmt := ls.resolveCall(op, base+1)
 		cfk := callFrame{
 			Fn:         bfn,
@@ -1762,7 +2066,7 @@ func (ls *LState) closeTBCVM(level int, kind uint8, contRA, contB int) bool {
 			Base:       base,
 			LocalBase:  base + 1,
 			ReturnBase: base,
-			NArgs:      1 + ccmt,
+			NArgs:      nargs + ccmt,
 			NRet:       0,
 			Parent:     ls.currentFrame,
 			TailCall:   0,
@@ -1772,23 +2076,45 @@ func (ls *LState) closeTBCVM(level int, kind uint8, contRA, contB int) bool {
 			ContB:      contB,
 		}
 		if bfn != nil && bfn.IsG {
-			// the depth bump must survive a raise mid-close: scope it so
+			if ls.mmYieldable() || kind == 7 {
+				// U5f: stock callclosemethod's yieldable arm — a C __close
+				// called from Lua code is luaD_call'd (yy=1), so a Go close
+				// body may suspend; the kind tag carries the close
+				// continuation across the suspend (mainLoop's resume arm).
+				// Kind 7 runs yieldable unconditionally: its closes run from
+				// the resume's clean C stack (finishpcallk), where stock's
+				// non-yieldable count is zero whatever sits below.
+				ls.pushCallFrame(cfk, callee, false)
+				ls.hookCallEvent(ls.currentFrame)
+				if callGFunction(ls, false) {
+					if ls.G.CurrentThread != ls {
+						return 2 // suspended inside the Go __close
+					}
+					return 1 // the body ended the thread / a Go region took over
+				}
+				continue
+			}
+			// noyield (Go-context dispatch — stock luaD_callnoyield): the
+			// depth bump must survive a raise mid-close: scope it so
 			// the deferred decrement runs on the unwind too
 			ls.noyieldDepth++
 			done := func() (done bool) {
 				defer func() { ls.noyieldDepth-- }()
 				ls.pushCallFrame(cfk, callee, false)
+				ls.hookCallEvent(ls.currentFrame)
 				return callGFunction(ls, false)
 			}()
 			if done {
-				return true
+				return 1
 			}
 			continue
 		}
 		ls.pushCallFrame(cfk, callee, false)
-		return true
+		// U5f: the __close frame's call hook (stock luaD_call into it)
+		ls.hookCallEvent(ls.currentFrame)
+		return 1
 	}
-	return false
+	return 0
 }
 
 // The metamethod-dispatch states (U5d, row 22 — stock ltm.c's
@@ -1863,6 +2189,7 @@ func (ls *LState) callMM(nargs, nret int, contA, contB int) (LValue, uint8) {
 				TailCall:   0,
 				CCmt:       ccmt,
 			}, callee, false)
+			ls.hookCallEvent(ls.currentFrame)
 			return callGFunction(ls, false)
 		}()
 		if done {
@@ -1890,6 +2217,8 @@ func (ls *LState) callMM(nargs, nret int, contA, contB int) (LValue, uint8) {
 		ContRA:     contA,
 		ContB:      contB,
 	}, callee, false)
+	// U5f: the kind-6 metamethod frame's call hook (stock luaD_call)
+	ls.hookCallEvent(ls.currentFrame)
 	return LNil, mmPushed
 }
 
@@ -1928,6 +2257,219 @@ func loopAttempt(L *LState, minIdx int, baseframe *callFrame) {
 	L.mainLoop(L, baseframe)
 }
 
+// Debug-hook mask bits (stock lua.h's LUA_MASK*, the LUA_HOOK* event
+// numbers as bit positions).
+const (
+	hookMaskCall  uint8 = 1 << 0 // "call" + "tail call"
+	hookMaskRet   uint8 = 1 << 1
+	hookMaskLine  uint8 = 1 << 2
+	hookMaskCount uint8 = 1 << 3
+)
+
+// hookInvoke runs the hook function for an event (stock luaD_hook over
+// ldblib's hookf): the hook is called with (event, line-or-nil) — hookf
+// pushes nil when currentline < 0 — as a callR body, so getinfo(2) from
+// inside the hook is the frame the event fired on (stock calls the hook
+// directly from C: no intermediate frame) and GetInfo 'n' resolves the
+// event names ("sethook", "close", "foo"). callR is no-yield — stock
+// hooks run under luaD_callnoyield too, so a yielding hook raises the
+// row-84 boundary error. While the hook runs hookBusy blocks nested
+// events (stock's allowhook=0), but the per-instruction seam still
+// advances hookOldPc/hookCountdown over the hook function's own frames
+// — stock's oldpc is thread-global and updated by every traced
+// instruction, whatever frame it belongs to.
+//
+// U5f: the frame the event fired ON (the frame current when this runs —
+// the callee for a call event, the returning frame for a return, the
+// executing frame for line/count) is marked Hooked (CIST_HOOKED) while
+// the hook runs, and (ftransfer, ntransfer) are recorded thread-globally
+// (L->transferinfo) — overwritten by every event, reported by getinfo
+// 'r' over the marked frame.
+func (ls *LState) hookInvoke(event string, line, ftransfer, ntransfer int) {
+	if ls.hookBusy || ls.hookFn == nil {
+		return
+	}
+	ls.hookBusy = true
+	traced := ls.currentFrame
+	if traced != nil {
+		traced.Hooked = true
+	}
+	ls.hookFTransfer = ftransfer
+	ls.hookNTransfer = ntransfer
+	defer func() {
+		if traced != nil {
+			traced.Hooked = false
+		}
+		ls.hookBusy = false
+	}()
+	base := ls.reg.Top()
+	ls.reg.Push(ls.hookFn)
+	ls.reg.Push(LString(event))
+	if line >= 0 {
+		ls.reg.Push(LInteger(line))
+	} else {
+		ls.reg.Push(LNil)
+	}
+	ls.callR(2, 0, base)
+}
+
+// hookCallEvent fires the CALL hook for a freshly pushed frame (stock
+// luaD_hookcall via luaG_tracecall for a Lua callee, precallC's hook
+// for a C one). A tailcall-reused frame reports "tail call" (TailCall >
+// 0). Vararg Lua frames defer to their OP_VARARGPREP (stock defers the
+// hook the same way — the argument shuffle must run first). oldpc=0
+// makes the callee's first instruction fire the line hook (pcIdx 0 <=
+// 0), matching stock's hookcall entry.
+func (ls *LState) hookCallEvent(cf *callFrame) {
+	if ls.hookMask == 0 {
+		return
+	}
+	if !cf.Fn.IsG && cf.Fn.Proto.IsVarArg != 0 {
+		return // OP_VARARGPREP fires it (and owns the oldpc dance)
+	}
+	ls.hookOldPc = 0
+	if ls.hookMask&hookMaskCall == 0 {
+		return
+	}
+	event := "call"
+	if !cf.Fn.IsG && cf.TailCall > 0 {
+		event = "tail call"
+	}
+	// U5f (stock luaD_hookcall vs precallC): the transfer window is the
+	// callee's parameters — numparams for a Lua callee (missing ones
+	// nil-filled), the actual argument count for a C callee.
+	n := cf.NArgs
+	if !cf.Fn.IsG {
+		n = int(cf.Fn.Proto.NumParameters)
+	}
+	ls.hookInvoke(event, -1, 1, n)
+}
+
+// hookVarargCallEvent is OP_VARARGPREP's trap arm (stock lvm.c): the
+// deferred call/tail-call hook for a vararg frame fires after the
+// argument shuffle, then oldpc=1 — the instruction after VARARGPREP is
+// seen as a new line even when the line does not change.
+func (ls *LState) hookVarargCallEvent(cf *callFrame) {
+	if ls.hookMask == 0 {
+		return
+	}
+	ls.hookOldPc = 0
+	if ls.hookMask&hookMaskCall != 0 {
+		event := "call"
+		if cf.TailCall > 0 {
+			event = "tail call"
+		}
+		ls.hookInvoke(event, -1, 1, int(cf.Fn.Proto.NumParameters))
+	}
+	ls.hookOldPc = 1
+}
+
+// hookReturnEvent is stock rethook at luaD_poscall: the RETURN event
+// fires before the results move (after the frame's tbc closes —
+// moveresults' CIST_TBC ordering), with the returning frame still
+// current so the hook's getinfo(2) names it; then oldpc tracks the
+// CALLER's current instruction (pcRel(savedpc): the call site), so the
+// resume instruction compares like any post-call step. A non-Lua caller
+// leaves oldpc alone (stock's isLua guard).
+//
+// U5f: firstres/nres (stock's firstres = top - nres) give the transfer
+// window — ftransfer = firstres - virtual func. Our LocalBase IS the
+// virtual func cell of stock's vararg layout (there is no copied func
+// slot; the params sit exactly where stock puts them after its copy),
+// so the 1-based register index stock reports is firstres-LocalBase+1;
+// verified against the oracle for Lua returns, G returns, tail calls
+// and select-style multrets (/tmp/tr.lua, db.lua:533).
+func (ls *LState) hookReturnEvent(cf *callFrame, firstres, nres int) {
+	if ls.hookMask == 0 {
+		return
+	}
+	if ls.hookMask&hookMaskRet != 0 {
+		ls.hookInvoke("return", -1, firstres-cf.LocalBase+1, nres)
+	}
+	if parent := cf.Parent; parent != nil && parent.Fn != nil && !parent.Fn.IsG && parent.Fn.Proto != nil {
+		ls.hookOldPc = parent.Pc - 1
+	}
+}
+
+// hookLineAt is luaG_getfuncline over the fork's absolute line array
+// (DbgSourcePositions), with traceexec's oldpc-validity guard: an oldpc
+// left by ANOTHER proto may index past this one — stock substitutes 0.
+// A stripped proto (no lineinfo) answers -1 (db.lua:1016's line-hook
+// battery: events still fire, with a nil line).
+func hookLineAt(p *FunctionProto, idx int) int {
+	if len(p.DbgSourcePositions) == 0 {
+		return -1
+	}
+	if idx < 0 || idx >= len(p.DbgSourcePositions) {
+		idx = 0
+	}
+	return p.DbgSourcePositions[idx]
+}
+
+// traceHook is the per-instruction seam (stock luaG_traceexec), run by
+// the main loops right after the fetch's Pc++ — pcIdx = cf.Pc-1 is the
+// instruction about to run. The count countdown runs even while a hook
+// is executing (stock decrements on every traced instruction, hook
+// frames included); the count hook fires before the line hook. The line
+// test — a jump back (pcIdx <= oldpc) or a line change since the
+// instruction oldpc last visited — fires with the instruction's
+// absolute line. oldpc advances on every visit, whatever frame it
+// belongs to (stock's thread-global oldpc).
+func (ls *LState) traceHook(cf *callFrame) {
+	// U5f (stock luaG_tracecall's vararg arm, db.lua:124's trace): a
+	// vararg proto's instruction 0 — OP_VARARGPREP — never passes through
+	// traceexec (trap is 0 at its fetch); its handler fires the deferred
+	// call event and sets oldpc=1, so instruction 1 is what traces the
+	// entry line. Tracing instruction 0 here would fire that line twice.
+	if pcIdx := cf.Pc - 1; pcIdx == 0 && cf.Fn.Proto.IsVarArg != 0 {
+		return
+	}
+	if ls.hookMask&hookMaskCount != 0 {
+		ls.hookCountdown--
+		if ls.hookCountdown <= 0 {
+			ls.hookCountdown = ls.hookCount
+			ls.hookInvoke("count", -1, 0, 0)
+		}
+	}
+	if ls.hookMask&hookMaskLine != 0 {
+		pcIdx := cf.Pc - 1
+		p := cf.Fn.Proto
+		// traceexec's oldpc-validity guard comes BEFORE the comparison:
+		// an oldpc left by another proto (or a hook frame) may index past
+		// this one — stock substitutes 0, so a jump-back test against a
+		// polluted oldpc degrades to npci <= 0 (the entry line event)
+		oldpc := ls.hookOldPc
+		if oldpc < 0 || oldpc >= len(p.DbgSourcePositions) {
+			oldpc = 0
+		}
+		if pcIdx <= oldpc || hookLineAt(p, pcIdx) != hookLineAt(p, oldpc) {
+			ls.hookInvoke("line", hookLineAt(p, pcIdx), 0, 0)
+		}
+		ls.hookOldPc = pcIdx
+	}
+}
+
+// firePendingReturnHook is the resume half of a C call that suspended
+// mid-body (coroutine.yield): stock finishCfunc redoes the poscall, so
+// the yield's RETURN event fires when the thread resumes, before the
+// suspended frame's next instruction (coroutine.lua's trace: the 4th
+// event). The G frame was popped at the suspension; its caller is the
+// frame now on top — the oldpc walk uses that frame's call site.
+func (ls *LState) firePendingReturnHook() {
+	ls.retHookPending = false
+	if ls.hookMask&hookMaskRet != 0 {
+		// the suspended G frame is already popped in the fork's model —
+		// stock's finishCfunc redoes poscall over the still-live C frame
+		// with the resume window (firstres = func, nres = yielded count).
+		// (0,0) here diverges for a 'r' query in this resume-seam hook
+		// only; no corpus reads one (coroutine.lua checks event names).
+		ls.hookInvoke("return", -1, 0, 0)
+	}
+	if cf := ls.currentFrame; cf != nil && cf.Fn != nil && !cf.Fn.IsG && cf.Fn.Proto != nil {
+		ls.hookOldPc = cf.Pc - 1
+	}
+}
+
 func (ls *LState) callR(nargs, nret, rbase int) {
 	// U5d (row 22, stock lua_call/lua_pcall from C = luaD_callnoyield):
 	// a call driven from a Go frame has no continuation — mark the
@@ -1955,6 +2497,9 @@ func (ls *LState) callR(nargs, nret, rbase int) {
 		TailCall:   0,
 		CCmt:       ccmt,
 	}, callee, false)
+	// U5f: the Go-driven call is stock's luaD_call — the call hook fires
+	// at the callee's first instruction (tracecall/precallC)
+	ls.hookCallEvent(ls.currentFrame)
 	if ls.G.MainThread == nil {
 		ls.G.MainThread = ls
 		ls.G.CurrentThread = ls
@@ -2171,6 +2716,10 @@ func (ls *LState) Close() {
 	if ls.stack == nil {
 		return
 	}
+	// U5f (stock close_state → callallpendingfinalizers): a close runs
+	// the finalizers already queued before tearing anything down. Their
+	// errors are warned, not raised (GCTM's shape)
+	ls.drainFinalizers()
 	// U4d (stock close_state): a full close runs the MAIN thread's
 	// Lua-level exits — upvalues first, then every tbc entry as a 1-arg
 	// __close(obj) (YIELD-mapped-to-OK shape; failures are swallowed like
@@ -2568,7 +3117,15 @@ func (ls *LState) GetInfo(what string, dbg *Debug, fn LValue) (LValue, error) {
 				dbg.LineDefined = -1
 				dbg.LastLineDefined = -1
 			} else {
+				// U5f: a stripped chunk's NULL source answers "=?"
+				// (stock funcinfo's no-source arm; chunkid drops the "="
+				// so short_src renders "?"). An explicit empty chunkname
+				// (load(s, "")) is a real empty source — "" as-is, and
+				// short_src renders `[string ""]` (db.lua:73)
 				dbg.Source = f.Proto.SourceName
+				if f.Proto.SourceIsNull {
+					dbg.Source = "=?"
+				}
 				dbg.LineDefined = f.Proto.LineDefined
 				dbg.LastLineDefined = f.Proto.LastLineDefined
 				if dbg.LineDefined == 0 {
@@ -2578,7 +3135,8 @@ func (ls *LState) GetInfo(what string, dbg *Debug, fn LValue) (LValue, error) {
 				}
 			}
 		case 'l':
-			if frame != nil && !frame.Fn.IsG && frame.Pc > 0 {
+			if frame != nil && !frame.Fn.IsG && frame.Pc > 0 &&
+				len(f.Proto.DbgSourcePositions) > 0 { // U5f: stripped → -1
 				dbg.CurrentLine = f.Proto.DbgSourcePositions[frame.Pc-1]
 			} else {
 				dbg.CurrentLine = -1
@@ -2605,22 +3163,43 @@ func (ls *LState) GetInfo(what string, dbg *Debug, fn LValue) (LValue, error) {
 			// name comes from the CALLER — funcnamefromcall over the
 			// caller's current instruction (funcnamefromcode: the call
 			// site's getobjname kind, a metamethod event, or the for
-			// iterator); a C caller yields nothing
+			// iterator); a C caller yields nothing. U5f: a caller running
+			// a hook (CIST_HOOKED — funcnamefromcall's first arm, before
+			// the isLua dispatch) names the hook's own frame "?" / "hook"
 			dbg.NameWhat = ""
 			dbg.Name = ""
 			if frame != nil && frame.TailCall == 0 {
-				if parent := frame.Parent; parent != nil && parent.Fn != nil && !parent.Fn.IsG && parent.Fn.Proto != nil {
-					if kind, name := funcNameFromCode(parent.Fn.Proto, parent.Pc-1); kind != "" {
-						dbg.NameWhat = kind
-						dbg.Name = name
+				if parent := frame.Parent; parent != nil {
+					if parent.Hooked {
+						dbg.NameWhat = "hook"
+						dbg.Name = "?"
+					} else if parent.Fin {
+						// U5f (funcnamefromcall's CIST_FIN arm, before
+						// the isLua dispatch): the caller is running this
+						// frame as the __gc finalizer — named even over a
+						// C caller (a collectgarbage-driven finalizer)
+						dbg.NameWhat = "metamethod"
+						dbg.Name = "__gc"
+					} else if parent.Fn != nil && !parent.Fn.IsG && parent.Fn.Proto != nil {
+						if kind, name := funcNameFromCode(parent.Fn.Proto, parent.Pc-1); kind != "" {
+							dbg.NameWhat = kind
+							dbg.Name = name
+						}
 					}
 				}
 			}
 		case 'r':
-			// ftransfer/ntransfer are hook-transfer bookkeeping; with no
-			// hooks in the fork they are always 0
+			// U5f (stock auxgetinfo): the transfer window of the event the
+			// hook was last invoked for, reported ONLY over the frame it
+			// fired on (CIST_HOOKED) — call/return windows for the traced
+			// frame, which db.lua's transfer battery reads via getinfo(2)
+			// + getlocal(2, ftransfer..). Anything else answers 0/0.
 			dbg.FTransfer = 0
 			dbg.NTransfer = 0
+			if frame != nil && frame.Hooked {
+				dbg.FTransfer = ls.hookFTransfer
+				dbg.NTransfer = ls.hookNTransfer
+			}
 		case 'L':
 			retlines = true
 		default:
@@ -2632,7 +3211,9 @@ func (ls *LState) GetInfo(what string, dbg *Debug, fn LValue) (LValue, error) {
 		// stock collectvalidlines: nil for C functions; else
 		// {line=true} over the lineinfo — a vararg proto skips
 		// instruction 0 (its VARARGPREP, which carries the function's
-		// definition line)
+		// definition line). A stripped proto (NULL lineinfo, U5f-1's
+		// string.dump(f, true)) answers an EMPTY table — stock zeroes
+		// nlines, and db.lua's getinfo-over-dump battery pins it
 		if f.IsG {
 			dbg.ActiveLines = nil
 		} else {
@@ -2642,7 +3223,11 @@ func (ls *LState) GetInfo(what string, dbg *Debug, fn LValue) (LValue, error) {
 			if p.IsVarArg != 0 {
 				i = 1
 			}
-			for ; i < len(p.Code); i++ {
+			nlines := len(p.DbgSourcePositions)
+			if len(p.Code) < nlines {
+				nlines = len(p.Code)
+			}
+			for ; i < nlines; i++ {
 				dbg.ActiveLines.RawSetInt(p.DbgSourcePositions[i], LTrue)
 			}
 		}
@@ -2674,23 +3259,61 @@ func (ls *LState) GetStack(level int) (*Debug, bool) {
 		level--
 	}
 	frame := ls.currentFrame
+	// U5f (stock lua_getstack): one frame = one level — a tail call
+	// REPLACES its frame (istailcall is a flag on the surviving ci), it
+	// does not leave phantom levels behind. The old `level -= TailCall`
+	// walked past the stack for a tail-called callee's caller
+	// (db.lua:627's getinfo(2) over h→g1→g→f).
 	for ; level > 0 && frame != nil; frame = frame.Parent {
 		level--
-		if !frame.Fn.IsG {
-			level -= frame.TailCall
-		}
 	}
 
 	if level == 0 && frame != nil {
 		return &Debug{frame: frame}, true
-	} else if level < 0 && ls.stack.Sp() > 0 {
-		return &Debug{frame: ls.stack.At(0)}, true
 	}
+	// U5f: stock lua_getstack rejects negative levels outright ("invalid
+	// (negative) level" returns 0) — debug.getlocal/setlocal must argerror
+	// "level out of range" for them (db.lua:260's pcall battery). The old
+	// bottom-frame fallback made debug.setlocal(-1, 1, 10) succeed.
 	return &Debug{}, false
+}
+
+// findVarargCell (stock findvararg, ldebug.c): the register cell of the
+// (-n)-th extra argument of a hidden-model vararg frame — any negative
+// index names one, "(vararg)" the generic name. The extras keep the
+// cells the caller left them in — [Base+nparams+1, LocalBase) — both
+// before and after OP_VARARGPREP's shift (the shuffle moves the fixed
+// params above them, never the extras themselves; OP_VARARG reads the
+// same window). A table-model function (promoted) has no addressable
+// varargs (stock guards on PF_VAHID); C frames have no proto at all.
+func (ls *LState) findVarargCell(frame *callFrame, no int) (int, bool) {
+	proto := frame.Fn.Proto
+	if proto == nil || proto.IsVarArg&VarArgHidden == 0 {
+		return 0, false
+	}
+	np := int(proto.NumParameters)
+	nextra := frame.NArgs - np
+	if nextra < 0 {
+		nextra = 0
+	}
+	if no < 0 && no >= -nextra {
+		return frame.Base + np - no, true
+	}
+	return 0, false
 }
 
 func (ls *LState) GetLocal(dbg *Debug, no int) (string, LValue) {
 	frame := dbg.frame
+	// U5f: negative indices address the varargs (stock luaG_findlocal
+	// routes n < 0 to findvararg before the local-name lookup — the
+	// old path fell through to "(temporary)" for them; db.lua's vararg
+	// battery pins "(vararg)" and the settable cells)
+	if no < 0 {
+		if cell, ok := ls.findVarargCell(frame, no); ok {
+			return "(vararg)", ls.reg.Get(cell)
+		}
+		return "", LNil
+	}
 	if name := ls.findLocal(frame, no); len(name) > 0 {
 		return name, ls.reg.Get(frame.LocalBase + no - 1)
 	}
@@ -2699,6 +3322,13 @@ func (ls *LState) GetLocal(dbg *Debug, no int) (string, LValue) {
 
 func (ls *LState) SetLocal(dbg *Debug, no int, lv LValue) string {
 	frame := dbg.frame
+	if no < 0 {
+		if cell, ok := ls.findVarargCell(frame, no); ok {
+			ls.reg.Set(cell, lv)
+			return "(vararg)"
+		}
+		return ""
+	}
 	if name := ls.findLocal(frame, no); len(name) > 0 {
 		ls.reg.Set(frame.LocalBase+no-1, lv)
 		return name
@@ -2707,25 +3337,35 @@ func (ls *LState) SetLocal(dbg *Debug, no int, lv LValue) string {
 }
 
 func (ls *LState) GetUpvalue(fn *LFunction, no int) (string, LValue) {
-	if fn.IsG {
-		return "", LNil
-	}
-
 	no--
 	if no >= 0 && no < len(fn.Upvalues) {
+		// U5f (stock aux_upvalue's C-closure arm): a Go closure's upvalue
+		// is addressable — its name is "" rather than "absent"
+		// (db.lua:597: getupvalue(gmatch-closure, 1) == "")
+		if fn.IsG {
+			return "", fn.Upvalues[no].Value()
+		}
+		// U5f (stock aux_upvalue's Lua arm): a nameless upvalue — a
+		// stripped proto carries no DbgUpvalues — is "(no name)" while
+		// the index stays addressable (db.lua:972's chunk-without-debug)
+		if no >= len(fn.Proto.DbgUpvalues) {
+			return "(no name)", fn.Upvalues[no].Value()
+		}
 		return fn.Proto.DbgUpvalues[no], fn.Upvalues[no].Value()
 	}
 	return "", LNil
 }
 
 func (ls *LState) SetUpvalue(fn *LFunction, no int, lv LValue) string {
-	if fn.IsG {
-		return ""
-	}
-
 	no--
 	if no >= 0 && no < len(fn.Upvalues) {
 		fn.Upvalues[no].SetValue(lv)
+		if fn.IsG {
+			return "" // as GetUpvalue: a C (Go) closure's upvalue name
+		}
+		if no >= len(fn.Proto.DbgUpvalues) {
+			return "(no name)" // as GetUpvalue: stripped, nameless
+		}
 		return fn.Proto.DbgUpvalues[no]
 	}
 	return ""
@@ -2899,15 +3539,17 @@ func (ls *LState) Load(reader io.Reader, name string) (*LFunction, error) {
 // LoadEnv is Load with an explicit chunk environment (5.2 load's env
 // argument): the compiled main chunk's _ENV upvalue cell is seeded with
 // env, so the chunk (and every closure it creates) resolves globals
-// there. A nil env falls back to the thread environment.
-func (ls *LState) LoadEnv(reader io.Reader, name string, env *LTable) (*LFunction, error) {
-	if env == nil {
+// there. A nil env falls back to the thread environment; 5.5 accepts
+// ANY value for env (calls.lua:415's `load(..., 123)` — only actual
+// global accesses care that it is a table).
+func (ls *LState) LoadEnv(reader io.Reader, name string, env LValue) (*LFunction, error) {
+	if env == LNil {
 		env = ls.currentEnv()
 	}
 	return ls.loadAux(reader, name, env)
 }
 
-func (ls *LState) loadAux(reader io.Reader, name string, env *LTable) (*LFunction, error) {
+func (ls *LState) loadAux(reader io.Reader, name string, env LValue) (*LFunction, error) {
 	chunk, err := parse.Parse(reader, name)
 	if err != nil {
 		return nil, newApiErrorE(ApiErrorSyntax, err)
@@ -2916,16 +3558,51 @@ func (ls *LState) loadAux(reader io.Reader, name string, env *LTable) (*LFunctio
 	if err != nil {
 		return nil, newApiErrorE(ApiErrorSyntax, err)
 	}
-	fn := newLFunctionL(proto, env, int(proto.NumUpvalues))
-	// seed the main chunk's _ENV cell (the only upvalue a main proto
-	// declares — Compile registers it at index 0)
-	if idx := proto.EnvUpvalueIndex; idx >= 0 {
+	return ls.newMainFunction(proto, env), nil
+}
+
+// loadBinaryAux is loadAux's binary arm (U5f): undump a precompiled
+// chunk (dump.go, stock lundump.c) and wrap it as the main function.
+// The env folds live in newMainFunction (a Go-nil env = argument absent
+// seeds the globals; an explicit value seeds as-is).
+func (ls *LState) loadBinaryAux(data []byte, name string, env LValue) (*LFunction, error) {
+	proto, err := undumpProto(data, name)
+	if err != nil {
+		return nil, newApiErrorS(ApiErrorSyntax, err.Error())
+	}
+	return ls.newMainFunction(proto, env), nil
+}
+
+// newMainFunction wraps a compiled (or undumped) main proto as a
+// callable (U5f re-pin: stock f_parser + lua_load + load_aux). f_parser's
+// luaF_initupvals (lfunc.c) fills EVERY upvalue of the fresh main with a
+// new CLOSED nil-valued cell; lua_load's tail (lapi.c) then seeds upvalue
+// #1 with the registry globals; an explicit load env argument overwrites
+// upvalue #1 again in load_aux. Upvalue #1 is NOT necessarily _ENV — a
+// dumped non-main loaded as a chunk keeps its own upvalue order
+// (calls.lua:418: `local y=x` makes x upvalue 1 and _ENV 2, and the
+// no-env load leaves _ENV nil until setupvalue sets it). The callers
+// resolve a nil env to the thread environment first (the interp's
+// registry-globals analog).
+func (ls *LState) newMainFunction(proto *FunctionProto, env LValue) *LFunction {
+	envtable, _ := env.(*LTable)
+	if envtable == nil {
+		envtable = ls.currentEnv()
+	}
+	fn := newLFunctionL(proto, envtable, int(proto.NumUpvalues))
+	if env == nil {
+		env = ls.G.Global // stock lua_load: the registry globals
+	}
+	for i := range fn.Upvalues {
 		uv := &Upvalue{}
 		uv.Close()
-		uv.SetValue(env)
-		fn.Upvalues[idx] = uv
+		uv.SetValue(LNil) // stock setnilvalue: a typed nil, not a nil LValue
+		fn.Upvalues[i] = uv
 	}
-	return fn, nil
+	if len(fn.Upvalues) > 0 {
+		fn.Upvalues[0].SetValue(env)
+	}
+	return fn
 }
 
 func (ls *LState) Call(nargs, nret int) {
@@ -2965,7 +3642,7 @@ func (ls *LState) PCall(nargs, nret int, errfunc *LFunction) (err error) {
 				if ls.Options.IncludeGoStackTrace {
 					buf := make([]byte, 4096)
 					runtime.Stack(buf, false)
-					err.(*ApiError).StackTrace = strings.Trim(string(buf), "\000") + "\n" + ls.stackTrace(0)
+					err.(*ApiError).StackTrace = strings.Trim(string(buf), "\000") + "\n" + ls.stackTrace(nil, 0)
 				}
 			} else {
 				err = rcv.(*ApiError)
@@ -2990,52 +3667,19 @@ func (ls *LState) PCall(nargs, nret int, errfunc *LFunction) (err error) {
 					ls.stack.SetSp(drop)
 					ls.currentFrame = ls.stack.Last()
 				}
-				ls.Push(errfunc)
-				ls.Push(err.(*ApiError).Object)
+				// U5f: the handler runs through runMsgh's loop — stock
+				// luaG_errormsg re-invokes it for every nested raise (C-call
+				// counting; errors.lua:636), collapsing to luaD_errerr only
+				// on the second-level ceiling or a register-stack overflow
+				// (row 78e). A failing handler's frames die inside runMsgh's
+				// protected invocation; the outer close dance below is
+				// shared with the no-handler arm.
 				ls.Panic = panicWithoutTraceback
-				defer func() {
-					ls.Panic = oldpanic
-					rcv := recover()
-					if rcv != nil {
-						if _, isunwind := rcv.(*closeSelfUnwind); isunwind {
-							panic(rcv) // base-level unwind: never caught here
-						}
-						// the errfunc itself panicked — its frames die too.
-						// U5c (stock luaD_errerr, row 83): a FAILING message
-						// handler — raising any object or dying of stack
-						// exhaustion — collapses to exactly "error in error
-						// handling" as the final error object; the handler's own
-						// object is discarded (probed: string/table raises and
-						// the handler-overflow shapes; calls.lua:168,
-						// cstack.lua:24-31)
-						ls.closeUpvalues(base)
-						err = newApiErrorS(ApiErrorError, "error in error handling")
-						// U5a: restore the CALL STACK before the error-path
-						// closes (stock luaD_pcall's L->ci = old_ci precedes
-						// luaD_closeprotected) — the dying frames must be
-						// off the frame stack when __close metamethods run,
-						// so the metamethod's caller is the recovering
-						// boundary (locals.lua's error-in-__close battery
-						// pins debug.getinfo(2).name == "pcall" inside
-						// them). The REGISTER top stays high: SetTop clears
-						// cells above it and the to-be-closed values still
-						// live there.
-						ls.stack.SetSp(sp)
-						if sp == 0 {
-							ls.currentFrame = nil
-						} else {
-							ls.currentFrame = ls.stack.Last()
-						}
-						ls.closeErrorPath(base, &err)
-						ls.stack.SetSp(sp)
-						ls.currentFrame = ls.stack.Last()
-						ls.reg.SetTop(base)
-					}
-				}()
-				ls.Call(1, 1)
-				err = newApiError(ApiErrorError, ls.Get(-1))
+				obj := ls.runMsgh(errfunc, err.(*ApiError).Object)
+				ls.Panic = oldpanic
+				err = newApiError(ApiErrorError, obj)
 			} else if len(err.(*ApiError).StackTrace) == 0 {
-				err.(*ApiError).StackTrace = ls.stackTrace(0)
+				err.(*ApiError).StackTrace = ls.stackTrace(nil, 0)
 			}
 			// same call-stack restore before the closes as the errfunc arm
 			ls.stack.SetSp(sp)
@@ -3097,6 +3741,10 @@ func (ls *LState) SetMetatable(obj LValue, mt LValue) {
 	switch v := obj.(type) {
 	case *LTable:
 		v.Metatable = mt
+		// U5f: setmetatable time is the finalizer registration point
+		// (stock luaC_checkfinalizer) — a non-nil __gc field makes the
+		// object collectable-with-finalizer
+		ls.syncFinalizer(v, mt)
 	case *LUserData:
 		if v.Light {
 			// U5c: light userdata shares the basic-type table (stock
@@ -3104,6 +3752,7 @@ func (ls *LState) SetMetatable(obj LValue, mt LValue) {
 			ls.G.builtinMts[basicTypeIndex(v)] = mt
 		} else {
 			v.Metatable = mt
+			ls.syncFinalizer(v, mt) // U5f: as tables, above
 		}
 	default:
 		ls.G.builtinMts[basicTypeIndex(obj)] = mt
@@ -3173,6 +3822,10 @@ func (ls *LState) Resume(th *LState, fn *LFunction, args ...LValue) (ResumeState
 		cf.NArgs = len(args)
 		th.initCallFrame(cf)
 		th.Panic = panicWithoutTraceback
+		// U5f: a fresh thread's entry is stock luaD_call into the body —
+		// the call hook fires at its first instruction (luaG_tracecall;
+		// a vararg body defers to its OP_VARARGPREP)
+		th.hookCallEvent(th.currentFrame)
 	} else {
 		for _, arg := range args {
 			th.Push(arg)

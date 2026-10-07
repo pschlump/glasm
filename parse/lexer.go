@@ -36,12 +36,19 @@ type Error struct {
 	// luaX_syntaxerror, so the message carries no "near" part at all
 	// (attribute/const/label errors; U4).
 	Sem bool
+	// Bare: no position prefix at all — stock luaG_runerror raised with
+	// no live Lua frame (the parser's C-stack-overflow guard via
+	// luaE_incCstack renders exactly "C stack overflow"; U5f).
+	Bare bool
 	// EOFLine is the last real line number, used when Pos.Line == EOF
 	// (stock reports the current line, never a sentinel, at EOZ).
 	EOFLine int
 }
 
 func (e *Error) Error() string {
+	if e.Bare {
+		return e.Message
+	}
 	pos := e.Pos
 	src := ChunkID(pos.Source)
 	if e.Sem {
@@ -66,19 +73,21 @@ func semErrorLine(e *Error) int {
 
 // ChunkID renders a source name the way stock Lua's luaO_chunkid does
 // (lobject.c): "=name" keeps the literal text after '=', "@file" keeps
-// the file name (both truncated to 60), anything else becomes
-// [string "src"] — cut at the first newline and truncated. Callers that
-// mean a file name pass "@file"; the engines' bare case names render
-// verbatim only if '@'-prefixed first.
+// the file name, anything else becomes [string "src"] — cut at the first
+// newline and truncated. The rendered id never exceeds 59 visible chars:
+// LUA_IDSIZE is 60 counting the terminating NUL (stock copies the source
+// NUL in both literal arms; errors.lua:404-414 pins the border). Callers
+// that mean a file name pass "@file"; the engines' bare case names
+// render verbatim only if '@'-prefixed first.
 func ChunkID(source string) string {
 	const idsize = 60
 	if strings.HasPrefix(source, "=") || strings.HasPrefix(source, "@") {
 		s := source[1:]
-		if len(s) > idsize {
+		if len(s) > idsize-1 {
 			if source[0] == '=' {
 				return s[:idsize-1]
 			}
-			return "..." + s[len(s)-(idsize-3):]
+			return "..." + s[len(s)-(idsize-4):]
 		}
 		return s
 	}
@@ -98,6 +107,18 @@ func ChunkID(source string) string {
 }
 
 func writeChar(buf *bytes.Buffer, c int) { buf.WriteByte(byte(c)) }
+
+// charTokenText is luaX_token2str's single-byte arm (U5f): a printable
+// ASCII byte is itself; anything else — control or 8-bit — is the
+// '<\N>' decimal form, quoted by the error renderer. rune(ch) would
+// UTF-8-encode \255 into two bytes and drop the byte identity
+// (`a\1a = 1` reports near '<\1>', `\255a = 1` near '<\255>').
+func charTokenText(ch int) string {
+	if ch >= 0x20 && ch <= 0x7E {
+		return string([]byte{byte(ch)})
+	}
+	return fmt.Sprintf(`<\%d>`, ch)
+}
 
 func isDecimal(ch int) bool { return '0' <= ch && ch <= '9' }
 
@@ -144,7 +165,13 @@ func (sc *Scanner) TokenError(tok ast.Token, msg string) *Error {
 	if eof == EOF {
 		eof = sc.lastLine
 	}
-	return &Error{Pos: tok.Pos, Message: msg, Token: tok.Str, EOFLine: eof}
+	// txtToken renders the string token's SOURCE text, not its value
+	// (U5f): near '[[a]]' / near "'aa'", not near the decoded bytes
+	near := tok.Str
+	if tok.Raw != "" {
+		near = tok.Raw
+	}
+	return &Error{Pos: tok.Pos, Message: msg, Token: near, EOFLine: eof}
 }
 
 func (sc *Scanner) readNext() int {
@@ -208,7 +235,8 @@ func (sc *Scanner) skipComments(ch int) error {
 			var buf bytes.Buffer
 			// a comment shares the long-string scanner (errors report
 			// "comment", per stock read_long_string with seminfo NULL)
-			return sc.scanMultilineString(sc.Next(), &buf, true)
+			_, err := sc.scanMultilineString(sc.Next(), &buf, true)
+			return err
 		}
 	}
 	for {
@@ -378,8 +406,10 @@ func isHexDigit(c byte) bool {
 // bytes; `raw` accumulates the source text as stock Lua's scanner buffer
 // holds it (delimiter + translated escapes + offending character on
 // error) so that "near" tokens in error messages match stock byte-for-
-// byte.
-func (sc *Scanner) scanString(quote int, buf *bytes.Buffer) error {
+// byte. On success raw is the complete token text with the closing
+// delimiter (stock saves it too; the VALUE strips first and last), and
+// becomes the token's Raw for txtToken's near rendering.
+func (sc *Scanner) scanString(quote int, buf *bytes.Buffer) ([]byte, error) {
 	raw := []byte{byte(quote)}
 	ch := sc.Next()
 	for ch != quote {
@@ -387,14 +417,14 @@ func (sc *Scanner) scanString(quote int, buf *bytes.Buffer) error {
 			// stock: TK_EOS for end-of-input (near <eof>), TK_STRING
 			// (the buffer) for a raw newline inside the literal
 			if ch < 0 {
-				return sc.ErrorEOF("unfinished string")
+				return nil, sc.ErrorEOF("unfinished string")
 			}
-			return sc.Error(string(raw), "unfinished string")
+			return nil, sc.Error(string(raw), "unfinished string")
 		}
 		if ch == '\\' {
 			raw = append(raw, '\\')
 			if err := sc.scanEscape(buf, &raw); err != nil {
-				return err
+				return nil, err
 			}
 		} else {
 			writeChar(buf, ch)
@@ -402,7 +432,7 @@ func (sc *Scanner) scanString(quote int, buf *bytes.Buffer) error {
 		}
 		ch = sc.Next()
 	}
-	return nil
+	return append(raw, byte(quote)), nil
 }
 
 // scanEscape handles the character after a backslash inside a short
@@ -610,13 +640,22 @@ func (sc *Scanner) countSep(ch int) (int, int) {
 // U1 re-pins its error texts to stock 5.5 (llex.c read_long_string):
 // "invalid long string delimiter" and "unfinished long <string|comment>
 // (starting at line N)" — comments share the scanner but report
-// "comment". isComment selects the wording.
-func (sc *Scanner) scanMultilineString(ch int, buf *bytes.Buffer, isComment bool) error {
+// "comment". isComment selects the wording. U5f: raw accumulates the
+// exact source text (both delimiters; newline-normalized content minus
+// the dropped leading newline; partial-close '='/']' runs stay) —
+// stock's scanner buffer, which txtToken renders as the near token.
+func (sc *Scanner) scanMultilineString(ch int, buf *bytes.Buffer, isComment bool) ([]byte, error) {
 	startLine := sc.Pos.Line
+	var raw []byte
 	var count1, count2 int
 	count1, ch = sc.countSep(ch)
 	if ch != '[' {
-		return sc.Error(string(rune(ch)), "invalid long string delimiter")
+		return nil, sc.Error(charTokenText(ch), "invalid long string delimiter")
+	}
+	if !isComment {
+		raw = append(raw, '[')
+		raw = append(raw, strings.Repeat("=", count1)...)
+		raw = append(raw, '[')
 	}
 	ch = sc.Next()
 	if ch == '\n' || ch == '\r' {
@@ -628,22 +667,31 @@ func (sc *Scanner) scanMultilineString(ch int, buf *bytes.Buffer, isComment bool
 			if isComment {
 				what = "comment"
 			}
-			return sc.ErrorEOF(fmt.Sprintf("unfinished long %s (starting at line %d)", what, startLine))
+			return nil, sc.ErrorEOF(fmt.Sprintf("unfinished long %s (starting at line %d)", what, startLine))
 		} else if ch == ']' {
 			count2, ch = sc.countSep(sc.Next())
 			if count1 == count2 && ch == ']' {
-				goto finally
+				if !isComment {
+					raw = append(raw, ']')
+					raw = append(raw, strings.Repeat("=", count2)...)
+					raw = append(raw, ']')
+				}
+				return raw, nil
 			}
 			buf.WriteByte(']')
 			buf.WriteString(strings.Repeat("=", count2))
+			if !isComment {
+				raw = append(raw, ']')
+				raw = append(raw, strings.Repeat("=", count2)...)
+			}
 			continue
 		}
 		writeChar(buf, ch)
+		if !isComment {
+			raw = append(raw, byte(ch))
+		}
 		ch = sc.Next()
 	}
-
-finally:
-	return nil
 }
 
 var reservedWords = map[string]int{
@@ -703,20 +751,28 @@ redo:
 				goto redo
 			} else {
 				tok.Type = ch
-				tok.Str = string(rune(ch))
+				tok.Str = charTokenText(ch)
 			}
 		case '"', '\'':
 			tok.Type = TString
-			err = sc.scanString(ch, buf)
+			var raw []byte
+			raw, err = sc.scanString(ch, buf)
 			tok.Str = buf.String()
+			if err == nil {
+				tok.Raw = string(raw)
+			}
 		case '[':
 			if c := sc.Peek(); c == '[' || c == '=' {
 				tok.Type = TString
-				err = sc.scanMultilineString(sc.Next(), buf, false)
+				var raw []byte
+				raw, err = sc.scanMultilineString(sc.Next(), buf, false)
 				tok.Str = buf.String()
+				if err == nil {
+					tok.Raw = string(raw)
+				}
 			} else {
 				tok.Type = ch
-				tok.Str = string(rune(ch))
+				tok.Str = charTokenText(ch)
 			}
 		case '=':
 			if sc.Peek() == '=' {
@@ -725,7 +781,7 @@ redo:
 				sc.Next()
 			} else {
 				tok.Type = ch
-				tok.Str = string(rune(ch))
+				tok.Str = charTokenText(ch)
 			}
 		case '~':
 			if sc.Peek() == '=' {
@@ -750,7 +806,7 @@ redo:
 				sc.Next()
 			default:
 				tok.Type = ch
-				tok.Str = string(rune(ch))
+				tok.Str = charTokenText(ch)
 			}
 		case '>':
 			switch sc.Peek() {
@@ -764,7 +820,7 @@ redo:
 				sc.Next()
 			default:
 				tok.Type = ch
-				tok.Str = string(rune(ch))
+				tok.Str = charTokenText(ch)
 			}
 		case '.':
 			ch2 := sc.Peek()
@@ -794,7 +850,7 @@ redo:
 				sc.Next()
 			} else {
 				tok.Type = ch
-				tok.Str = string(rune(ch))
+				tok.Str = charTokenText(ch)
 			}
 		case '/':
 			if sc.Peek() == '/' {
@@ -803,7 +859,7 @@ redo:
 				sc.Next()
 			} else {
 				tok.Type = ch
-				tok.Str = string(rune(ch))
+				tok.Str = charTokenText(ch)
 			}
 		case '&':
 			tok.Type = TBand
@@ -813,7 +869,7 @@ redo:
 			tok.Str = "|"
 		case '+', '*', '%', '^', '#', '(', ')', '{', '}', ']', ';', ',':
 			tok.Type = ch
-			tok.Str = string(rune(ch))
+			tok.Str = charTokenText(ch)
 		default:
 			if ch == 0 {
 				// a NUL byte is a single-char token in stock (TK_EOS is a
@@ -830,7 +886,7 @@ redo:
 			// becomes a single-char token and the parser rejects it with
 			// "unexpected symbol" (U2 adds the real bitwise operators)
 			tok.Type = ch
-			tok.Str = string(rune(ch))
+			tok.Str = charTokenText(ch)
 		}
 	}
 
@@ -869,6 +925,18 @@ type Lexer struct {
 	PNewLine      bool
 	Token         ast.Token
 	PrevTokenType int
+	// PrevTokenLine is the line of the token before the current lookahead
+	// — stock's ls->lastline, the line of the last CONSUMED token.
+	// luaK_semerror reports there, not at the lookahead's line: the
+	// `local <close> a, b` battery (errors.lua:534) has the b on line 1
+	// and the <eof> lookahead on line 2, and stock says :1:.
+	PrevTokenLine int
+	// ArgsLine is the line of the last-reduced parenthesized argument
+	// list's '(' — stock funcargs saves it at entry and fixes OP_CALL's
+	// line to it (the call-error position), so the grammar's
+	// functioncall rules read it off the lexer (each args reduce is
+	// immediately followed by its functioncall reduce, innermost first).
+	ArgsLine int
 	// pushed is a one-token pushback (the `global` contextual-keyword
 	// lookahead — U3a). Zero when empty.
 	pushed    ast.Token
@@ -881,10 +949,67 @@ type Lexer struct {
 	funcName bool
 	// strAnchors: the per-compilation string anchor table (anchorString).
 	strAnchors map[string]string
+	// depth is the construct-nesting counter behind the parser's
+	// C-stack-overflow guard (U5f; see luaMaxCNest).
+	depth int
+	// blocks/fnLines/frameBases: per-open-construct local-declaration
+	// counts, the owning function's definition line (0 = main), and each
+	// frame's function base (the index of its owning function's frame) —
+	// the parse-time side of stock's MAXVARS guard (see luaMaxVars; the
+	// concurrent level is per-funcState, NOT summed across nested
+	// functions). inLocalDecl/expectLocalName track a `local`
+	// declaration's name run.
+	blocks         []int
+	fnLines        []int
+	frameBases     []int
+	inLocalDecl    bool
+	expectLocalName bool
+}
+
+// luaMaxCNest is stock LUAI_MAXCCALLS (luaconf.h) — the parser's nesting
+// ceiling: enterlevel's luaE_incCstack raises bare "C stack overflow"
+// when the grammar recursion (subexpr per expression level, statement
+// per block level, restassign per assignment element) reaches 200
+// C-call units (errors.lua:724's syntax-limits battery: 500 nested
+// parens/do/while/if/function bodies fail the load, 100 load fine). The
+// fork's LR parser is table-driven — yyParse does not recurse per
+// construct — so the guard is emulated at TOKEN granularity: each
+// bracketing opener raises the count, its closer lowers it. Loop heads
+// are counted through their body's 'do' (one unit per construct, like
+// stock's single enterlevel per statement), and lists recursing in
+// stock's recursive-descent but flat in LR (assignment/global-decl
+// commas) stay uncounted — those loads fail on register limits first,
+// which the suite's substring assert accepts.
+const luaMaxCNest = 200
+
+// luaMaxVars is stock MAXVARS (lparser.c): 200 concurrent declared
+// variables per function, checked by adjustlocalvars as each local is
+// assigned — DURING the parse, so an over-declaring statement raises the
+// limit error before any later syntax error is discovered (errors.lua's
+// un-ended 201-local chunk reports the limit, not "'end' expected"). The
+// lexer counts declared names into per-construct frames (summed as the
+// concurrent level; if/else sibling branches overcount — nothing in the
+// corpora approaches 200 there) and raises stock's errorlimit text at
+// the current token. Function parameters and for-control names are not
+// counted (no corpus pins them); compile.go's post-parse SetRegTop
+// remains as the backstop.
+const luaMaxVars = 200
+
+// nestAdjust is the construct-depth delta of one token type (+1 opener,
+// -1 closer, 0 otherwise).
+func nestAdjust(typ int) int {
+	switch typ {
+	case '(', '{', TDo, TRepeat, TIf, TFunction:
+		return 1
+	case ')', '}', TEnd, TUntil:
+		return -1
+	}
+	return 0
 }
 
 func (lx *Lexer) Lex(lval *yySymType) int {
 	lx.PrevTokenType = lx.Token.Type
+	lx.PrevTokenLine = lx.Token.Pos.Line
 	var tok ast.Token
 	if lx.hasPushed {
 		tok = lx.pushed
@@ -966,6 +1091,73 @@ func (lx *Lexer) Lex(lval *yySymType) int {
 		panic(e)
 	}
 	lx.funcName = tok.Type == TFunction || ((tok.Type == TIdent || tok.Type == '.' || tok.Type == ':') && lx.funcName)
+	// U5f: the parser nesting guard (luaMaxCNest) — bare "C stack
+	// overflow" at the ceiling, stock's position-free luaG_runerror over
+	// a parser frame. The open/close also drives the local-declaration
+	// frames (luaMaxVars): a `function` opener records its own line as
+	// the owning function, other openers inherit the enclosing one.
+	if d := nestAdjust(tok.Type); d != 0 {
+		lx.depth += d
+		if d > 0 {
+			fnline := lx.fnLines[len(lx.fnLines)-1]
+			base := lx.frameBases[len(lx.frameBases)-1]
+			if tok.Type == TFunction {
+				fnline = tok.Pos.Line
+			}
+			lx.blocks = append(lx.blocks, 0)
+			lx.fnLines = append(lx.fnLines, fnline)
+			if tok.Type == TFunction {
+				base = len(lx.blocks) - 1 // a function frame is its own base
+			}
+			lx.frameBases = append(lx.frameBases, base)
+		} else {
+			lx.blocks = lx.blocks[:len(lx.blocks)-1]
+			lx.fnLines = lx.fnLines[:len(lx.fnLines)-1]
+			lx.frameBases = lx.frameBases[:len(lx.frameBases)-1]
+		}
+		if lx.depth >= luaMaxCNest {
+			panic(&Error{Message: "C stack overflow", Bare: true})
+		}
+	}
+	// U5f: the parse-time MAXVARS guard (luaMaxVars) — declared names of
+	// a `local` run count into the innermost frame; anything outside the
+	// declaration's name/','/attribute grammar terminates it.
+	switch tok.Type {
+	case TLocal:
+		lx.inLocalDecl, lx.expectLocalName = true, true
+	case TFunction:
+		if lx.inLocalDecl {
+			lx.expectLocalName = true // `local function` declares its name
+		}
+	case TIdent:
+		if lx.inLocalDecl {
+			if lx.expectLocalName {
+				lx.expectLocalName = false
+				lx.blocks[len(lx.blocks)-1]++
+				active := 0
+				for _, b := range lx.blocks[lx.frameBases[len(lx.frameBases)-1]:] {
+					active += b
+				}
+				if active > luaMaxVars {
+					lx.limitError(tok, "local variables")
+				}
+			}
+		}
+	case ',':
+		if lx.inLocalDecl {
+			lx.expectLocalName = true
+		}
+	case '<':
+		if lx.inLocalDecl {
+			lx.expectLocalName = false // the attribute's name follows
+		}
+	case '>':
+		if lx.inLocalDecl {
+			lx.expectLocalName = true // the next name (or '=') follows
+		}
+	default:
+		lx.inLocalDecl, lx.expectLocalName = false, false
+	}
 	lval.token = tok
 	lx.Token = tok
 	return int(tok.Type)
@@ -988,20 +1180,32 @@ func (lx *Lexer) Error(message string) {
 	panic(e)
 }
 
-// SyntaxErrorAtNext reports stock's exprstat/assignment error class
-// (lparser.c's check_condition "syntax error"): the parser has consumed
-// the offending expression and errors at the token FOLLOWING it, which
-// goyacc may not have scanned yet (default reductions). Scan one token
-// and error there — e.g. a bare "returna" chunk yields
-// "...: syntax error near <eof>", matching stock byte-for-byte.
-func (lx *Lexer) SyntaxErrorAtNext() {
-	// scan directly: Lex() drops the EOF token without recording it
-	tok, err := lx.scanner.Scan(lx)
-	if err != nil {
-		panic(err)
-	}
-	lx.Token = tok
+// SyntaxErrorAtCurrent reports stock's exprstat/assignment error class
+// (lparser.c's check_condition "syntax error"): the CURRENT lookahead —
+// the token that failed to continue the call or assignment. At the
+// stat:prefixexp reduction goyacc has always read the lookahead (the
+// prefixexp continuation states carry shift actions, so the reduction
+// is never a default one), so lx.Token IS that token: the chunk "syntax
+// error" reports near 'error' (the second name ends the suffixedexp
+// and cannot continue it), a bare trailing identifier near <eof>.
+func (lx *Lexer) SyntaxErrorAtCurrent() {
+	tok := lx.Token
 	e := lx.scanner.TokenError(tok, "syntax error")
+	if tok.Pos.Line == EOF || tok.Type == EOF {
+		e.NearEOF = true
+	}
+	panic(e)
+}
+
+// limitError raises stock's errorlimit text (lparser.c) at the given
+// token — luaX_syntaxerror position and near token included ("too many
+// local variables (limit is 200) in function at line 2 near ..."; U5f).
+func (lx *Lexer) limitError(tok ast.Token, what string) {
+	where := "main function"
+	if line := lx.fnLines[len(lx.fnLines)-1]; line != 0 {
+		where = fmt.Sprintf("function at line %d", line)
+	}
+	e := lx.scanner.TokenError(tok, fmt.Sprintf("too many %s (limit is %d) in %s", what, luaMaxVars, where))
 	if tok.Pos.Line == EOF || tok.Type == EOF {
 		e.NearEOF = true
 	}
@@ -1013,18 +1217,23 @@ func (lx *Lexer) TokenError(tok ast.Token, message string) {
 }
 
 // SemError raises a luaK_semerror-class error (U4): stock wording with no
-// "near '<token>'" suffix, reported at the current line — the lexer is
-// positioned on the lookahead when grammar actions run, matching stock's
-// ls->linenumber at the semerror. Used for the attribute/const checks the
-// stock parser raises mid-parse.
+// "near '<token>'" suffix, reported at the line of the last consumed token
+// — stock's luaK_semerror resets ls->linenumber = ls->lastline before
+// raising, so the position is the token the parser just shifted, not the
+// lookahead it peeked. Used for the attribute/const checks the stock
+// parser raises mid-parse.
 func (lx *Lexer) SemError(message string) {
 	e := lx.scanner.TokenError(lx.Token, message)
 	e.Sem = true
+	if line := lx.PrevTokenLine; line > 0 {
+		e.Pos.Line = line
+	}
 	panic(e)
 }
 
 func Parse(reader io.Reader, name string) (chunk []ast.Stmt, err error) {
-	lexer := &Lexer{scanner: NewScanner(reader, name)}
+	// blocks/fnLines/frameBases open with the main chunk's frame (luaMaxVars)
+	lexer := &Lexer{scanner: NewScanner(reader, name), blocks: []int{0}, fnLines: []int{0}, frameBases: []int{0}}
 	chunk = nil
 	defer func() {
 		if e := recover(); e != nil {

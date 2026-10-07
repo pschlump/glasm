@@ -31,6 +31,35 @@ func mainLoop(L *LState, baseframe *callFrame) {
 		}
 		L.currentFrame = L.stack.Last()
 	}
+	// U5f: a suspended Go __close (a VM-dispatched close method that
+	// yielded — coroutine.yield AS __close): stock's resume finishes the
+	// C frame by poscall (resume arguments as its wanted-0 results,
+	// dropped) and unroll continues the interrupted close/return through
+	// luaV_finishOp — routing through doReturn's kind-4/5/7 arm IS that
+	// continuation (the frame is on top, tagged)
+	if m := L.currentFrame; m != nil && m.Fn != nil && m.Fn.IsG && (m.Pcall == 4 || m.Pcall == 5 || m.Pcall == 7) {
+		L.retHookPending = false // doReturn's kind-4/5 arm fires the event
+		L.reg.SetTop(m.Base)     // discard the staged resume arguments
+		if doReturn(L, m, baseframe, m.LocalBase, 0, 1) == 1 {
+			return
+		}
+		L.currentFrame = L.stack.Last()
+	}
+	// U5f: a C function that suspended mid-body (coroutine.yield) — its
+	// RETURN event fires now, before the suspended frame resumes
+	if L.retHookPending {
+		L.firePendingReturnHook()
+	}
+	// U5f (finishCfunc's poscall replay): a plain G call that suspended
+	// left the top Lua frame mid-instruction — the resume staged its
+	// arguments at the call's result window; adjust them to the call's
+	// wanted count (SetTop pads missing cells with nils, truncates
+	// extras). Stock fires the suspended C frame's return hook before
+	// moveresults; the arm above matches that order.
+	if m := L.currentFrame; m != nil && m.PendRet > 0 {
+		L.reg.SetTop(m.PendBase + m.PendRet - 1)
+		m.PendRet = 0
+	}
 	if L.currentFrame.Fn.IsG {
 		callGFunction(L, false)
 		return
@@ -40,6 +69,9 @@ func mainLoop(L *LState, baseframe *callFrame) {
 		cf = L.currentFrame
 		inst = cf.Fn.Proto.Code[cf.Pc]
 		cf.Pc++
+		if L.hookMask&(hookMaskLine|hookMaskCount) != 0 {
+			L.traceHook(cf)
+		}
 		if jumpTable[int(inst&0x7f)](L, inst, baseframe) == 1 {
 			return
 		}
@@ -61,6 +93,28 @@ func mainLoopWithContext(L *LState, baseframe *callFrame) {
 		}
 		L.currentFrame = L.stack.Last()
 	}
+	// U5f: a suspended Go __close resumed — finish the C frame and
+	// continue the interrupted close/return (mainLoop's arm documents the
+	// stock mapping)
+	if m := L.currentFrame; m != nil && m.Fn != nil && m.Fn.IsG && (m.Pcall == 4 || m.Pcall == 5 || m.Pcall == 7) {
+		L.retHookPending = false // doReturn's kind-4/5 arm fires the event
+		L.reg.SetTop(m.Base)     // discard the staged resume arguments
+		if doReturn(L, m, baseframe, m.LocalBase, 0, 1) == 1 {
+			return
+		}
+		L.currentFrame = L.stack.Last()
+	}
+	// U5f: a C function that suspended mid-body (coroutine.yield) — its
+	// RETURN event fires now, before the suspended frame resumes
+	if L.retHookPending {
+		L.firePendingReturnHook()
+	}
+	// U5f (finishCfunc's poscall replay): as in mainLoop — a suspended
+	// plain G call's wanted-count adjustment of the staged resume values
+	if m := L.currentFrame; m != nil && m.PendRet > 0 {
+		L.reg.SetTop(m.PendBase + m.PendRet - 1)
+		m.PendRet = 0
+	}
 	if L.currentFrame.Fn.IsG {
 		callGFunction(L, false)
 		return
@@ -70,6 +124,9 @@ func mainLoopWithContext(L *LState, baseframe *callFrame) {
 		cf = L.currentFrame
 		inst = cf.Fn.Proto.Code[cf.Pc]
 		cf.Pc++
+		if L.hookMask&(hookMaskLine|hookMaskCount) != 0 {
+			L.traceHook(cf)
+		}
 		select {
 		case <-L.ctx.Done():
 			L.RaiseError("%s", L.ctx.Err().Error())
@@ -226,9 +283,58 @@ func callGFunction(L *LState, tailcall bool) bool {
 	}
 
 	if gfnret < 0 {
+		// U5f: the C function suspended (a yield) — its RETURN event
+		// fires when the thread resumes (stock finishCfunc redoes the
+		// poscall; coroutine.lua's 4th trace event)
+		L.retHookPending = L.hookMask&hookMaskRet != 0
+		if frame.Pcall == 4 || frame.Pcall == 5 || frame.Pcall == 7 {
+			// U5f: a VM-dispatched Go __close suspended (stock: a
+			// yieldable close method is luaD_call'd — lua_yieldk with a
+			// NULL continuation throws, LEAVING the C frame; resume
+			// finishes it by poscall). Keep the tagged close frame so the
+			// resume can continue the interrupted close/return (mainLoop's
+			// entry arm); the yield values — the close call's own staged
+			// arguments — move to the parent (the test comment: "regular
+			// yield will yield all values passed to the close function").
+			parent := L.Parent
+			if parent == nil {
+				L.raiseErrorAt(0, "attempt to yield from outside a coroutine")
+			}
+			n := L.GetTop()
+			L.G.CurrentThread = parent
+			L.Parent = nil
+			if !L.wrapped {
+				parent.Push(LTrue)
+			}
+			L.XMoveTo(parent, n)
+			L.reg.SetTop(frame.ReturnBase)
+			return true
+		}
+		// U5f (stock resume → unroll → finishCfunc → luaD_poscall):
+		// record the interrupted call's wanted-result count on the frame
+		// the resume continues. switchToParentThread leaves this thread's
+		// reg.top at the suspended call's ReturnBase, so coResume's
+		// XMoveTo stages the resume arguments exactly at the call's
+		// result window — but nothing adjusts them to the call's C
+		// operand want (stock replays the poscall via finishCfunc).
+		// Without it, `local a, b = coroutine.yield(x)` resumed with one
+		// value left a stale register cell as b (a Go-nil cell — type(b)
+		// crashed with a nil dereference, db.lua:827), and an
+		// over-delivery leaked extra values into a following B=0 call's
+		// argument count. MultRet keeps every staged value (no entry).
+		if p := frame.Parent; p != nil && p.Fn != nil && !p.Fn.IsG && p.Pcall == 0 && frame.NRet >= 0 {
+			p.PendRet = frame.NRet + 1
+			p.PendBase = frame.ReturnBase
+		}
 		switchToParentThread(L, L.GetTop(), false, false)
 		return true
 	}
+
+	// U5f: precallC's luaD_poscall — the C function's RETURN event fires
+	// before the results move, its frame still current (the hook's
+	// getinfo(2) names it: "return sethook"); the transfer window is the
+	// results themselves (firstres = top - gfnret, stock precallC→rethook)
+	L.hookReturnEvent(frame, L.reg.Top()-gfnret, gfnret)
 
 	wantret := frame.NRet
 	if wantret == MultRet {
@@ -992,6 +1098,9 @@ func init() {
 					rg.top = regi + 1
 				}
 			}
+			// U5f (stock checkGC(L, ra+1)): allocation sites drain the
+			// __gc finalizer queue (GCTM)
+			L.drainFinalizers()
 			return 0
 		},
 		func(L *LState, inst uint32, baseframe *callFrame) int { //OP_SELF
@@ -1447,6 +1556,9 @@ func init() {
 					rg.top = regi + 1
 				}
 			}
+			// U5f (stock checkGC(L, L->top.p)): as NEWTABLE/CLOSURE —
+			// allocation drains the finalizer queue
+			L.drainFinalizers()
 			return 0
 		},
 		func(L *LState, inst uint32, baseframe *callFrame) int { //OP_CLOSE
@@ -1477,8 +1589,11 @@ func init() {
 			// U5d (row 22): the __close calls run as VM frames (a yield
 			// inside a Lua __close suspends, stock luaF_close from Lua
 			// code) with a kind-4 close continuation; a __close error
-			// propagates as a normal error
-			L.closeTBCVM(RA, 4, 0, RA)
+			// propagates as a normal error. U5f: a Go __close may suspend
+			// (2) — the loop stops; the resume continues the list
+			if L.closeTBCVM(RA, 4, 0, RA, LNil) == 2 {
+				return 1
+			}
 			return 0
 		},
 		func(L *LState, inst uint32, baseframe *callFrame) int { //OP_TBC
@@ -1660,6 +1775,9 @@ func init() {
 				}
 				ls.currentFrame = newcf
 			}
+			// U5f: the call hook fires at the callee's first instruction
+			// (precallC for a G callee, luaG_tracecall otherwise)
+			L.hookCallEvent(L.currentFrame)
 			if callable.IsG && callGFunction(L, false) {
 				return 1
 			}
@@ -1757,6 +1875,8 @@ func init() {
 					TailCall:   0,
 					CCmt:       ccmt,
 				}, callee, false)
+				// U5f: the tailcalled C callee's call hook (precallC)
+				L.hookCallEvent(L.currentFrame)
 				if callGFunction(L, true) {
 					return 1
 				}
@@ -1879,6 +1999,9 @@ func init() {
 				// vararg frames; the callee's own VARARGPREP (its first
 				// instruction) rebuilds the frame from Base
 				cf.LocalBase = base + 1
+				// U5f: the reused frame reports "tail call" (TailCall > 0);
+				// a vararg callee defers to its OP_VARARGPREP
+				L.hookCallEvent(cf)
 			}
 			return 0
 		},
@@ -2486,6 +2609,9 @@ func init() {
 					closure.Upvalues[i] = cf.Fn.Upvalues[uvd.Idx]
 				}
 			}
+			// U5f (stock checkGC(L, ra+1)): as NEWTABLE — allocation
+			// drains the finalizer queue
+			L.drainFinalizers()
 			return 0
 		},
 		func(L *LState, inst uint32, baseframe *callFrame) int { //OP_VARARG
@@ -2678,6 +2804,9 @@ func init() {
 				}
 				tb.RawSetString("n", LInteger(nextra))
 				reg.Set(lbase+np, tb)
+				// U5f: stock OP_VARARGPREP's trap arm — the deferred call
+				// hook fires after the table build
+				L.hookVarargCallEvent(cf)
 				return 0
 			}
 			newbase := lbase + np + nextra // just above all the arguments
@@ -2692,6 +2821,9 @@ func init() {
 			}
 			reg.array[newbase+np] = LNil // the vararg parameter slot
 			cf.LocalBase = newbase
+			// U5f: stock OP_VARARGPREP's trap arm — the deferred call
+			// hook fires after the shuffle, oldpc=1
+			L.hookVarargCallEvent(cf)
 			return 0
 		},
 		func(L *LState, inst uint32, baseframe *callFrame) int { //OP_EXTRAARG
@@ -3408,22 +3540,49 @@ func doReturn(L *LState, cf *callFrame, baseframe *callFrame, RA, nres, b int) i
 			}
 		}
 	}
-	if cf.Pcall == 4 || cf.Pcall == 5 {
+	if cf.Pcall == 4 || cf.Pcall == 5 || cf.Pcall == 7 {
 		// a VM-called __close returned (its results are discarded —
 		// NRet=0): the close body's own tbc variables close Go-driven
 		// (a nested __close-in-__close cannot carry two continuations;
 		// yields inside it raise the boundary error — ledger row), then
-		// the interrupted close (4) or return (5) resumes
+		// the interrupted close (4), return (5), or error-path marker
+		// completion (7) resumes.
+		// U5f: its RETURN event fires first, frame still current (the
+		// hook's getinfo(2) names it "close" via the owner's RETURN)
+		L.hookReturnEvent(cf, RA, nres)
 		L.closeTBC(lbase)
 		L.stack.Pop()
 		owner := L.stack.Last()
 		L.currentFrame = owner
 		if cf.Pcall == 4 {
-			L.closeTBCVM(cf.ContB, 4, 0, cf.ContB)
+			// U5f: a Go __close resuming the close list may suspend again
+			// (coroutine.yield as __close, twice) — 2 stops the loop
+			if L.closeTBCVM(cf.ContB, 4, 0, cf.ContB, LNil) == 2 {
+				return 1
+			}
 			return 0
 		}
-		if L.closeTBCVM(owner.LocalBase, 5, cf.ContRA, cf.ContB) {
-			return 0
+		if cf.Pcall == 7 {
+			// an error-path __close returned (U5f; stock finishpcallk's
+			// yieldable close after precover): its results are discarded;
+			// when the list drains the marker (owner — the close frame's
+			// parent) completes with the in-flight object staged at its
+			// LocalBase. A close error here raises to the driving loop's
+			// catch, which re-enters completeErrorMarker for the SAME
+			// marker (precover re-entry: last error wins).
+			switch L.closeTBCVM(owner.Base, 7, 0, 0, L.reg.Get(owner.LocalBase)) {
+			case 2:
+				return 1 // suspended inside a Go __close
+			case 1:
+				return 0 // another close frame was pushed — the loop enters it
+			}
+			return L.completePcallMarker(false, L.reg.Get(owner.LocalBase))
+		}
+		switch L.closeTBCVM(owner.LocalBase, 5, cf.ContRA, cf.ContB, LNil) {
+		case 2:
+			return 1 // suspended inside a Go __close
+		case 1:
+			return 0 // a close frame was pushed — the loop enters it
 		}
 		return doReturnTail(L, owner, baseframe, cf.ContRA, cf.ContB, cf.ContB+1)
 	}
@@ -3433,7 +3592,10 @@ func doReturn(L *LState, cf *callFrame, baseframe *callFrame, RA, nres, b int) i
 		// __newindex), close the mm body's own tbc Go-driven (a nested
 		// <close> inside a metamethod cannot carry two continuations —
 		// same ruling as kinds 4/5), then complete the owner's
-		// interrupted instruction (vmFinishMM, stock luaV_finishOp)
+		// interrupted instruction (vmFinishMM, stock luaV_finishOp).
+		// U5f: the metamethod's RETURN event fires first (its poscall),
+		// frame still current
+		L.hookReturnEvent(cf, RA, nres)
 		L.closeTBC(lbase)
 		n := cf.NRet
 		if n > nres {
@@ -3448,8 +3610,11 @@ func doReturn(L *LState, cf *callFrame, baseframe *callFrame, RA, nres, b int) i
 	// U4: the frame's to-be-closed variables close at return too (stock
 	// RETURN k / luaF_close(base, CLOSEKTOP) — unconditional here: the
 	// list is empty when the function declared no <close>)
-	if L.closeTBCVM(lbase, 5, RA, nres) {
-		return 0
+	switch L.closeTBCVM(lbase, 5, RA, nres, LNil) {
+	case 2:
+		return 1 // suspended inside a Go __close — the resume continues the return
+	case 1:
+		return 0 // a close frame was pushed — the loop enters it
 	}
 	return doReturnTail(L, cf, baseframe, RA, nres, b)
 }
@@ -3458,6 +3623,10 @@ func doReturn(L *LState, cf *callFrame, baseframe *callFrame, RA, nres, b int) i
 // delivery, and the marker/IsG handoff — after the frame's own closes
 // ran (or resumed).
 func doReturnTail(L *LState, cf *callFrame, baseframe *callFrame, RA, nres, b int) int {
+	// U5f: the RETURN event before the results move (stock rethook at
+	// luaD_poscall; for a tbc frame moveresults runs it after the
+	// closes — exactly the state doReturn reaches this tail in)
+	L.hookReturnEvent(cf, RA, nres)
 	reg := L.reg
 	n := cf.NRet
 	if cf.NRet == MultRet {

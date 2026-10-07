@@ -109,8 +109,18 @@ func strChar(L *LState) int {
 	return 1
 }
 
+// strDump is string.dump ([f [, strip]]) — U5f, stock lstrlib str_dump
+// over dump.go's ldump port. Only Lua functions dump (an ArgError
+// otherwise; stock's argcheck text), and the blob is the stock 5.5.1
+// precompiled format (load-compatible in both directions).
 func strDump(L *LState) int {
-	L.RaiseError("GopherLua does not support the string.dump")
+	fn := L.Get(1)
+	if lf, ok := fn.(*LFunction); ok && !lf.IsG {
+		strip := LVAsBool(L.Get(2))
+		L.Push(LString(dumpProto(lf.Proto, strip)))
+		return 1
+	}
+	L.ArgError(1, "Lua function expected")
 	return 0
 }
 
@@ -397,8 +407,15 @@ func strGmatchIter(L *LState) int {
 }
 
 // strGmatch ports gmatch: the iterator closure carries the match state
-// in an upvalue; returns iterator + the string + 0 for the generic for.
-// 5.5 gained an init position (negative counts from the end).
+// in an upvalue (it ignores its state/control arguments — gmatch_aux
+// reads everything from upvalues, so a resume across coroutine.wrap
+// works). U5f: stock 5.5 returns ONLY the iterator (the iterator+str+0
+// triple was the pre-5.4 convention; the generic-for adjust_assigns the
+// 4 control slots with nils); keeping 3 leaked "str, 0" into every
+// multret use — select("#", gmatch(...)) counted 3, and
+// getinfo(gmatch("abc","a")) read "abc" as the options string
+// (db.lua:739). 5.5 gained an init position (negative counts from the
+// end).
 func strGmatch(L *LState) int {
 	str := L.CheckString(1)
 	pattern := L.CheckString(2)
@@ -414,9 +431,7 @@ func strGmatch(L *LState) int {
 	ud := L.NewUserData()
 	ud.Value = &strMatchData{str, 0, mds}
 	L.Push(L.NewClosure(strGmatchIter, ud))
-	L.Push(LString(str))
-	L.Push(LInteger(0))
-	return 3
+	return 1
 }
 
 func strLen(L *LState) int {

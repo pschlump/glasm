@@ -1,12 +1,14 @@
 package lua
 
 import (
+	"bytes"
 	"fmt"
 	"io"
 	"math/bits"
 	"os"
 	"runtime"
 	"strings"
+	"time"
 )
 
 /* basic functions {{{ */
@@ -68,11 +70,15 @@ var baseFuncs = map[string]LGFunction{
 // (arg 2, ANY value, or the default) routes through Error(msg, 1) —
 // string messages gain the caller's position only when it is a Lua
 // frame, non-string values raise raw (assert(nil, 42) errors with 42,
-// not a type complaint about the message).
+// not a type complaint about the message). U5f: a failed assert with NO
+// argument is luaL_checkany's "value expected" argerror (errors.lua:671
+// — pcall(assert)), not "assertion failed!"; a present-but-nil arg 2
+// raises nil, which the boundary renders "<no error object>" (a string).
 func baseAssert(L *LState) int {
 	if L.ToBool(1) {
 		return L.GetTop()
 	}
+	L.CheckAny(1)
 	if L.GetTop() >= 2 {
 		L.Error(L.Get(2), 1)
 	} else {
@@ -168,6 +174,19 @@ func baseCollectGarbage(L *LState) int {
 		return 1
 	case "collect":
 		runtime.GC()
+		// U5f: the full cycle runs pending finalizers synchronously in
+		// stock (luaC_fullgc's GCTM loops). Go's SetFinalizer callbacks
+		// only enqueue, on another goroutine — give them a bounded
+		// moment, then run the metamethods (drainFinalizers loops until
+		// the queue empties, including objects a finalizer itself kills)
+		for i := 0; i < 100 && !L.G.finPending.Load(); i++ {
+			time.Sleep(100 * time.Microsecond)
+		}
+		L.drainFinalizers()
+		// U5f (row 79): the full-collection arm also clears the weak
+		// tables via the reachability walk (gc.go) — stock does this in
+		// the atomic step of the cycle this call forces
+		L.clearWeakTables()
 		L.Push(LInteger(0))
 	case "stop", "restart":
 		L.Push(LInteger(0))
@@ -298,8 +317,12 @@ func baseIpairs(L *LState) int {
 // loadaux is the shared tail of load/loadfile: parse+compile with the
 // given environment and normalize the error shape to (nil, message).
 // U1 (D3): env seeds the chunk's _ENV upvalue; nil means the thread env.
-func loadaux(L *LState, reader io.Reader, chunkname string, env *LTable) int {
-	if fn, err := L.LoadEnv(reader, chunkname, env); err != nil {
+// U5f: any value is a valid env (5.5 dropped the table check —
+// calls.lua:415's load(..., 123)); a Go-nil env (argument absent) seeds
+// the global table into upvalue 1 in newMainFunction, an explicit nil
+// seeds the nil — it must NOT fold here, so it goes to loadAux directly.
+func loadaux(L *LState, reader io.Reader, chunkname string, env LValue) int {
+	if fn, err := L.loadAux(reader, chunkname, env); err != nil {
 		L.Push(LNil)
 		L.Push(LString(err.Error()))
 		return 2
@@ -309,33 +332,49 @@ func loadaux(L *LState, reader io.Reader, chunkname string, env *LTable) int {
 	}
 }
 
-// checkLoadMode validates the 5.2 mode argument ("b", "t", "bt"; default
-// "bt"). The fork has no binary-chunk loader (undump is not implemented),
-// so mode "b" rejects every chunk with stock's text-chunk error — the
-// exact behavior a text chunk sees under stock — and "t"/"bt" accept text.
-func checkLoadMode(L *LState, idx int, chunkname string) bool {
-	mode := L.OptString(idx, "bt")
-	if !strings.Contains(mode, "t") {
+// loadauxBinary is loadaux's binary arm (U5f, dump.go): the chunk is a
+// precompiled blob (first byte = the binary signature).
+func loadauxBinary(L *LState, data []byte, chunkname string, env LValue) int {
+	if fn, err := L.loadBinaryAux(data, chunkname, env); err != nil {
 		L.Push(LNil)
-		// stock's text (lbaselib loadaux): no position prefix
+		L.Push(LString(err.Error()))
+		return 2
+	} else {
+		L.Push(fn)
+		return 1
+	}
+}
+
+// checkLoadMode validates the mode argument against the chunk's kind
+// (binary = first byte is the LUA_SIGNATURE byte): "b" accepts only
+// binary, "t" only text, "bt" (default) both — stock luaD_protected-
+// parser's checkmode texts.
+func checkLoadMode(L *LState, idx int, binary bool) bool {
+	mode := L.OptString(idx, "bt")
+	if binary && !strings.Contains(mode, "b") {
+		L.Push(LNil)
+		L.Push(LString(fmt.Sprintf("attempt to load a binary chunk (mode is '%s')", mode)))
+		return false
+	}
+	if !binary && !strings.Contains(mode, "t") {
+		L.Push(LNil)
 		L.Push(LString(fmt.Sprintf("attempt to load a text chunk (mode is '%s')", mode)))
 		return false
 	}
 	return true
 }
 
-// loadEnvArg validates load/loadfile's env argument (nil or table) and
-// returns it (nil → thread default).
-func loadEnvArg(L *LState, idx int) *LTable {
-	v := L.Get(idx)
-	if v == LNil {
+// loadEnvArg returns load/loadfile's env argument (a Go-nil LValue when
+// the argument is absent). Stock's lua_isnone distinguishes ABSENT
+// (lua_load seeds the global table into upvalue 1) from an EXPLICIT nil
+// (load_aux seeds the nil itself — calls.lua:460's `load(dump, "", "b",
+// nil)` leaves upvalue 1 nil), so absence travels as a nil interface,
+// not LNil (U5f; 5.5 accepts any value for env).
+func loadEnvArg(L *LState, idx int) LValue {
+	if L.GetTop() < idx {
 		return nil
 	}
-	if tb, ok := v.(*LTable); ok {
-		return tb
-	}
-	L.ArgError(idx, fmt.Sprintf("table expected, got %s", v.Type().String()))
-	return nil
+	return L.Get(idx)
 }
 
 // baseLoad implements 5.2 load: load(chunk [, chunkname [, mode [, env]]]).
@@ -343,11 +382,11 @@ func loadEnvArg(L *LState, idx int) *LTable {
 // chunkname is the chunk text itself ([string "..."] rendering), a
 // function chunk's is "=(load)" (stock lbaselib).
 func baseLoad(L *LState) int {
-	var reader io.Reader
+	var chunk []byte
 	var chunkname string
 	switch lv := L.Get(1).(type) {
 	case LString:
-		reader = strings.NewReader(string(lv))
+		chunk = []byte(lv)
 		chunkname = L.OptString(2, string(lv))
 		// stock's luaL_optstring yields a C string: the name (the chunk
 		// text itself by default) truncates at its first NUL —
@@ -360,61 +399,92 @@ func baseLoad(L *LState) int {
 		fn := lv
 		chunkname = L.OptString(2, "=(load)")
 		top := L.GetTop()
-		buf := []string{}
+		buf := []byte{}
 		for {
 			L.SetTop(top)
 			L.Push(fn)
-			L.Call(0, 1)
+			// U5f: stock luaD_protectedparser wraps the reader calls —
+			// an erroring reader becomes load's own (nil, object) return
+			// (calls.lua:412's `cannotload("hhi", ...)`), not a raise out
+			// of load
+			if perr := L.PCall(0, 1, nil); perr != nil {
+				L.Push(LNil)
+				if ae, ok := perr.(*ApiError); ok {
+					L.Push(ae.Object)
+				} else {
+					L.Push(LString(perr.Error()))
+				}
+				return 2
+			}
 			ret := L.reg.Pop()
 			if ret == LNil {
 				break
 			} else if LVCanConvToString(ret) {
 				str := ret.String()
 				if len(str) > 0 {
-					buf = append(buf, string(str))
+					buf = append(buf, str...)
 				} else {
 					break
 				}
 			} else {
+				// stock generic_reader raises luaL_error inside the
+				// protected parser — the error object load returns carries
+				// load's CALLER position (luaL_where(1) skips load's own C
+				// frame): "chunk:N: reader function must return a string"
 				L.Push(LNil)
-				L.Push(LString("reader function must return a string"))
+				if prefix := L.stockWhere(1); prefix != "" {
+					L.Push(LString(fmt.Sprintf("%v reader function must return a string", prefix)))
+				} else {
+					L.Push(LString("reader function must return a string"))
+				}
 				return 2
 			}
 		}
-		reader = strings.NewReader(strings.Join(buf, ""))
+		chunk = buf
 	default:
 		L.ArgError(1, "string or function expected")
 		return 0
 	}
-	if !checkLoadMode(L, 3, chunkname) {
+	// a binary chunk starts with the LUA_SIGNATURE byte (stock
+	// luaD_protectedparser's dispatch)
+	binary := len(chunk) > 0 && chunk[0] == 0x1b
+	if !checkLoadMode(L, 3, binary) {
 		return 2
 	}
-	return loadaux(L, reader, chunkname, loadEnvArg(L, 4))
+	if binary {
+		return loadauxBinary(L, chunk, chunkname, loadEnvArg(L, 4))
+	}
+	return loadaux(L, strings.NewReader(string(chunk)), chunkname, loadEnvArg(L, 4))
 }
 
 // baseLoadFile implements 5.2 loadfile([filename [, mode [, env]]]).
 func baseLoadFile(L *LState) int {
-	var reader io.Reader
+	var data []byte
 	var chunkname string
-	var err error
 	if L.GetTop() < 1 || L.Get(1) == LNil {
-		reader = os.Stdin
+		reader := io.Reader(os.Stdin)
+		data, _ = io.ReadAll(reader)
 		chunkname = "=stdin"
 	} else {
 		chunkname = L.CheckString(1)
-		reader, err = os.Open(chunkname)
+		f, err := os.Open(chunkname)
 		if err != nil {
 			// stock 5.5 loadfile: "cannot open <file>: <strerror>"
 			L.Push(LNil)
 			L.Push(LString(fmt.Sprintf("cannot open %s: No such file or directory", chunkname)))
 			return 2
 		}
-		defer reader.(*os.File).Close()
+		defer f.Close()
+		data, _ = io.ReadAll(f)
 	}
-	if !checkLoadMode(L, 2, chunkname) {
+	binary := len(data) > 0 && data[0] == 0x1b
+	if !checkLoadMode(L, 2, binary) {
 		return 2
 	}
-	return loadaux(L, reader, "@"+chunkname, loadEnvArg(L, 3))
+	if binary {
+		return loadauxBinary(L, data, "@"+chunkname, loadEnvArg(L, 3))
+	}
+	return loadaux(L, bytes.NewReader(data), "@"+chunkname, loadEnvArg(L, 3))
 }
 
 func baseNext(L *LState) int {

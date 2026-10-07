@@ -129,7 +129,7 @@ func (al attriblist) names() []string {
 %token<token> TAnd TBreak TDo TElse TElseIf TEnd TFalse TFor TFunction TIf TIn TLocal TNil TNot TOr TReturn TRepeat TThen TTrue TUntil TWhile TGoto
 
 /* Literals */
-%token<token> TEqeq TNeq TLte TGte T2Comma T3Comma T2Colon TIdent TNumber TString '{' '(' TIDiv TBand TBor TBXor TShl TShr
+%token<token> TEqeq TNeq TLte TGte T2Comma T3Comma T2Colon TIdent TNumber TString '{' '(' '>' '<' TIDiv TBand TBor TBXor TShl TShr '+' '-' '*' '/' '%' '^' '#'
 
 /* U3a: `global` as a contextual keyword (reserved word with enforcement
    at U5); the lexer only emits TGlobal when the following token can
@@ -193,13 +193,19 @@ stat:
         varlist '=' exprlist {
             $$ = &ast.AssignStmt{Lhs: $1, Rhs: $3}
             $$.SetLine($1[0].Line())
+            /* U5f: stock restassign codes every store at ls->lastline —
+               the line of the statement's LAST token (the RHS tail, the
+               token before the lookahead). db.lua's large-gaps trace:
+               the SETTABUP fires at the rhs `]` line, not the name's. */
+            $$.SetLastLine(yylex.(*Lexer).PrevTokenLine)
         } |
         /* 'stat = functioncal' causes a reduce/reduce conflict */
         prefixexp {
             if _, ok := $1.(*ast.FuncCallExpr); !ok {
-               /* stock exprstat: "syntax error" at the token after the
-                  non-call expression (5.5 lparser.c check_condition) */
-               yylex.(*Lexer).SyntaxErrorAtNext()
+               /* stock exprstat: "syntax error" at the current token —
+                  the one that failed to continue the call/assignment
+                  (5.5 lparser.c check_condition via luaX_syntaxerror) */
+               yylex.(*Lexer).SyntaxErrorAtCurrent()
             } else {
               $$ = &ast.FuncCallStmt{Expr: $1}
               $$.SetLine($1.Line())
@@ -211,7 +217,7 @@ stat:
             $$.SetLastLine($3.Pos.Line)
         } |
         TWhile expr TDo block TEnd {
-            $$ = &ast.WhileStmt{Condition: $2, Stmts: $4}
+            $$ = &ast.WhileStmt{Condition: $2, Stmts: $4, DoLine: $3.Pos.Line}
             $$.SetLine($1.Pos.Line)
             $$.SetLastLine($5.Pos.Line)
         } |
@@ -221,7 +227,7 @@ stat:
             $$.SetLastLine($4.Line())
         } |
         TIf expr TThen block elseifs TEnd {
-            $$ = &ast.IfStmt{Condition: $2, Then: $4}
+            $$ = &ast.IfStmt{Condition: $2, Then: $4, ThenLine: $3.Pos.Line}
             cur := $$
             for _, elseif := range $5 {
                 cur.(*ast.IfStmt).Else = []ast.Stmt{elseif}
@@ -231,7 +237,7 @@ stat:
             $$.SetLastLine($6.Pos.Line)
         } |
         TIf expr TThen block elseifs TElse block TEnd {
-            $$ = &ast.IfStmt{Condition: $2, Then: $4}
+            $$ = &ast.IfStmt{Condition: $2, Then: $4, ThenLine: $3.Pos.Line}
             cur := $$
             for _, elseif := range $5 {
                 cur.(*ast.IfStmt).Else = []ast.Stmt{elseif}
@@ -327,7 +333,7 @@ elseifs:
             $$ = []ast.Stmt{}
         } | 
         elseifs TElseIf expr TThen block {
-            $$ = append($1, &ast.IfStmt{Condition: $3, Then: $5})
+            $$ = append($1, &ast.IfStmt{Condition: $3, Then: $5, ThenLine: $4.Pos.Line})
             $$[len($$)-1].SetLine($2.Pos.Line)
         }
 
@@ -480,89 +486,93 @@ expr:
             $$ = &ast.LogicalOpExpr{Lhs: $1, Operator: "and", Rhs: $3}
             $$.SetLine($1.Line())
         } |
+        /* U5f: comparisons carry the OPERATOR token's line (stock subexpr
+           saves ls->linenumber = the operator's position before consuming
+           it; both luaK_infix's lhs discharge and luaK_posfix's EQ/LT/LE
+           code at that line — not the lhs's line). */
         expr '>' expr {
             $$ = &ast.RelationalOpExpr{Lhs: $1, Operator: ">", Rhs: $3}
-            $$.SetLine($1.Line())
+            $$.SetLine($2.Pos.Line)
         } |
         expr '<' expr {
             $$ = &ast.RelationalOpExpr{Lhs: $1, Operator: "<", Rhs: $3}
-            $$.SetLine($1.Line())
+            $$.SetLine($2.Pos.Line)
         } |
         expr TGte expr {
             $$ = &ast.RelationalOpExpr{Lhs: $1, Operator: ">=", Rhs: $3}
-            $$.SetLine($1.Line())
+            $$.SetLine($2.Pos.Line)
         } |
         expr TLte expr {
             $$ = &ast.RelationalOpExpr{Lhs: $1, Operator: "<=", Rhs: $3}
-            $$.SetLine($1.Line())
+            $$.SetLine($2.Pos.Line)
         } |
         expr TEqeq expr {
             $$ = &ast.RelationalOpExpr{Lhs: $1, Operator: "==", Rhs: $3}
-            $$.SetLine($1.Line())
+            $$.SetLine($2.Pos.Line)
         } |
         expr TNeq expr {
             $$ = &ast.RelationalOpExpr{Lhs: $1, Operator: "~=", Rhs: $3}
-            $$.SetLine($1.Line())
+            $$.SetLine($2.Pos.Line)
         } |
         expr T2Comma expr {
             $$ = &ast.StringConcatOpExpr{Lhs: $1, Rhs: $3}
-            $$.SetLine($1.Line())
+            $$.SetLine($2.Pos.Line)
         } |
         expr '+' expr {
             $$ = &ast.ArithmeticOpExpr{Lhs: $1, Operator: "+", Rhs: $3}
-            $$.SetLine($1.Line())
+            $$.SetLine($2.Pos.Line)
         } |
         expr '-' expr {
             $$ = &ast.ArithmeticOpExpr{Lhs: $1, Operator: "-", Rhs: $3}
-            $$.SetLine($1.Line())
+            $$.SetLine($2.Pos.Line)
         } |
         expr '*' expr {
             $$ = &ast.ArithmeticOpExpr{Lhs: $1, Operator: "*", Rhs: $3}
-            $$.SetLine($1.Line())
+            $$.SetLine($2.Pos.Line)
         } |
         expr '/' expr {
             $$ = &ast.ArithmeticOpExpr{Lhs: $1, Operator: "/", Rhs: $3}
-            $$.SetLine($1.Line())
+            $$.SetLine($2.Pos.Line)
         } |
         expr TIDiv expr {
             $$ = &ast.ArithmeticOpExpr{Lhs: $1, Operator: "//", Rhs: $3}
-            $$.SetLine($1.Line())
+            $$.SetLine($2.Pos.Line)
         } |
         expr TBand expr {
             $$ = &ast.ArithmeticOpExpr{Lhs: $1, Operator: "&", Rhs: $3}
-            $$.SetLine($1.Line())
+            $$.SetLine($2.Pos.Line)
         } |
         expr TBor expr {
             $$ = &ast.ArithmeticOpExpr{Lhs: $1, Operator: "|", Rhs: $3}
-            $$.SetLine($1.Line())
+            $$.SetLine($2.Pos.Line)
         } |
         expr TBXor expr {
             $$ = &ast.ArithmeticOpExpr{Lhs: $1, Operator: "~", Rhs: $3}
-            $$.SetLine($1.Line())
+            $$.SetLine($2.Pos.Line)
         } |
         expr TShl expr {
             $$ = &ast.ArithmeticOpExpr{Lhs: $1, Operator: "<<", Rhs: $3}
-            $$.SetLine($1.Line())
+            $$.SetLine($2.Pos.Line)
         } |
         expr TShr expr {
             $$ = &ast.ArithmeticOpExpr{Lhs: $1, Operator: ">>", Rhs: $3}
-            $$.SetLine($1.Line())
+            $$.SetLine($2.Pos.Line)
         } |
         expr '%' expr {
             $$ = &ast.ArithmeticOpExpr{Lhs: $1, Operator: "%", Rhs: $3}
-            $$.SetLine($1.Line())
+            $$.SetLine($2.Pos.Line)
         } |
         expr '^' expr {
             $$ = &ast.ArithmeticOpExpr{Lhs: $1, Operator: "^", Rhs: $3}
-            $$.SetLine($1.Line())
+            $$.SetLine($2.Pos.Line)
         } |
         '-' expr %prec UNARY {
             $$ = &ast.UnaryMinusOpExpr{Expr: $2}
-            $$.SetLine($2.Line())
+            $$.SetLine($1.Pos.Line)
         } |
         TBXor expr %prec UNARY {
             $$ = &ast.UnaryBNotOpExpr{Expr: $2}
-            $$.SetLine($2.Line())
+            $$.SetLine($1.Pos.Line)
         } |
         TNot expr %prec UNARY {
             $$ = &ast.UnaryNotOpExpr{Expr: $2}
@@ -570,7 +580,7 @@ expr:
         } |
         '#' expr %prec UNARY {
             $$ = &ast.UnaryLenOpExpr{Expr: $2}
-            $$.SetLine($2.Line())
+            $$.SetLine($1.Pos.Line)
         }
 
 string: 
@@ -590,11 +600,11 @@ prefixexp:
             $$ = $1
         } |
         '(' expr ')' {
+            $$ = $2
             if ex, ok := $2.(*ast.Comma3Expr); ok {
                 ex.AdjustRet = true
+                ex.SetLine($1.Pos.Line)
             }
-            $$ = $2
-            $$.SetLine($1.Pos.Line)
         }
 
 afunctioncall:
@@ -606,11 +616,11 @@ afunctioncall:
 functioncall:
         prefixexp args {
             $$ = &ast.FuncCallExpr{Func: $1, Args: $2}
-            $$.SetLine($1.Line())
+            $$.SetLine(yylex.(*Lexer).ArgsLine)
         } |
         prefixexp ':' TIdent args {
             $$ = &ast.FuncCallExpr{Method: $3.Str, Receiver: $1, Args: $4}
-            $$.SetLine($1.Line())
+            $$.SetLine(yylex.(*Lexer).ArgsLine)
         }
 
 args:
@@ -618,18 +628,22 @@ args:
             if yylex.(*Lexer).PNewLine {
                yylex.(*Lexer).TokenError($1, "ambiguous syntax (function call x new statement)")
             }
+            yylex.(*Lexer).ArgsLine = $1.Pos.Line
             $$ = []ast.Expr{}
         } |
         '(' exprlist ')' {
             if yylex.(*Lexer).PNewLine {
                yylex.(*Lexer).TokenError($1, "ambiguous syntax (function call x new statement)")
             }
+            yylex.(*Lexer).ArgsLine = $1.Pos.Line
             $$ = $2
         } |
         tableconstructor {
+            yylex.(*Lexer).ArgsLine = $1.Line()
             $$ = []ast.Expr{$1}
-        } | 
+        } |
         string {
+            yylex.(*Lexer).ArgsLine = $1.Line()
             $$ = []ast.Expr{$1}
         }
 

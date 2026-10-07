@@ -47,12 +47,16 @@ const fileDefInIndex = 2
 const fileDefaultWriteBuffer = 4096
 const fileDefaultReadBuffer = 4096
 
+// checkFile is stock tofile's luaL_checkudata(L, 1, LUA_FILEHANDLE): the
+// FILE* type name in the argcheck texts ("FILE* expected, got ..."), not
+// the generic userdata type (errors.lua:368 pokes it through __gc).
 func checkFile(L *LState) *lFile {
-	ud := L.CheckUserData(1)
-	if file, ok := ud.Value.(*lFile); ok {
-		return file
+	if ud, ok := L.Get(1).(*LUserData); ok {
+		if file, ok := ud.Value.(*lFile); ok {
+			return file
+		}
 	}
-	L.ArgError(1, "file expected")
+	L.typeErrorStr(1, lFileClass)
 	return nil
 }
 
@@ -205,12 +209,13 @@ func OpenIo(L *LState) int {
 
 var fileMethods = map[string]LGFunction{
 	"__tostring": fileToString,
-	// stock's metameth table maps the file __close to f_gc, NOT io_close:
-	// a no-op on an already-closed handle. io.lines(filename) returns the
-	// file as the generic-for's 4th to-be-closed value (U5a — TFORPREP
-	// registers it), and the lines iterator already closed it at EOF by
-	// the time the loop-exit close fires on the same handle.
+	// stock's metameth table maps the file __close AND __gc to f_gc, NOT
+	// io_close: a no-op on an already-closed handle. io.lines(filename)
+	// returns the file as the generic-for's 4th to-be-closed value (U5a —
+	// TFORPREP registers it), and the lines iterator already closed it at
+	// EOF by the time the loop-exit close fires on the same handle.
 	"__close": fileCloseMeta,
+	"__gc":    fileCloseMeta,
 	"write":   fileWrite,
 	"close":   fileClose,
 	"flush":   fileFlush,

@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"os"
 	"strconv"
+	"sync"
+	"sync/atomic"
 )
 
 type LValueType int
@@ -239,6 +241,22 @@ type Global struct {
 	builtinXPCall *LFunction
 	builtinPairs  *LFunction
 
+	// The __gc finalizer queue (U5f, stock g->tmudata). The fork's
+	// collector is Go's GC: a dead object surfaces only through
+	// runtime.SetFinalizer, whose callback runs on Go's finalizer
+	// goroutine and must ONLY enqueue here (no LState touches). The
+	// drain points — the luaC_checkGC analogs in the VM, the
+	// collectgarbage full arm, and Close — run the queued __gc
+	// metamethods on the running thread. finPending is the lock-free
+	// gate for the per-instruction checks.
+	finMu      sync.Mutex
+	finQ       []LValue
+	finPending atomic.Bool
+	// finDepth suppresses nested drains: a finalizer's own allocation
+	// sites do not re-enter (stock's GCSTPGC around GCTM) — their
+	// objects stay queued for the next drain.
+	finDepth int
+
 	builtinMts map[int]LValue
 	tempFiles  []*os.File
 	gccount    int32
@@ -284,6 +302,31 @@ type LState struct {
 	// boundary". Marker-frame bodies (pcall/xpcall/pairs/__close from
 	// the VM) are pushed by the loop itself and never bump it.
 	noyieldDepth int
+	// Debug-hook state (U5f, stock's L->hook/hookcount/oldpc/allowhook,
+	// per-thread since coroutines are *LState; a fresh thread inherits
+	// nothing, like lua_newthread). hookMask's bits are hookMask* below
+	// (stock LUA_MASK* numbers). hookOldPc is THREAD-global like stock's
+	// L->oldpc: the index of the last instruction the line seam visited,
+	// in ANY frame's proto — a running hook function's own traced
+	// instructions advance it too (stock's cross-proto oldpc behavior,
+	// which a byte-exact line trace reproduces). hookBusy is stock's
+	// allowhook=0 while a hook runs. retHookPending marks a C function
+	// that suspended mid-call (coroutine.yield): its RETURN event fires
+	// when the thread resumes (stock finishCfunc's redo-poscall).
+	// hookFTransfer/hookNTransfer are stock's L->transferinfo — the
+	// register window being transferred by the event the hook was last
+	// invoked for (call: (1, nparams), return: (firstres-func, nres),
+	// line/count: (0,0)); thread-global and overwritten by every event,
+	// they are what getinfo 'r' reports over a CIST_HOOKED frame (U5f).
+	hookFn         *LFunction
+	hookMask       uint8
+	hookCount      int
+	hookCountdown  int
+	hookOldPc      int
+	hookBusy       bool
+	retHookPending bool
+	hookFTransfer  int
+	hookNTransfer  int
 }
 
 // tbcEntry is one to-be-closed variable registration (U4). The value

@@ -297,6 +297,7 @@ int main(void) {
     {
       int32_t n = rt_err_stage_copy((rt_addr)(uintptr_t)buf, sizeof buf);
       CHECK(n == (int32_t)strlen("context deadline exceeded"));
+      buf[n] = '\0'; /* stage_copy copies err_buf_len bytes, no NUL */
       CHECK(strcmp(buf, "context deadline exceeded") == 0);
     }
     /* sticky: rt_deadline never re-stages over a pending error */

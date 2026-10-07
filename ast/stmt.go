@@ -70,6 +70,10 @@ type WhileStmt struct {
 
 	Condition Expr
 	Stmts     []Stmt
+	// DoLine is the `do` token's line (U5f): stock codes the loop-back
+	// jump at ls->lastline — the body's last token's line, or the `do`
+	// line when the body is empty (the last token consumed by then).
+	DoLine int
 }
 
 type RepeatStmt struct {
@@ -85,6 +89,10 @@ type IfStmt struct {
 	Condition Expr
 	Then      []Stmt
 	Else      []Stmt
+	// ThenLine is the `then` token's line (U5f): stock codes the
+	// jump-over-else at ls->lastline — the then-block's last token's
+	// line, or the `then` line when the block is empty.
+	ThenLine int
 }
 
 type NumberForStmt struct {

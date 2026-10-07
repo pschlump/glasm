@@ -49,7 +49,15 @@ type Upvaldesc struct {
 }
 
 type FunctionProto struct {
-	SourceName         string
+	SourceName string
+	// SourceIsNull marks stock's NULL source (U5f): a stripped binary
+	// chunk carries no source string, and getinfo/where render "?"
+	// shapes for it. A TEXT load with an explicit empty chunkname
+	// (load(s, "")) is a REAL empty source — `[string ""]` (db.lua:73)
+	// — so "" alone must not take the NULL path. Only the undump sets
+	// the flag (dumping an empty TString is size 0, identical to NULL,
+	// so every undumped empty source IS stock's NULL).
+	SourceIsNull       bool
 	LineDefined        int
 	LastLineDefined    int
 	NumUpvalues        uint8
@@ -233,16 +241,12 @@ func (fn *LFunction) LocalName(regno, pc int) (string, bool) {
 	if fn.IsG {
 		return "", false
 	}
-	p := fn.Proto
-	for i := 0; i < len(p.DbgLocals) && p.DbgLocals[i].StartPc < pc; i++ {
-		if pc < p.DbgLocals[i].EndPc {
-			regno--
-			if regno == 0 {
-				return p.DbgLocals[i].Name, true
-			}
-		}
-	}
-	return "", false
+	// U5f: stock luaF_getlocalname — the loop guard is startpc <= pc (a
+	// local is visible AT its own initializing instruction; the old strict
+	// < hid a local whose StartPc was exactly the query pc, so the
+	// return-hook battery saw the block's last-declared locals as
+	// "(temporary)", db.lua:515). localNameAt is the stock-exact walk.
+	return localNameAt(fn.Proto, regno, pc)
 }
 
 /* }}} */

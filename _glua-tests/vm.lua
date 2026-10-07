@@ -126,7 +126,7 @@ local ok, msg = load([[
      a293,  a294,  a295,  a296,  a297,  a298,  a299,
      a300,  a301,  a302) end
 ]]) 
-assert(not ok and string.find(msg, "register overflow"))
+assert(not ok and string.find(msg, "too many local variables"))
 
 local ok, msg = load([[
    function main()

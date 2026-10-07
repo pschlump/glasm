@@ -181,6 +181,10 @@ func coResume(L *LState) int {
 			th.initCallFrame(cf)
 		}
 		th.Panic = panicWithoutTraceback
+		// U5f: stock lua_resume calls the entry function (luaD_call) — the
+		// call hook fires for the entry frame (a vararg body defers to its
+		// OP_VARARGPREP; the marker arm's payload is the frame on top)
+		th.hookCallEvent(th.currentFrame)
 	} else {
 		nargs := L.GetTop() - 1
 		L.XMoveTo(th, nargs)

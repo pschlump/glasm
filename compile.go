@@ -23,6 +23,10 @@ const maxRegisters = 200
 // 200-declaration mixing battery).
 const maxFuncRegisters = opMaxArgsA
 
+// maxUpvalues is stock MAXUPVAL (llimits.h): 255 captures per function
+// (singlevaraux's luaY_checklimit "upvalues").
+const maxUpvalues = 255
+
 type expContextType int
 
 const (
@@ -138,6 +142,20 @@ func savereg(ec *expcontext, reg int) int {
 func raiseCompileError(context *funcContext, line int, format string, args ...interface{}) {
 	msg := fmt.Sprintf(format, args...)
 	panic(&CompileError{context: context, Line: line, Message: msg})
+}
+
+// raiseErrorLimit is stock's errorlimit (lparser.c): "too many %s (limit
+// is %d) in %s", where %s is "main function" for the main chunk (line
+// defined 0) or "function at line %d" otherwise — errors.lua's limit
+// batteries pin both the what and the "line N" text (:768's upvalues,
+// :778's local variables). Reported at the function's definition line
+// (the fork's compile is post-parse; stock uses the current token).
+func raiseErrorLimit(context *funcContext, limit int, what string) {
+	where := "main function"
+	if line := context.Proto.LineDefined; line != 0 {
+		where = fmt.Sprintf("function at line %d", line)
+	}
+	raiseCompileError(context, context.Proto.LineDefined, "too many %s (limit is %d) in %s", what, limit, where)
 }
 
 func isVarArgReturnExpr(expr ast.Expr) bool {
@@ -461,6 +479,12 @@ func (vp *varNamePool) RegisterKindReg(name string, kind, reg int) int {
 // (register-holding entries only).
 func (vp *varNamePool) noteDbg(index int, info *DbgLocalInfo) {
 	vp.dbg[index-vp.offset] = info
+}
+
+// dbgAt is the DbgLocalInfo of the entry at index (nil for
+// register-less entries) — the localfunc/for-loop startpc re-pins.
+func (vp *varNamePool) dbgAt(index int) *DbgLocalInfo {
+	return vp.dbg[index-vp.offset]
 }
 
 // noteCTC records the folded constant of the varKindCTC entry at index.
@@ -836,6 +860,18 @@ func (fc *funcContext) RegisterLocalVarKind(name string, kind int) int {
 	return ret
 }
 
+// dbgInfoAt is the DbgLocalInfo of the function-wide local index (nil
+// for register-less entries) — the U5f startpc re-pins (stock's
+// adjustlocalvars-time startpc, deferred past code the fork's register
+// choreography needs the registration BEFORE).
+func (fc *funcContext) dbgInfoAt(idx int) *DbgLocalInfo {
+	_, block := fc.FindLocalVarAndBlockAt(idx)
+	if block == nil {
+		return nil
+	}
+	return block.LocalVars.dbgAt(idx)
+}
+
 // regOfVar is the register of the local at function-wide index idx —
 // the register sites (MOVE operands, capture descriptors, CLOSE levels)
 // go through here, never through the index itself (U5a: the index is a
@@ -992,7 +1028,7 @@ func (fc *funcContext) CloseUpvalues() int {
 
 func (fc *funcContext) LeaveBlock() int {
 	closed := fc.CloseUpvalues()
-	fc.EndScope(closed > -1)
+	fc.EndScope()
 
 	// U4: the block's <close> declarations are closed by its OP_CLOSE /
 	// the enclosing return — tailcall promotion is allowed again below
@@ -1008,28 +1044,26 @@ func (fc *funcContext) LeaveBlock() int {
 	return closed
 }
 
-// EndScope closes the debug-info window of the block's locals
-// (stock removevars' endpc). extendToClose marks a scope whose exit code
-// CLOSES: stock emits OP_CLOSE before removevars, so its endpc is one
-// PAST the close — the close's own __close metamethod still sees the
-// block's locals in debug.getlocal (the repeat-until battery,
-// locals.lua:1198). LocalName's pc < EndPc keeps the extra pc visible at
-// the CLOSE only, never past it.
-func (fc *funcContext) EndScope(extendToClose bool) {
+// EndScope closes the debug-info window of the block's locals (stock
+// removevars' endpc): EndPc = fs->pc at the leave — one PAST the block's
+// last emitted instruction, its exit OP_CLOSE included, giving stock's
+// half-open [StartPc, EndPc). A scope whose exit closes (LeaveBlock's
+// OP_CLOSE, the function's final RETURN closing tbc variables) needs no
+// extra room under this rule: the close/__close dispatch runs AT that
+// last instruction, which the window already covers (the repeat-until
+// battery, locals.lua:1198 — the old extendToClose flag compensated a
+// base that was one short).
+func (fc *funcContext) EndScope() {
 	for _, info := range fc.Block.LocalVars.dbg {
 		if info != nil {
-			end := fc.Code.LastPC()
-			if extendToClose {
-				end++
-			}
-			info.EndPc = end
+			info.EndPc = fc.Code.LastPC() + 1
 		}
 	}
 }
 
 func (fc *funcContext) SetRegTop(top int) {
 	if top > maxRegisters {
-		raiseCompileError(fc, fc.Proto.LineDefined, "too many local variables")
+		raiseErrorLimit(fc, maxRegisters, "local variables")
 	}
 	fc.regTop = top
 }
@@ -1067,11 +1101,13 @@ type opnd struct {
 // code was a scratch constant load above the live registers, the load is
 // popped and the constant returned as the operand (numericOnly selects
 // between arith operands and comparison operands, which may keep strings
-// for EQK).
-func compileConstOperand(fc *funcContext, expr ast.Expr, reg int, numericOnly bool) (opnd, int) {
+// for EQK). single reports that the expression's ENTIRE code is the one
+// trailing instruction — the infix-discharge shape (see infixLine).
+func compileConstOperand(fc *funcContext, expr ast.Expr, reg int, numericOnly bool) (opnd, int, bool) {
 	startpc := fc.Code.LastPC()
 	compileExpr(fc, reg, expr, ecnone(0))
 	last := fc.Code.Last()
+	single := fc.Code.LastPC() == startpc+1
 	// The trailing load is attributable to the expression only when it is
 	// the expression's ENTIRE code (U4e): an and/or operand ends with the
 	// never-executed other arm's load behind a jump, and popping that
@@ -1079,39 +1115,55 @@ func compileConstOperand(fc *funcContext, expr ast.Expr, reg int, numericOnly bo
 	// register — `5 + (23 or 2)` compiled to `23 + 2` (events.lua's
 	// basic-type metatable battery). Multi-instruction code keeps the
 	// register form; the value is already where it belongs.
-	if fc.Code.LastPC() == startpc+1 && opGetArgA(last) >= fc.RegTop() {
+	if single && opGetArgA(last) >= fc.RegTop() {
 		switch opGetOpCode(last) {
 		case OP_LOADI:
 			fc.Code.Pop()
-			return opnd{kind: opndInt, ival: int64(opGetArgSbx(last)), kidx: -1}, reg
+			return opnd{kind: opndInt, ival: int64(opGetArgSbx(last)), kidx: -1}, reg, single
 		case OP_LOADF:
 			fc.Code.Pop()
 			sb := int64(opGetArgSbx(last))
-			return opnd{kind: opndFloat, ival: sb, fval: float64(sb), isFloat: true, kidx: -1}, reg
+			return opnd{kind: opndFloat, ival: sb, fval: float64(sb), isFloat: true, kidx: -1}, reg, single
 		case OP_LOADK:
 			idx := opGetArgBx(last)
 			if idx <= opMaxIndexK {
 				switch n := fc.Proto.Constants[idx].(type) {
 				case LInteger:
 					fc.Code.Pop()
-					return opnd{kind: opndInt, ival: int64(n), kidx: idx}, reg
+					return opnd{kind: opndInt, ival: int64(n), kidx: idx}, reg, single
 				case LNumber:
 					fc.Code.Pop()
 					o := opnd{kind: opndK, kidx: idx, fval: float64(n)}
 					if iv, ok := floatToIntExact(float64(n)); ok {
 						o = opnd{kind: opndFloat, ival: iv, fval: float64(n), isFloat: true, kidx: idx}
 					}
-					return o, reg
+					return o, reg, single
 				default:
 					if !numericOnly {
 						fc.Code.Pop()
-						return opnd{kind: opndK, kidx: idx}, reg
+						return opnd{kind: opndK, kidx: idx}, reg, single
 					}
 				}
 			}
 		}
 	}
-	return opnd{kind: opndReg, reg: reg}, reg + 1
+	return opnd{kind: opndReg, reg: reg}, reg + 1, single
+}
+
+// infixLine re-lines the lhs load of a binary operation to the operator
+// token's line (stock luaK_infix, lcode.c: for OPR_ADD..OPR_SHR it calls
+// luaK_exp2anyreg on a non-numeral lhs IMMEDIATELY after the operator is
+// consumed — ls->lastline is the operator's line — and the order/equality
+// comparisons discharge the same way; OPR_EQ/NE via exp2RK, OPR_LT..GE via
+// exp2anyreg unless the operand is an sC numeral). A lhs whose entire code
+// is one load instruction IS that discharge (a multi-instruction lhs was
+// already register-resident — a call, a nested operation — and infix emits
+// nothing for it). db.lua's large-gaps trace: `b[1] \n+ \nb[1]` fires the
+// lhs GETI event at the OPERATOR's line, not the operand's.
+func infixLine(fc *funcContext, lhs opnd, single bool, line int) {
+	if single && lhs.kind == opndReg {
+		fc.Code.lines[fc.Code.LastPC()] = line
+	}
 }
 
 // materializeReg re-emits a constant operand into a register (the
@@ -1547,12 +1599,18 @@ func compileAssignStmt(context *funcContext, stmt *ast.AssignStmt) { // {{{
 	reg, acs := compileAssignStmtLeft(context, stmt)
 	reg, acs = compileAssignStmtRight(context, stmt, reg, acs)
 
+	// U5f: stock restassign codes every store at ls->lastline — the
+	// line of the statement's LAST token (the RHS tail; the parser
+	// records it as the statement's LastLine). db.lua's large-gaps trace
+	// pins the SETTABUP there, not at the target name's line.
+	tail := eline(stmt)
+
 	for i := lennames - 1; i >= 0; i-- {
 		ex := stmt.Lhs[i]
 		switch acs[i].ec.ctype {
 		case ecLocal:
 			if acs[i].needmove {
-				code.AddABC(OP_MOVE, context.regOfVar(context.FindLocalVar(ex.(*ast.IdentExpr).Value)), reg, 0, sline(ex))
+				code.AddABC(OP_MOVE, context.regOfVar(context.FindLocalVar(ex.(*ast.IdentExpr).Value)), reg, 0, tail)
 				reg -= 1
 			}
 		case ecGlobal:
@@ -1564,23 +1622,23 @@ func compileAssignStmt(context *funcContext, stmt *ast.AssignStmt) { // {{{
 				// D3: _ENV shadowed by a local — the global write is a
 				// keyed table write on that register
 				if fits {
-					code.AddABCk(OP_SETFIELD, acs[i].envLocalIdx, kidx, reg, 0, sline(ex))
+					code.AddABCk(OP_SETFIELD, acs[i].envLocalIdx, kidx, reg, 0, tail)
 				} else {
-					loadStringK(context, reg+1, name, sline(ex))
-					code.AddABCk(OP_SETTABLE, acs[i].envLocalIdx, reg+1, reg, 0, sline(ex))
+					loadStringK(context, reg+1, name, tail)
+					code.AddABCk(OP_SETTABLE, acs[i].envLocalIdx, reg+1, reg, 0, tail)
 				}
 			} else if fits {
-				code.AddABCk(OP_SETTABUP, envUpvalueIndexOf(context), kidx, reg, 0, sline(ex))
+				code.AddABCk(OP_SETTABUP, envUpvalueIndexOf(context), kidx, reg, 0, tail)
 			} else {
 				// K-overflow fallback (stock luaK_indexed): the upvalue
 				// table and the key both go into registers
-				code.AddABC(OP_GETUPVAL, reg+2, envUpvalueIndexOf(context), 0, sline(ex))
-				loadStringK(context, reg+1, name, sline(ex))
-				code.AddABCk(OP_SETTABLE, reg+2, reg+1, reg, 0, sline(ex))
+				code.AddABC(OP_GETUPVAL, reg+2, envUpvalueIndexOf(context), 0, tail)
+				loadStringK(context, reg+1, name, tail)
+				code.AddABCk(OP_SETTABLE, reg+2, reg+1, reg, 0, tail)
 			}
 			reg -= 1
 		case ecUpvalue:
-			code.AddABC(OP_SETUPVAL, reg, context.Upvalues.RegisterUnique(ex.(*ast.IdentExpr).Value), 0, sline(ex))
+			code.AddABC(OP_SETUPVAL, reg, context.Upvalues.RegisterUnique(ex.(*ast.IdentExpr).Value), 0, tail)
 			reg -= 1
 		case ecTable:
 			vreg, vk := opIndexOrReg(acs[i].valuerk), 0
@@ -1589,11 +1647,11 @@ func compileAssignStmt(context *funcContext, stmt *ast.AssignStmt) { // {{{
 			}
 			switch acs[i].keyMode {
 			case keyKStr:
-				code.AddABCk(OP_SETFIELD, acs[i].ec.reg, acs[i].keyData, vreg, vk, sline(ex))
+				code.AddABCk(OP_SETFIELD, acs[i].ec.reg, acs[i].keyData, vreg, vk, tail)
 			case keyInt:
-				code.AddABCk(OP_SETI, acs[i].ec.reg, acs[i].keyData, vreg, vk, sline(ex))
+				code.AddABCk(OP_SETI, acs[i].ec.reg, acs[i].keyData, vreg, vk, tail)
 			default:
-				code.AddABCk(OP_SETTABLE, acs[i].ec.reg, acs[i].keyReg, vreg, vk, sline(ex))
+				code.AddABCk(OP_SETTABLE, acs[i].ec.reg, acs[i].keyReg, vreg, vk, tail)
 			}
 			if !opIsK(acs[i].valuerk) {
 				reg -= 1
@@ -1665,8 +1723,19 @@ func compileLocalAssignStmt(context *funcContext, stmt *ast.LocalAssignStmt) { /
 	}
 	if len(stmt.Names) == 1 && len(stmt.Exprs) == 1 {
 		if _, ok := stmt.Exprs[0].(*ast.FunctionExpr); ok {
-			context.RegisterLocalVarKind(stmt.Names[0], localStmtAttrib(stmt, 0))
+			idx := context.RegisterLocalVarKind(stmt.Names[0], localStmtAttrib(stmt, 0))
 			compileRegAssignment(context, stmt.Names, stmt.Exprs, reg, len(stmt.Names), sline(stmt))
+			// U5f (stock localfunc, lparser.c:1792): the name registers
+			// before the body (so the body's self-references resolve) but
+			// "debug information will only see the variable after this
+			// point" — startpc = fs->pc after the initializing OP_CLOSURE.
+			// The pre-registered window pointed AT the closure, so a
+			// hook firing there saw the local before it materialized
+			// (db.lua:695: getlocal(2,1) answers "(temporary)" while the
+			// closure register still reads nil).
+			if info := context.dbgInfoAt(idx); info != nil {
+				info.StartPc = context.Code.LastPC() + 1
+			}
 			compileStmtTBC(context, stmt)
 			return
 		}
@@ -2034,8 +2103,29 @@ func compileReturnStmt(context *funcContext, stmt *ast.ReturnStmt) { // {{{
 	if lastisvaarg {
 		count = 0
 	}
+	// stock luaK_ret's checklimit (lcode.c:215): B = nret+1 must fit the
+	// 8-bit B field — "too many returns (limit is 255)" (calls.lua:599's
+	// 255-value return). Reported at the function's definition line
+	// (post-parse; stock raises at the current token).
+	if count > maxFuncRegisters {
+		raiseErrorLimit(context, maxFuncRegisters, "returns")
+	}
 	context.Code.AddABCk(OP_RETURN, a, count, 0, kc, sline(stmt))
 } // }}}
+
+// blockTailLine is the line stock codes a construct's trailing jump at:
+// ls->lastline at the luaK_jump call — the block's last token's line, or
+// the delimiter token's line (`then`/`do`) when the block is empty. The
+// jump-over-else (test_then_block) and the while loop-back (whilestat)
+// are both emitted BEFORE the next keyword is read, so they carry the
+// block tail, never the construct's header/end line (db.lua:25's trace:
+// coding them at the if/while line fired phantom line events).
+func blockTailLine(stmts []ast.Stmt, emptyLine int) int {
+	if n := len(stmts); n > 0 {
+		return eline(stmts[n-1])
+	}
+	return emptyLine
+}
 
 func compileIfStmt(context *funcContext, stmt *ast.IfStmt) { // {{{
 	thenlabel := context.NewLabel()
@@ -2046,7 +2136,7 @@ func compileIfStmt(context *funcContext, stmt *ast.IfStmt) { // {{{
 	context.SetLabelPc(thenlabel, context.Code.LastPC())
 	compileBlock(context, stmt.Then)
 	if len(stmt.Else) > 0 {
-		context.Code.AddSJ(OP_JMP, endlabel, sline(stmt))
+		context.Code.AddSJ(OP_JMP, endlabel, blockTailLine(stmt.Then, stmt.ThenLine))
 	}
 	context.SetLabelPc(elselabel, context.Code.LastPC())
 	if len(stmt.Else) > 0 {
@@ -2114,7 +2204,7 @@ func compileWhileStmt(context *funcContext, stmt *ast.WhileStmt) { // {{{
 	context.EnterBlock(elselabel, stmt)
 	compileChunk(context, stmt.Stmts, false)
 	context.CloseUpvalues()
-	context.Code.AddSJ(OP_JMP, condlabel, eline(stmt))
+	context.Code.AddSJ(OP_JMP, condlabel, blockTailLine(stmt.Stmts, stmt.DoLine))
 	context.LeaveBlock()
 	context.SetLabelPc(elselabel, context.Code.LastPC())
 } // }}}
@@ -2201,6 +2291,13 @@ func compileFuncDefStmt(context *funcContext, stmt *ast.FuncDefStmt) { // {{{
 		astmt.SetLastLine(eline(stmt.Func))
 		compileAssignStmt(context, astmt)
 	}
+	// U5f (stock funcstat's luaK_fixline): the definition "happens" on the
+	// statement's FIRST line — the final store instruction is re-lined
+	// there. A field-chain def lowered to an assignment otherwise carries
+	// the statement TAIL line (the assignment rule): `function a.x.y()`
+	// over an a.x that is nil errors at the SETFIELD, and errors.lua:433
+	// pins line 1 (the `function` line), not the body's `end` line
+	context.Code.lines[context.Code.LastPC()] = sline(stmt)
 } // }}}
 
 // compileNumberForStmt — stock 5.5 flow (lparser.c fornum + lvm.c
@@ -2223,12 +2320,12 @@ func compileNumberForStmt(context *funcContext, stmt *ast.NumberForStmt) { // {{
 	// the register it occupies is RegTop at the call (a `global *` preamble
 	// shifts flat indices without shifting registers)
 	rfor := reg
-	context.RegisterLocalVar("(for state)")
+	idxfor0 := context.RegisterLocalVar("(for state)")
 	ecupdate(ec, ecLocal, rfor, 0)
 	compileExpr(context, reg, stmt.Init, ec)
 
 	reg = context.RegTop()
-	context.RegisterLocalVar("(for state)")
+	idxfor1 := context.RegisterLocalVar("(for state)")
 	ecupdate(ec, ecLocal, rfor+1, 0)
 	compileExpr(context, reg, stmt.Limit, ec)
 
@@ -2240,11 +2337,21 @@ func compileNumberForStmt(context *funcContext, stmt *ast.NumberForStmt) { // {{
 	ecupdate(ec, ecLocal, rfor+2, 0)
 	compileExpr(context, reg, stmt.Step, ec)
 
-	// U4: the control variable is RDKCONST (stock lparser.c) — the loop
-	// steps it internally, user code cannot assign it.
-	context.RegisterLocalVarKind(stmt.Name, varKindConst)
+	// U5f (stock fornum): the two "(for state)" windows start where
+	// adjustlocalvars(2) runs — AFTER the init/limit/step code, at the
+	// pc OP_FORPREP is about to occupy.
+	for _, idx := range []int{idxfor0, idxfor1} {
+		if info := context.dbgInfoAt(idx); info != nil {
+			info.StartPc = code.LastPC() + 1
+		}
+	}
 
+	// U4: the control variable is RDKCONST (stock lparser.c) — the loop
+	// steps it internally, user code cannot assign it. U5f (stock
+	// forbody): its window starts only after OP_FORPREP — emitted here
+	// first, the registration follows the instruction.
 	code.AddABx(OP_FORPREP, rfor, 0, sline(stmt))
+	context.RegisterLocalVarKind(stmt.Name, varKindConst)
 	preppc := code.LastPC()
 	bodypc := code.LastPC() + 1
 	compileChunk(context, stmt.Stmts, false)
@@ -2282,6 +2389,14 @@ func compileGenericForStmt(context *funcContext, stmt *ast.GenericForStmt) { // 
 	code := context.Code
 	endlabel := context.NewLabel()
 	nnames := len(stmt.Names)
+	// stock forlist saves the line right after 'in' — the first explist
+	// token's line — and fixes TFORPREP/TFORCALL/TFORLOOP to it (the
+	// iterator-call error position, errors.lua's `for k,v in \n 3`):
+	// the statement's own 'for' line is the NUMERIC for's rule
+	fline := sline(stmt)
+	if len(stmt.Exprs) > 0 {
+		fline = stmt.Exprs[0].Line()
+	}
 
 	// the FOR block (stock forstat enterblock, isbreakable — break finds
 	// this block's endlabel through the body block's labelNoJump)
@@ -2289,13 +2404,24 @@ func compileGenericForStmt(context *funcContext, stmt *ast.GenericForStmt) { // 
 	// U5a: rgen is the REGISTER of the first control slot (TFOR* A
 	// operands) — RegTop at the registrations, not their flat indices
 	rgen := context.RegTop()
-	context.RegisterLocalVar("(for state)")
-	context.RegisterLocalVar("(for state)")
-	context.RegisterLocalVar("(for state)")
+	idxgen := [3]int{
+		context.RegisterLocalVar("(for state)"),
+		context.RegisterLocalVar("(for state)"),
+		context.RegisterLocalVar("(for state)"),
+	}
 
 	compileRegAssignment(context,
 		[]string{"(for state)", "(for state)", "(for state)", "(for state)"},
 		stmt.Exprs, context.RegTop()-3, 4, sline(stmt))
+
+	// U5f (stock forlist): the three "(for state)" windows start where
+	// adjustlocalvars(3) runs — after the explist's code, at the pc
+	// OP_TFORPREP is about to occupy.
+	for _, idx := range idxgen {
+		if info := context.dbgInfoAt(idx); info != nil {
+			info.StartPc = code.LastPC() + 1
+		}
+	}
 
 	// stock marktobeclosed: the closing variable's scope is the loop
 	// block itself (the internal slot has no pool entry, so the
@@ -2305,7 +2431,7 @@ func compileGenericForStmt(context *funcContext, stmt *ast.GenericForStmt) { // 
 	context.NeedsClose = true
 	context.tbcActive++
 
-	code.AddABx(OP_TFORPREP, rgen, 0, sline(stmt))
+	code.AddABx(OP_TFORPREP, rgen, 0, fline)
 	preppc := code.LastPC()
 	bodypc := code.LastPC() + 1
 
@@ -2325,9 +2451,9 @@ func compileGenericForStmt(context *funcContext, stmt *ast.GenericForStmt) { // 
 	context.LeaveBlock()
 
 	tfcallpc := code.LastPC() + 1
-	code.AddABC(OP_TFORCALL, rgen, 0, nnames, sline(stmt))
+	code.AddABC(OP_TFORCALL, rgen, 0, nnames, fline)
 	tflpc := code.LastPC() + 1
-	code.AddABx(OP_TFORLOOP, rgen, tflpc+1-bodypc, sline(stmt))
+	code.AddABx(OP_TFORLOOP, rgen, tflpc+1-bodypc, fline)
 
 	// the FOR block closes AFTER TFORLOOP — emitted on the normal loop
 	// exit only; TFORLOOP's jump back lands above it
@@ -2538,11 +2664,23 @@ func compileExpr(context *funcContext, reg int, expr ast.Expr, ec *expcontext) i
 		compileFunctionExpr(childcontext, ex, ec)
 		protono := len(context.Proto.FunctionPrototypes)
 		context.Proto.FunctionPrototypes = append(context.Proto.FunctionPrototypes, childcontext.Proto)
-		code.AddABx(OP_CLOSURE, sreg, protono, sline(ex))
+		// U5f: stock emits OP_CLOSURE when the expression is discharged to
+		// a register — after body() consumed the closing `end` — so the
+		// instruction carries ls->lastline = the `end` line (LastLine,
+		// == LastLineDefined), not the `function` keyword's line (db.lua's
+		// local-function trace battery: CLOSURE@end is the chunk's first
+		// traced line)
+		code.AddABx(OP_CLOSURE, sreg, protono, eline(ex))
 		// capture descriptors live in the child proto (stock Upvaldesc);
 		// marking the defining block's RefUpvalue drives OP_CLOSE
 		// emission as the old pseudo-instructions did
 		for _, upvalue := range childcontext.Upvalues.List() {
+			// stock singlevaraux caps captures at MAXUPVAL (255) per
+			// function (luaY_checklimit "upvalues"; errors.lua:768's
+			// 127+127+battery)
+			if len(childcontext.Proto.Upvalues) >= maxUpvalues {
+				raiseErrorLimit(childcontext, maxUpvalues, "upvalues")
+			}
 			localidx, block := context.FindLocalVarAndBlock(upvalue.Name)
 			if localidx > -1 {
 				// U5b (stock singlevaraux's capture arm, lparser.c): an
@@ -2713,7 +2851,8 @@ func compileFunctionExpr(context *funcContext, funcexpr *ast.FunctionExpr, ec *e
 	context.Proto.LineDefined = sline(funcexpr)
 	context.Proto.LastLineDefined = eline(funcexpr)
 	if len(funcexpr.ParList.Names) > maxRegisters {
-		raiseCompileError(context, context.Proto.LineDefined, "register overflow")
+		// stock: params are locals (adjustlocalvars' MAXVARS check)
+		raiseErrorLimit(context, maxRegisters, "local variables")
 	}
 	context.Proto.NumParameters = uint8(len(funcexpr.ParList.Names))
 	if ec.ctype == ecMethod {
@@ -2733,27 +2872,40 @@ func compileFunctionExpr(context *funcContext, funcexpr *ast.FunctionExpr, ec *e
 		// so the slot is register np — the extras' first cell in the
 		// hidden layout, the vararg table's cell in the table layout.
 		context.Proto.IsVarArg = VarArgHidden
+		// VARARGPREP is every vararg proto's first instruction (stock
+		// setvararg: A=0,0,0 — the runtime reads numparams from the
+		// proto). U5b: the interpreter runs it for real — hidden model
+		// copies the fixed params above the extra arguments, table model
+		// (a promoted function) builds {1..n, n=n} into the param slot.
+		// U5f ordering (stock parlist): the params register BEFORE
+		// setvararg codes OP_VARARGPREP, the vararg entry AFTER it —
+		// StartPc 0 for the params, 1 for the vararg — so the locals
+		// live at pc 0 are exactly the parameters (debug.getlocal over a
+		// non-active function never answers "(vararg table)" or the
+		// named vararg, db.lua:269's assert).
+		//
+		// U5f: stock codes VARARGPREP at ls->lastline — the `function`
+		// token's line for a body (== LineDefined), but the lexer's
+		// INIT lastline (1) for the main chunk, whose setvararg runs
+		// before the first token is read (db.lua:124's trace battery:
+		// the line-0 event LineDefined would fire is not stock's)
+		vline := context.Proto.LineDefined
+		if context.Parent == nil {
+			vline = 1
+		}
+		context.Code.AddABC(OP_VARARGPREP, 0, 0, 0, vline)
 		if name := funcexpr.ParList.VArgName; name != "" {
 			context.RegisterLocalVarKind(name, varKindVararg)
 		} else if context.Parent != nil {
+			// mainfunc exception (stock lparser.c): the main chunk calls
+			// setvararg directly — VARARGPREP but no locvar AND no
+			// reserved slot, so main's locals start at register 0 like
+			// stock's main proto. That keeps DbgLocals' entry order ==
+			// register order, which varinfo's localNameAt(reg+1)
+			// convention depends on ("(local 'x')" hints). The unnamed
+			// slot is unreferenceable anyway (no name to resolve).
 			context.RegisterLocalVar(varargTableName)
 		}
-		// mainfunc exception (stock lparser.c): the main chunk calls
-		// setvararg directly — VARARGPREP but no locvar AND no
-		// reserved slot, so main's locals start at register 0 like
-		// stock's main proto. That keeps DbgLocals' entry order ==
-		// register order, which varinfo's localNameAt(reg+1)
-		// convention depends on ("(local 'x')" hints). The unnamed
-		// slot is unreferenceable anyway (no name to resolve).
-	}
-	// VARARGPREP is every vararg proto's first instruction (stock
-	// setvararg: A=0,0,0 — the runtime reads numparams from the proto).
-	// U5b: the interpreter runs it for real — hidden model copies the
-	// fixed params above the extra arguments, table model (a promoted
-	// function) builds {1..n, n=n} into the param slot. Non-vararg protos
-	// emit nothing.
-	if context.Proto.IsVarArg != 0 {
-		context.Code.AddABC(OP_VARARGPREP, 0, 0, 0, context.Proto.LineDefined)
 	}
 	// the root block's entry level: parameters (+ the vararg slot) only
 	context.Block.entryNactvar = context.BlockLocalVarsCount()
@@ -2766,13 +2918,32 @@ func compileFunctionExpr(context *funcContext, funcexpr *ast.FunctionExpr, ec *e
 	// the __close dispatch (funcnamefromcode's RETURN arm — traceback
 	// frames "in metamethod 'close'", locals.lua:544)
 	retstmt := &ast.ReturnStmt{}
-	retstmt.SetLine(eline(funcexpr))
-	retstmt.SetLastLine(eline(funcexpr))
+	rline := eline(funcexpr)
+	if context.Parent == nil {
+		// U5f: stock's close_func codes the implicit return at ls->lastline
+		// — the line of the LAST CONSUMED TOKEN. For a function that is
+		// its `end` (eline's value — getinfo 'L' pins it: the activelines
+		// set includes the `end` line, getinfo01.lua). The main chunk is
+		// the exception: mainfunc's check(EOS) consumes the EOF token
+		// BEFORE close_func, so lastline still holds the last REAL
+		// token's line (the parser records the EOF line itself as the
+		// chunk's eline, one past a trailing newline) — pinning that one
+		// fired a phantom line event at the hook seam (stock fires none:
+		// changedline says same line). No statements at all: lastline is
+		// the lexer's init 1 (nothing was consumed before EOS)
+		if n := len(funcexpr.Stmts); n > 0 {
+			rline = eline(funcexpr.Stmts[n-1])
+		} else {
+			rline = 1
+		}
+	}
+	retstmt.SetLine(rline)
+	retstmt.SetLastLine(rline)
 	compileReturnStmt(context, retstmt)
 	// extendToClose: the final RETURN (just emitted) closes this
 	// function's tbc variables — its __close dispatch is the last
 	// instruction that must still see the locals
-	context.EndScope(true)
+	context.EndScope()
 	context.finishFunctionGotos()
 	// U5b (stock luaK_finish, the vararg half): the deferred finalization,
 	// run only now — a promoting use or <close> declaration may follow an
@@ -3041,8 +3212,9 @@ func compileArithmeticOpExpr(context *funcContext, reg int, expr *ast.Arithmetic
 	}
 	expr, _ = exp.(*ast.ArithmeticOpExpr)
 	a := savereg(ec, reg)
-	lhs, reg2 := compileConstOperand(context, expr.Lhs, reg, true)
-	rhs, rnext := compileConstOperand(context, expr.Rhs, reg2, true)
+	lhs, reg2, lsingle := compileConstOperand(context, expr.Lhs, reg, true)
+	infixLine(context, lhs, lsingle, sline(expr))
+	rhs, rnext, _ := compileConstOperand(context, expr.Rhs, reg2, true)
 	emitArith(context, a, lhs, rhs, arithOpForOperator(expr.Operator), rnext, sline(expr))
 } // }}}
 
@@ -3130,8 +3302,9 @@ func compileUnaryOpExpr(context *funcContext, reg int, expr ast.Expr, ec *expcon
 // cond != k → skip it).
 func compileRelationalOpExprAux(context *funcContext, reg int, expr *ast.RelationalOpExpr, flip int, label int) { // {{{
 	code := context.Code
-	lhs, reg2 := compileConstOperand(context, expr.Lhs, reg, false)
-	rhs, rnext := compileConstOperand(context, expr.Rhs, reg2, false)
+	lhs, reg2, lsingle := compileConstOperand(context, expr.Lhs, reg, false)
+	infixLine(context, lhs, lsingle, sline(expr))
+	rhs, rnext, _ := compileConstOperand(context, expr.Rhs, reg2, false)
 	line := sline(expr)
 
 	// (a > b) <=> (b < a); (a >= b) <=> (b <= a) — swap the operand
@@ -3786,7 +3959,7 @@ func patchCode(context *funcContext) { // {{{
 	// maxstacksize; conflating them rejected legal 200-local chunks as soon as
 	// an expression needed a temp above register 200 (goto.lua:411).
 	if maxreg > maxFuncRegisters {
-		raiseCompileError(context, context.Proto.LineDefined, "register overflow(too many local variables)")
+		raiseErrorLimit(context, maxFuncRegisters, "registers")
 	}
 	context.Proto.NumUsedRegisters = uint8(maxreg)
 } // }}}

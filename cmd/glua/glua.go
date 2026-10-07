@@ -141,7 +141,10 @@ Available options are:
 		}
 		argtb := L.NewTable()
 		// the standalone surface: arg[0] = script name, arg[1..n] = CLI
-		// args — the same table the wasm engine seeds for a -W run
+		// args — the same table the wasm engine seeds for a -W run.
+		// (U5f note: this is the standalone interpreter's argv table,
+		// which stock 5.5 keeps; it is NOT the 5.1 vararg 'arg' that
+		// U5b removed from function bodies)
 		L.RawSet(argtb, lua.LNumber(0), lua.LString(script))
 		for i := 1; i < nargs; i++ {
 			L.RawSet(argtb, lua.LNumber(i), lua.LString(flag.Arg(i)))

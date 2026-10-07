@@ -174,16 +174,18 @@ func findSetReg(p *FunctionProto, lastpc, reg int) int {
 }
 
 // localNameAt — stock luaF_getlocalname over DbgLocals: the name of the
-// localnum'ts (1-based) active local at pc. The fork records StartPc =
-// the first active pc and EndPc = the LAST active pc, so stock's
-// half-open [startpc, endpc) is the closed [StartPc, EndPc] here.
+// localnum'th (1-based) active local at pc. U5f: the windows are stock's
+// half-open [StartPc, EndPc) — StartPc the pc of the local's initializing
+// instruction, EndPc one past its block's last instruction (the compiler's
+// EndScope = fs->pc analog) — and a local is visible at BOTH boundaries'
+// start (startpc <= pc < endpc, stock's exact tests).
 func localNameAt(p *FunctionProto, localnum, pc int) (string, bool) {
 	for i := 0; i < len(p.DbgLocals); i++ {
 		lv := p.DbgLocals[i]
 		if lv.StartPc > pc {
 			break
 		}
-		if pc <= lv.EndPc {
+		if pc < lv.EndPc {
 			localnum--
 			if localnum == 0 {
 				return lv.Name, true

@@ -15,7 +15,11 @@ type LNumber float64
 
 const LNumberBit = 64
 const LNumberScanFormat = "%f"
-const LuaVersion = "Lua 5.1"
+// U5f: _VERSION re-pinned to the 5.5 core the engine now implements
+// (the 5.2→5.5 program, U1..U5) — a script feature-detecting on it
+// must see the integer/float split, _ENV, and the 5.5 libraries.
+// _GOPHER_LUA_VERSION keeps the implementation identity.
+const LuaVersion = "Lua 5.5"
 
 var LuaPath = "LUA_PATH"
 var LuaLDir string

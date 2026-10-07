@@ -733,3 +733,65 @@ history, this file's status log); memory; delete `testdiff/u5probe_test.go`.
   the whole testdiff package no longer fits go-test's default 10m (it got through every
   gate and died to the alarm mid-TestWazeroSpike; the spike itself passes standalone in
   1.2s) — run `go test ./testdiff/ -timeout 45m` for the full suite.
+
+- **U5f (2026-10-07) — U5 COMPLETE.** Corpora + gates + ledger + closeout (ledger rows
+  87–91); the exit gate (§5) is met. **U5f-1 string.dump + binary load (row 25 closes)**:
+  `dump.go` — the dumper/undumper pair over the stock 5.5.1 format (signature/version/
+  format/LUAC_DATA/size checks, per-proto linedefined..debug block, LUA_VNUM_INT vs
+  VNUM_FLT kept distinct, `string.dump(f, true)`'s stripped shape). An undumped empty
+  source is indistinguishable from stock's NULL → `FunctionProto.SourceIsNull`, with the
+  NULL-source renderings db.lua pins: source `=?`/short_src `?`, `?:?:` prefixes, getinfo
+  'l' −1, a line hook firing with nil line. load/loadfile parity: the binary dispatch,
+  the mode texts, the **absent-vs-explicit-nil env** rule (absent seeds the registry
+  globals into upvalue #1, explicit nil seeds nil — a Go-nil interface through
+  `loadEnvArg`/`newMainFunction`, which also ports f_parser's `luaF_initupvals` and the
+  dumped-non-main upvalue order), reader-function chunks under the protected parser
+  (`reader function must return a string` at the caller's empty position), NUL-truncated
+  string chunknames, and the parser-limit texts (bare `C stack overflow`; errorlimit's
+  returns/locals/registers/upvalues — position diverges, texts pinned by find-booleans).
+  Covering cases `_u5/{dump01,load01,limits01}.lua`. **U5f-2a the sethook machinery**
+  (row 88): per-thread hook state (a fresh coroutine inherits nothing), events as callR
+  bodies over a `Hooked` frame (CIST_HOOKED names the hook's own frame `("?", "hook")`),
+  CALL at the callee's first instruction (vararg protos defer to OP_VARARGPREP),
+  RETURN before the results move, COUNT before LINE, LINE = luaG_traceexec over
+  thread-global oldpc; the transfer windows (call (1,numparams|NArgs), return
+  (firstres−LocalBase+1, nres)); the **suspended-call replay** (db.lua:827 — PendRet/
+  PendBase record the interrupted call's window; the main-loop entry replays poscall and
+  fires the pending RETURN); getregistry + the `_HOOKKEY` hook-table mirror; gmatch's
+  iterator returns ONE value (db.lua:739). **U5f-2b the position/name battery** (row 89):
+  getlocal-0's n>0 guard, `(temporary)`/`(C temporary)`, the HALF-open local windows with
+  their StartPc re-pins (vararg protos at pc 1, `(for state)` at FORPREP, localfunc after
+  its CLOSURE — db.lua:269/:695/:515), negative-n → findvararg, negative-level rejection
+  (`level out of range` — the old bottom-frame fallback made setlocal(−1,1,10) succeed),
+  Go-closure upvalues addressable as name "" (:597), `(no name)` for stripped protos
+  (:972), luaL_traceback's port (LEVELS1/2 split, tail-call lines, pushfuncname's
+  loaded-path arm — issues.lua's traceback battery re-pinned to the 5.5 dialect,
+  `[C]: in global 'error'`, no `[G]: ?` tail; `_cli-tests` err1 golden regenerated), and
+  the store/statement line rules: assignment tail, lhs infix-discharge at the operator
+  line, comparison operator line, blockTailLine, CLOSURE@end, the implicit-return line,
+  and **funcstat's `luaK_fixline`** (compileFuncDefStmt re-lines the final store to the
+  statement's FIRST line — errors.lua:433's `function a.x.y()` over a table-valued `a`
+  errors at the SETFIELD pinned to line 1; the bug only showed under the full-file state,
+  isolated repros passed on both engines). `_VERSION` → "Lua 5.5" (config.go;
+  `_GOPHER_LUA_VERSION` keeps the implementation identity; no corpus/banner dependency —
+  audited); cmd/glua's argv `arg` table documented as the standalone surface (NOT the
+  U5b-removed vararg `arg`). **U5f-2c the GC surface over Go's collector** (row 90):
+  `gc.go` — `__gc` finalizers (`syncFinalizer` at SetMetatable, enqueue-on-the-finalizer-
+  goroutine, `drainFinalizers` at the stock drain points incl. the VM's NEWTABLE/CONCAT/
+  CLOSURE seams and collectgarbage and Close, `runFinalizer` under CIST_FIN naming
+  `("__gc", "metamethod")` with luaE_warnerror's stderr warning) + **weak tables** —
+  row 79's interp-side durable fix pulled in from U7+ because coroutine.lua
+  (required-green) needs value-weak clearing: collectgarbage("collect") runs runtime.GC()
+  then a mark-from-Lua-roots/clear-weak-entries walk. Ruled residuals (row 90's list):
+  full-collection-only semantics (closure.lua:39 hangs), the finalization-phase ordering
+  (gc.lua:316), register residue above ci->top (gc.lua:340), no generational mode
+  (gengc.lua:122) — the three files' skip reasons re-pinned to it. **U5f-3** cstack.lua
+  carried as a row-78e skip (the handler-itself-overflows dialect; calls.lua:168 green).
+  **U5f-4 closeout**: TestU5OfficialSuite (SuiteFlags engines, u5SuiteSkips =
+  clua55Skips + rows 78e/79, u5RequiredGreen asserted, ≥95% + required-green enforced) —
+  **26/26 = 100%**; the `_u5` corpus complete at 29 cases ×{interp↔clua55, interp↔wasm,
+  interp↔wazero}; `u5probe_test.go` + the dbg/loc scratch drivers deleted. Gates at
+  close: TestU5Gate/TestU5WasmGate/TestU5WazeroGate, TestU1Gate/TestU2Gate/
+  TestU2fMatrixOracle/TestU2fErrorOracle, TestCLuaConformance/TestCLua55Conformance,
+  TestWasmFullMatrix/TestWasmErrorSuite/TestWasmGluaFull, `go test -short ./...`,
+  `_cli-tests` ×{wasmtime, WAZERO=1} — all green.

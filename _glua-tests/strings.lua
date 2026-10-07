@@ -2,7 +2,7 @@
 local ok, msg = pcall(function()
   string.dump()
 end)
-assert(not ok and string.find(msg, "GopherLua does not support the string.dump"))
+assert(not ok and string.find(msg, "bad argument #1 to 'dump'"))
 assert(string.find("","aaa") == nil)
 -- U5a closeout re-pin (row 80): stock add_s — a non-digit after '%' in a
 -- replacement raises (the old fork copied it through literally)
