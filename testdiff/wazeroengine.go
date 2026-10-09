@@ -38,6 +38,10 @@ import (
 
 func u32[T int32 | int | uint32](v T) uint64 { return uint64(uint32(v)) }
 
+// deadlineFlagLE is the watchdog's single store: 1 as 4 little-endian
+// bytes, the encoding of rt_ctrl_addr()'s g_deadline_flag (U6b, row 37).
+var deadlineFlagLE = []byte{1, 0, 0, 0}
+
 // NewRunEngine returns the wasm-backend engine for the standalone runners
 // (glua -W, luawasm-run): the wasmtime differential oracle by default, or
 // the wazero production engine (ledger row 32 — one blob, two hosts) when
@@ -231,10 +235,12 @@ func (e *WazeroEngine) Run(c Case) (log []string) {
 		return f.Call(ctx, args...)
 	}
 
-	// M6d (D3): the memlimit block is v3-only until U6 (row 60); refuse
-	// rather than run uncapped.
+	// U6b (rows 36/93, M6d D3 back on ABI v4): the per-VM allocation cap
+	// — before lnewstate, so the whole VM lifetime counts.
 	if e.MaxMem > 0 {
-		return []string{"ENGINE-ERROR\tmemlimit is not on the ABI v4 blob until U6 (row 60)"}
+		if _, err := call(rtInst, "rt_set_memlimit", u32(int32(e.MaxMem))); err != nil {
+			return []string{"ENGINE-ERROR\trt_set_memlimit: " + err.Error()}
+		}
 	}
 
 	L, err := call(rtInst, "lnewstate")
@@ -300,10 +306,19 @@ func (e *WazeroEngine) Run(c Case) (log []string) {
 		return []string{"ENGINE-ERROR\tframe: " + err.Error()}
 	}
 
-	// U2e: the deadline watchdog is v3-only until U6 (row 60) — the v4
-	// blob has no rt_ctrl_addr/rt_deadline block.
+	// U6b (row 37, the M6d D4 watchdog back on ABI v4): a bare 4-byte
+	// store into the linear memory at the control-block flag (wazero's
+	// Memory.Write is a plain buffer copy; no engine state touched, safe
+	// off-thread). The guest's basic-block-transition polls raise
+	// rt_deadline's ordinary error.
 	if e.Deadline > 0 {
-		return []string{"ENGINE-ERROR\tdeadline is not on the ABI v4 blob until U6 (row 60)"}
+		if a, err := call(rtInst, "rt_ctrl_addr"); err == nil {
+			flagAddr := uint32(a[0])
+			timer := time.AfterFunc(e.Deadline, func() {
+				_ = mem.Write(flagAddr, deadlineFlagLE)
+			})
+			defer timer.Stop()
+		}
 	}
 
 	status, err := call(scriptInst, "lua_main", frame[0])

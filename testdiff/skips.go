@@ -118,10 +118,19 @@ var ledgeredErrSkips = map[string]string{
 
 // skipRtSurfacesUntilU6: the row-59 retirement window closed with the
 // U2e backend rewrite (the wasm/wazero gates run on the ABI v4
-// lua55_rt.wasm blob). What still waits is the U6 runtime-cutover tail:
-// rt_sandbox, the memlimit/deadline block, and the 5.1 prod-blob flavor
-// are v3-only surfaces (row 60) — the gates over them stay skipped
-// until the prod blob moves to the 5.5 tree.
+// lua55_rt.wasm blob), and U6b landed the memlimit/deadline block on it
+// (rows 36/37 re-pinned, row 93 for the 5.5 emergency-GC ruling). What
+// still waits is rt_sandbox and the 5.1 prod-blob flavor — v3-only
+// surfaces (row 60) whose gates stay skipped until U6c/U6d.
 func skipRtSurfacesUntilU6(t *testing.T) {
-	t.Skip("rt sandbox/memlimit/deadline + prod-blob surfaces are v3-only until the U6 cutover — ledger row 60")
+	t.Skip("rt sandbox + prod-blob surfaces are v3-only until the U6 cutover — ledger row 60")
+}
+
+// skipProdBlobUntilU6d: the prod flavor is still the 5.1 lua51_prod.wasm
+// blob (v3 ABI), which cannot host v4-compiled modules (row 60) — the
+// m6d gates' wazero-prod legs wait for the 5.5 prod flavor (U6d). The
+// engine entries stay visible so U6d re-arms them by deleting these
+// guards alone.
+func skipProdBlobUntilU6d(t *testing.T) {
+	t.Skip("the prod blob is 5.1/v3 and cannot host v4 modules until the 5.5 prod flavor — ledger row 60, U6d")
 }

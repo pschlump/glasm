@@ -98,6 +98,7 @@ type backend struct {
 	chunkName  string
 	imports    map[string]uint32
 	gKCells    uint32 // mutable global: constants cells base
+	gDeadline  uint32 // mutable global: the deadline flag's address (U6b)
 	protos     []protoInfo
 	protoIdx   map[*lua.FunctionProto]int // proto → dispatch index
 	protoFuncs []*wasm.Function           // dispatch idx → wasm function
@@ -288,10 +289,36 @@ func (b *backend) declareImports() {
 		"rt_tail_nargs":    m.ImportFunc("rt", "rt_tail_nargs", nil, i32v),
 		"rt_tail_funcell":  m.ImportFunc("rt", "rt_tail_funcell", nil, i32v),
 		"rt_tail_restage":  m.ImportFunc("rt", "rt_tail_restage", nil, i32v),
+		"rt_ctrl_addr":     m.ImportFunc("rt", "rt_ctrl_addr", nil, i32v),
+		"rt_deadline":      m.ImportFunc("rt", "rt_deadline", nil, i32v),
 	}
 	b.gKCells = m.GlobalI32(0, true)
 	m.ExportGlobal("gKCells", b.gKCells)
+	b.gDeadline = m.GlobalI32(0, true)
 	m.ImportMemory("rt", "memory", 1, 0)
+}
+
+// emitDeadlinePoll (U6b, row 37 — the M6d D4 design, design A5): load the
+// host-owned deadline flag and, when the host has expired the run, raise
+// through rt_deadline — rt_deadline stages the error and always returns
+// RT_ERR, so this returns -1 (the ABI v4 error convention), unwinding the
+// frame chain exactly like any rt_* error (pcall can catch it; the flag
+// stays sticky so the next back edge re-raises). Emitted at (i) every
+// proto's flattened dispatch-loop header — once per basic-block
+// transition, the v3 granularity: calls do NOT split blocks, so a
+// pcall-catch followed by straight-line statements inside one block
+// completes without re-raising (the m6d catch leg), while any loop's
+// back edge re-polls (the reraise leg) — and (ii) lua_dispatch's
+// tail-restage loop (tail-call chains never touch a basic block; the
+// rt's own restage loop polls the flag directly for the ABI-level
+// chains).
+func (b *backend) emitDeadlinePoll(f *wasm.Function) {
+	f.GlobalGet(b.gDeadline)
+	f.I32Load(0)
+	f.If(wasm.Void)
+	f.Call(b.imp("rt_deadline")).Drop()
+	f.I32Const(-1).Return()
+	f.End()
 }
 
 // emitInit writes luawasm_init: interns the global constant pool into a
@@ -327,6 +354,11 @@ func (b *backend) emitInit() {
 	f.I32Const(int32(strBytes)).Call(b.imp("rt_frame_alloc")).LocalSet(lS)
 	f.I32Const(int32(cellSize * total)).Call(b.imp("rt_frame_alloc")).LocalSet(lK)
 	f.LocalGet(lK).GlobalSet(b.gKCells)
+	// U6b: cache the deadline control-block address BEFORE the step gate —
+	// the poll sites read it on every basic-block transition, and a step<2
+	// debug init must not leave gDeadline at 0 (a poll of linear-memory
+	// base+0 could read nonzero data and raise spuriously).
+	f.Call(b.imp("rt_ctrl_addr")).GlobalSet(b.gDeadline)
 	f.I32Const(0).LocalSet(lC)
 
 	// staged by the step parameter (0 = allocs only, 1 = +chunkname,
@@ -427,6 +459,9 @@ func (b *backend) emitDispatch() {
 	n := len(b.protos)
 
 	f.Loop(wasm.Void) // $again — the M5c restage target
+	// U6b (row 37): the restage loop is an unbounded back edge with no
+	// basic blocks of its own (tail-call chains) — poll it directly.
+	b.emitDeadlinePoll(f)
 	for i := 0; i <= n; i++ {
 		f.Block(wasm.Void)
 	}

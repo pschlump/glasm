@@ -61,6 +61,9 @@
 #include "lua55/src/lua.h"
 #include "lua55/src/lauxlib.h"
 #include "lua55/src/lualib.h"
+#ifdef LUA_RT_FLAVOR
+#include "rt_abi55.h" /* rt_alloc — the budget allocator (U6b, rows 36/93) */
+#endif
 
 /* ---- host imports ---- */
 
@@ -330,8 +333,14 @@ static void install_shims(lua_State *L) {
 }
 
 /* the default allocator (mirrors lauxlib.c's luaL_alloc: realloc+free;
-   free(NULL) is valid, realloc(ptr,0) frees) — the budget-tracking rt_alloc
-   arrives with the ABI v4 port (U6) */
+   free(NULL) is valid, realloc(ptr,0) frees). The ORACLE flavor keeps
+   it — the oracle must not grow a budget (TestCLua55Conformance memory
+   posture). The RT flavor (LUA_RT_FLAVOR, build55.sh) switches to the
+   budget-tracking rt_alloc (rt_abi55.c, U6b rows 36/93): the host arms
+   it with rt_set_memlimit BEFORE this entry so the whole VM lifetime
+   counts; a refusal rides stock LUA_ERRMEM as the bare pcall-catchable
+   "not enough memory". Both flavors link this file; only build55.sh's
+   RT leg defines the macro, so the oracle blob preprocessor-identical. */
 static void *d_alloc(void *ud, void *ptr, size_t osize, size_t nsize) {
   (void)ud; (void)osize;
   if (nsize == 0) {
@@ -353,7 +362,11 @@ int32_t lnewstate(void) {
      fixed non-zero seed walks off that ladder immediately (42 = the
      harness's canonical seed). The math random seed is pinned separately
      at build time (-Dluai_makeseed, build55.sh). */
+#ifdef LUA_RT_FLAVOR
+  lua_State *L = lua_newstate(rt_alloc, NULL, 42);
+#else
   lua_State *L = lua_newstate(d_alloc, NULL, 42);
+#endif
   if (L == NULL) return 0;
   luaL_openlibs(L);
   install_shims(L);

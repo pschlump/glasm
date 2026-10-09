@@ -423,3 +423,34 @@ SharedVMSerialization, OneScriptLaw, EventSink; `CGO_ENABLED=0 go build ./host/`
   the e001 residual); RT-NATIVE55 extended for the layout ×3 sanitizers; prior gates re-run.
   Ledger rows 86 + 61(d) + 92 updated; note/u6a-implemented.md. Next: U6b (budget alloc +
   deadline block on v4).
+
+- **U6b COMPLETE (2026-10-08)** — rows 36/37 re-pinned on ABI v4; **row 93 NEW** (the 5.5
+  emergency-GC divergence + the positionless-literal crossing rule). The v3 surface ported:
+  `rt_set_memlimit`/`rt_mem_used_bytes`/`rt_alloc` (the budget chokepoint + one-time 64KiB
+  emergency slack, re-armed at rt_err_clear/rt_set_state) and the deadline block
+  (`rt_ctrl_addr`/`rt_set_deadline`/`rt_deadline_flag`/`rt_deadline`) in rt_abi55.c; the RT
+  flavor's `lnewstate` builds with `rt_alloc` (`#ifdef LUA_RT_FLAVOR` — the oracle blob
+  preprocessor-identical and verified BYTE-IDENTICAL after the rebuild); build55.sh exports the
+  six new entries (rt_alloc not exported, as v3). Backend: `emitDeadlinePoll` (global.get/
+  i32.load/if → rt_deadline/return −1) at every proto's flattened dispatch-loop head — the
+  v3 block-TRANSITION granularity (calls do not split blocks: pcall-catch + same-block tail
+  completes, every back edge re-polls) — plus `lua_dispatch`'s restage loop and
+  `rtw_dispatch_body`'s C-side restage loop (ABI-level tail chains); `gDeadline` cached from
+  `rt_ctrl_addr()` before the step gate. Engines un-refused: MaxMem → `rt_set_memlimit`
+  before lnewstate; Deadline → the watchdog word store (wasmtime `UnsafeData` slice /
+  wazero `mem.Write(deadlineFlagLE)`), both the v3 shapes verbatim. **Row 93's find:** 5.5's
+  `luaM_realloc_` retries a refusal via `tryagain` → `luaC_fullgc(L,1)`, and `cantryagain`
+  is `completestate && !gcstopem` — NOT gcstp-gated — so under the row-61 freeze the
+  emergency sweep frees every wasm-cell-held object exactly when rt_alloc refuses. Fix:
+  `gcstopem=1` in rt_set_state (durable: cycles never start under GCSTPGC; reallocstack
+  save/restores it). Second find (the m6d tailspin gate): v3 kept `err_prefixed` sticky
+  across the C-land crossing; v4's rtw_reraise clears there, so the deadline's no-position
+  verdict died and the catching rt_run prefixed "chunk:2: " — `stage_tvalue` now recognizes
+  the positionless literals by content (seterrorobj's two + the deadline text). Skips:
+  `skipRtSurfacesUntilU6` re-scoped to sandbox+prod (m6c/m6cdet keep it), the 7 m6d gates
+  un-skipped with the wazero-prod legs on a new `skipProdBlobUntilU6d`. Gates: m6d
+  ×{wasmtime,wazero} green (prod skipped); RT-NATIVE55 extended (memlimit + deadline
+  batteries; `cpcall55` — 5.5 retired lua_cpcall) ×3 sanitizers; matrix/error/glua +
+  U1/U2/U2f + CLua55Conformance over the rebuilt blob; `_cli-tests` ×{wasmtime, WAZERO=1};
+  50M-iteration poll spot-check sub-second. Ledger row 93; note/u6b-implemented.md.
+  Next: U6c (sandbox surface on v4).

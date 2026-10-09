@@ -40,7 +40,6 @@ func errorLines(log []string) []string {
 // ε is asserted against a generous hard bound (2s) and reported; the
 // measured value lives in note/m6d-implemented.md (ledger row 37).
 func TestM6dDeadlineKill(t *testing.T) {
-	skipRtSurfacesUntilU6(t)
 	const d = 80 * time.Millisecond
 	src := "local i=0\nwhile true do i=i+1 end\n"
 	engines := []struct {
@@ -58,6 +57,9 @@ func TestM6dDeadlineKill(t *testing.T) {
 	}
 	for _, tc := range engines {
 		t.Run(tc.name, func(t *testing.T) {
+			if tc.name == "wazero-prod" {
+				skipProdBlobUntilU6d(t)
+			}
 			log, dt := dlCase(tc.e, "m6d_deadline.lua", src)
 			if dt > d+2*time.Second {
 				t.Errorf("kill took %v (deadline %v) — watchdog/poll failed", dt, d)
@@ -90,7 +92,6 @@ func TestM6dDeadlineKill(t *testing.T) {
 // TestM6dDeadlineTailSpin: an infinite tail-call chain never touches a
 // basic block — the lua_dispatch restage-loop poll is what kills it.
 func TestM6dDeadlineTailSpin(t *testing.T) {
-	skipRtSurfacesUntilU6(t)
 	const d = 80 * time.Millisecond
 	src := "local function f() return f() end\nf()\n"
 	for _, tc := range []struct {
@@ -118,7 +119,6 @@ func TestM6dDeadlineTailSpin(t *testing.T) {
 // completion, and a later back edge re-raises (the flag is sticky: no
 // livelock, no progress past the deadline).
 func TestM6dDeadlineCatchable(t *testing.T) {
-	skipRtSurfacesUntilU6(t)
 	const d = 60 * time.Millisecond
 	catch := `
 local ok, err = pcall(function() local i=0 while true do i=i+1 end end)
@@ -169,7 +169,6 @@ local i=0 while true do i=i+1 end
 // the run byte-identical to an unarmed one (the flag stays 0; the poll
 // is pure overhead on the happy path).
 func TestM6dDeadlineUnfired(t *testing.T) {
-	skipRtSurfacesUntilU6(t)
 	src := "local s=0 for i=1,100000 do s=s+i end print(s)\n"
 	for _, e := range []Engine{
 		&WasmEngine{name: "w", Deadline: time.Hour},
@@ -216,10 +215,12 @@ func oomEngines(cap int64) []struct {
 // bounded in time. The interp cannot produce this surface (Go's
 // allocator cannot refuse), so the text is pinned absolutely.
 func TestM6dMemCap(t *testing.T) {
-	skipRtSurfacesUntilU6(t)
 	src := "local t={} for i=1,1000000 do t[i]=string.rep(\"x\",4096) end print(\"done\",#t)\n"
 	for _, tc := range oomEngines(512 * 1024) {
 		t.Run(tc.name, func(t *testing.T) {
+			if tc.name == "wazero-prod" {
+				skipProdBlobUntilU6d(t)
+			}
 			start := time.Now()
 			log := tc.e.Run(Case{Name: "m6d_oom.lua", Dir: ".", Source: []byte(src)})
 			dt := time.Since(start)
@@ -248,7 +249,6 @@ func TestM6dMemCap(t *testing.T) {
 // keeps running (the emergency slack lets the error machinery finish;
 // the catch re-arms the refusal — ledger row 36).
 func TestM6dMemCapCatchable(t *testing.T) {
-	skipRtSurfacesUntilU6(t)
 	src := `
 local t = {}
 local ok, err = pcall(function() for i=1,1000000 do t[i] = string.rep("x", 4096) end end)
@@ -257,6 +257,9 @@ print("still alive", type(string.rep("y", 3)))
 `
 	for _, tc := range oomEngines(512 * 1024) {
 		t.Run(tc.name, func(t *testing.T) {
+			if tc.name == "wazero-prod" {
+				skipProdBlobUntilU6d(t)
+			}
 			log := tc.e.Run(Case{Name: "m6d_oomcatch.lua", Dir: ".", Source: []byte(src)})
 			var prints []string
 			for _, l := range log {
@@ -283,10 +286,12 @@ print("still alive", type(string.rep("y", 3)))
 // defense. Proves a single non-returning C path is bounded by the cap
 // (the deadline's documented blind spot).
 func TestM6dMemCapSingleCall(t *testing.T) {
-	skipRtSurfacesUntilU6(t)
 	src := "print(#string.rep(\"x\", 512*1024*1024))\n"
 	for _, tc := range oomEngines(2 * 1024 * 1024) {
 		t.Run(tc.name, func(t *testing.T) {
+			if tc.name == "wazero-prod" {
+				skipProdBlobUntilU6d(t)
+			}
 			start := time.Now()
 			log := tc.e.Run(Case{Name: "m6d_bigone.lua", Dir: ".", Source: []byte(src)})
 			if dt := time.Since(start); dt > 10*time.Second {

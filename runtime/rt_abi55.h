@@ -24,8 +24,10 @@
 **     v3's rt_pcall_caught hook in luaD_pcall.
 **
 ** Not in tranche 1 (U6, plan §4 U2d): rt_sandbox / globals lockdown, the
-** budget alloc + deadline block, the host-fn seam, the error()-position
-** line-stack. LUA_RT_ABI bumps on ANY signature/semantic change; the
+** host-fn seam, the error()-position line-stack. (The budget alloc +
+** deadline block landed at U6b — rows 36/37 re-pinned on v4; row 93 rules
+** the 5.5 emergency-GC divergence.) LUA_RT_ABI bumps on ANY
+** signature/semantic change; the
 ** backend refuses to emit against a mismatched module.
 */
 
@@ -204,6 +206,25 @@ int32_t rt_frame_alloc(int32_t bytes);
 
 /* raising from emitted code (message + the chunk:line position prefix) */
 void rt_error(rt_addr msgptr, int32_t msglen, int32_t line);
+
+/* U6b (rows 36/37, ledger row 93): the per-VM allocation cap + the
+   deadline control block — the v3 surface ported onto the 5.5 tree.
+   rt_set_memlimit is init-time (call BEFORE lnewstate: state, stdlib,
+   shims, pool and script all count); rt_alloc is the lua_newstate
+   allocator (the RT flavor's lnewstate passes it; not a wasm import);
+   rt_mem_used_bytes clamps to INT32_MAX. The deadline entries: the host
+   arms g_deadline_flag via a single aligned 4-byte store of 1 at
+   rt_ctrl_addr() from a watchdog (the one safe off-thread crossing —
+   the blob declares a memory max, so the base never moves); the
+   backend's dispatch-loop polls call rt_deadline, which stages the
+   pcall-catchable "context deadline exceeded" (no position — row 37). */
+void rt_set_memlimit(int32_t bytes);
+int32_t rt_mem_used_bytes(void);
+void *rt_alloc(void *ud, void *ptr, size_t osize, size_t nsize);
+rt_addr rt_ctrl_addr(void);
+void rt_set_deadline(int32_t on);
+int32_t rt_deadline_flag(void);
+int32_t rt_deadline(void);
 
 /* globals */
 int32_t rt_getglobal(rt_addr dstcell, rt_addr keycell, int32_t line);

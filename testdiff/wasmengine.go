@@ -438,12 +438,13 @@ func (e *WasmEngine) Run(c Case) (log []string) {
 		return f.Call(store, args...)
 	}
 
-	// M6d (D3): the per-VM allocation cap — before lnewstate, so the
-	// state, stdlib, shims, constant pool and script all count. The
-	// memlimit block is v3-only until U6 (row 60); refusing keeps a
-	// silent no-op from masquerading as protection.
+	// U6b (rows 36/93, M6d D3 back on ABI v4): the per-VM allocation cap
+	// — before lnewstate, so the state, stdlib, shims, constant pool and
+	// script all count; the whole VM lifetime runs through rt_alloc.
 	if e.MaxMem > 0 {
-		return []string{"ENGINE-ERROR\tmemlimit is not on the ABI v4 blob until U6 (row 60)"}
+		if _, err := call(rtInst, "rt_set_memlimit", int32(e.MaxMem)); err != nil {
+			return []string{"ENGINE-ERROR\trt_set_memlimit: " + err.Error()}
+		}
 	}
 
 	scriptMod, err := wt.NewModule(engine, bin)
@@ -507,11 +508,24 @@ func (e *WasmEngine) Run(c Case) (log []string) {
 		return []string{"ENGINE-ERROR\tframe: " + err.Error()}
 	}
 
-	// U2e: the deadline watchdog is v3-only until U6 (row 60) — the v4
-	// blob has no rt_ctrl_addr/rt_deadline block. Deadlines on the v4
-	// blob arrive with the U6 hardening pass.
+	// U6b (row 37, the M6d D4 watchdog back on ABI v4). wasmtime Stores
+	// are !Sync — the only safe off-thread crossing is a bare aligned
+	// word store into the linear memory: the blob declares a memory max,
+	// so wasmtime maps it statically (the base never moves) and the slice
+	// captured here on the main goroutine stays valid. The guest's
+	// basic-block-transition polls read the flag and raise rt_deadline's
+	// ordinary (pcall-catchable) error.
 	if e.Deadline > 0 {
-		return []string{"ENGINE-ERROR\tdeadline is not on the ABI v4 blob until U6 (row 60)"}
+		if a, err := call(rtInst, "rt_ctrl_addr"); err == nil {
+			flagAddr := uint32(toI32(a))
+			memBase := guestMem.UnsafeData(store)
+			timer := time.AfterFunc(e.Deadline, func() {
+				// 4-byte little-endian 1 — one aligned store
+				b := memBase[flagAddr : flagAddr+4 : flagAddr+4]
+				b[0], b[1], b[2], b[3] = 1, 0, 0, 0
+			})
+			defer timer.Stop()
+		}
 	}
 
 	status, err := call(scriptInst, "lua_main", frame)

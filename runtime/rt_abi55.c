@@ -128,6 +128,10 @@ static void rtw_reraise(lua_State *L);
 static TValue err_value;
 static char err_buf[1024];
 static int err_buf_len, err_pending, err_prefixed;
+static int rt_oom_inflight; /* U6b: the memlimit block's one-time slack
+                               flag — tentative here so the re-arms in
+                               rt_err_clear/rt_set_state (above it in the
+                               file) see it */
 
 /* the raise line for the host's error-position rendering (M8 surface
    kept); the FIRST staging of an in-flight error wins */
@@ -166,11 +170,27 @@ static void stage_tvalue(const TValue *ev) {
        the tbc error path stages several objects back-to-back without an
        rt_err_clear between them (the in-flight error, then a failing
        __close's replacement), so a stale flag from the previous staging
-       would suppress the position on the next one (U4f). */
+       would suppress the position on the next one (U4f).
+       U6b (row 37): the positionless literals — stock seterrorobj's
+       ERRMEM/ERRERR texts and rt_deadline's cancellation text — carry
+       their raisers' "no position" verdict IN THE CONTENT. v3 kept the
+       flag sticky across the C-land crossing (its adapter never cleared
+       the staging); v4 clears at the crossing (rtw_reraise — the
+       zero-patch rt_pcall_caught), so a re-staged bare literal must be
+       re-recognized here or the catching rt_run prefixes it (the
+       tail-spin deadline fired under an OP_CALL site and gained
+       "chunk:2: " — the m6d tailspin gate). A script's own
+       error("not enough memory") is unaffected: error()'s level-1 raise
+       prefixes the value BEFORE it ever stages, so the bare literal only
+       occurs when the positionless machinery built it. */
     err_prefixed = 0;
     if (chunk_name_len > 0 && err_buf_len > chunk_name_len &&
         memcmp(err_buf, chunk_name, (size_t)chunk_name_len) == 0 &&
         err_buf[chunk_name_len] == ':')
+      err_prefixed = 1;
+    else if (strcmp(err_buf, "not enough memory") == 0 ||
+             strcmp(err_buf, "error in error handling") == 0 ||
+             strcmp(err_buf, "context deadline exceeded") == 0)
       err_prefixed = 1;
   } else {
     err_prefixed = 1; /* non-string: the engine renders the value */
@@ -225,6 +245,7 @@ void rt_err_clear(void) {
   err_line_set = 0;
   err_prefixed = 0;
   setnilvalue(&err_value);
+  rt_oom_inflight = 0; /* U6b: a consumed OOM re-arms the refusal */
   rt_sea_nopos_set(0); /* U5e: the verdict is per-staging */
   rt_sea_msgh_ran_set(0); /* row 85: no in-flight error anymore */
 }
@@ -351,6 +372,22 @@ void rt_set_state(rt_addr p) {
      the same surface unobservable). The U6 arena retires this freeze
      with real rooting. */
   G(curL)->gcstp |= GCSTPGC;
+  /* U6b (row 93): also stop EMERGENCY collections. 5.5's luaM_realloc_
+     retries a failed allocation after luaC_fullgc(L,1) (lmem.c tryagain
+     — gated only by completestate+!gcstopem, NOT by gcstp), and fullinc
+     runs unconditionally: under the freeze a full mark-and-sweep from
+     the real roots would free every object held only from wasm cells
+     (the pool/frames are not GC roots) the moment rt_alloc refuses —
+     exactly the corruption the freeze exists to prevent, on the OOM
+     path the cap makes routine. 5.1 (v3's tree) raised LUA_ERRMEM
+     straight from the NULL return, which is why this hazard is new.
+     gcstopem=1 turns 5.5's path into 5.1's: tryagain declines, the
+     callers luaM_error, the refusal surfaces as the catchable
+     "not enough memory". Nothing clears it: the collector never runs a
+     cycle under GCSTPGC (lgc.c clears gcstopem only at cycle ends), and
+     ldo.c's closeprotected save/restores OUR value. */
+  G(curL)->gcstopem = 1;
+  rt_oom_inflight = 0; /* U6b: fresh activation re-arms the cap refusal */
   rt_rp_n = 0; /* row 85: no protects of ours survive a state reset */
 }
 
@@ -760,6 +797,135 @@ int32_t rt_forprep(rt_addr cells, int32_t line) {
 int32_t rt_frame_alloc(int32_t bytes) {
   void *p = malloc((size_t)bytes);
   return (int32_t)(size_t)p;
+}
+
+/* ---- U6b (rows 36/37, ledger row 93): the per-VM allocation cap ----
+**
+** rt_alloc replaces the driver's plain realloc shim (the RT flavor's
+** lnewstate builds the state with lua_newstate(rt_alloc, NULL)): every
+** Lua-object byte passes through here, so a budget check at the
+** chokepoint converts runaway allocation into a clean LUA_ERRMEM ("not
+** enough memory") — an ordinary pcall-catchable Lua error, never a trap
+** (design §6.4/§8.6, m6 plan D3; the v3 port verbatim-in-spirit).
+**
+** rt_set_memlimit is an init-time hook (per-VM lifetime, not per-run):
+** the host calls it BEFORE lnewstate, so the whole VM — stdlib open,
+** shims, constant pool, script — counts against the budget. It zeroes
+** the used counter (calling it mid-lifetime undercounts live blocks;
+** frees clamp at 0, so accounting stays monotone-safe either way).
+**
+** Emergency slack: a refusal sets rt_oom_inflight, and while it is set,
+** allocations up to limit+RT_MEM_EMERGENCY still pass. Without it the
+** OOM raise would dead-end — the ERRMEM recovery interns the message
+** string through the same allocator ("not enough memory"; our
+** stage_c_error does too); refusing THAT would recurse the error
+** machinery into error handling. The slack is one-time: the used
+** counter keeps counting, so a catch-and-retry loop gains at most
+** RT_MEM_EMERGENCY bytes total over the limit. rt_err_clear and
+** rt_set_state clear the flag so the next over-limit allocation
+** re-refuses (v4 has no rt_pcall_caught — rtw_reraise's rt_err_clear at
+** the C-land crossing IS the catch hook).
+**
+** The interp oracle has NO counterpart surface: Go's allocator cannot
+** refuse (SetMx watches runtime stats and os.Exit(3)s — not catchable),
+** so the OOM text is pinned absolutely, not diffed (ledger row 36).
+** Non-Lua allocations (rt_frame_alloc's malloc, frame chunks) bypass the
+** cap by design — bounded by the depth guard and restored per frame; the
+** linear-memory max (build55.sh --max-memory) is the second, coarser
+** backstop: memory.grow failure makes malloc fail → the same clean path.
+*/
+static int64_t rt_mem_limit, rt_mem_used;
+static int rt_oom_inflight;
+#define RT_MEM_EMERGENCY (64 * 1024)
+
+void rt_set_memlimit(int32_t bytes) {
+  rt_mem_limit = bytes > 0 ? (int64_t)bytes : 0;
+  rt_mem_used = 0;
+  rt_oom_inflight = 0;
+}
+
+int32_t rt_mem_used_bytes(void) {
+  return rt_mem_used > 0x7fffffffLL ? 0x7fffffff : (int32_t)rt_mem_used;
+}
+
+void *rt_alloc(void *ud, void *ptr, size_t osize, size_t nsize) {
+  void *np;
+  (void)ud;
+  if (nsize == 0) {
+    free(ptr);
+    rt_mem_used -= (int64_t)osize;
+    if (rt_mem_used < 0) rt_mem_used = 0; /* frees of pre-limit blocks */
+    return NULL;
+  }
+  if (rt_mem_limit > 0 && nsize > osize) {
+    int64_t cap =
+        rt_oom_inflight ? rt_mem_limit + RT_MEM_EMERGENCY : rt_mem_limit;
+    if (rt_mem_used + (int64_t)(nsize - osize) > cap) {
+      rt_oom_inflight = 1; /* → luaM_realloc_ raises LUA_ERRMEM */
+      return NULL;
+    }
+  }
+  np = realloc(ptr, nsize);
+  if (np == NULL) {
+    if (rt_mem_limit > 0) rt_oom_inflight = 1; /* real exhaustion: same path */
+    return NULL;
+  }
+  rt_mem_used += (int64_t)nsize - (int64_t)osize; /* signed: shrinks subtract */
+  return np;
+}
+
+/* ---- U6b (row 37): the deadline control block ----
+**
+** g_deadline_flag is host-written and guest-polled. The host arms it
+** when the run's deadline expires — either by calling rt_set_deadline
+** (main thread) or, from a watchdog goroutine, a single 4-byte
+** little-endian store of 1 at rt_ctrl_addr() (wasm engines cannot take
+** API calls off-thread; an aligned word store into linear memory is the
+** one safe crossing — the blob declares a memory max, so the base never
+** moves under wasmtime's static memories). The backend emits a
+** load-and-branch against it at every flattened dispatch-loop head and
+** at the lua_dispatch restage loop (and rtw_dispatch_body's own restage
+** loop below polls it directly — the ABI-level tail chains that never
+** re-enter the backend's loop); a set flag → rt_deadline stages an
+** ordinary Lua error (pcall-catchable, like the OOM raise).
+**
+** The flag is sticky for the run: a script can pcall-catch the deadline
+** error, but its next back edge re-raises — no livelock, no progress.
+** Fresh-VM-per-run resets it by construction (hosts may rt_set_deadline
+** (0) to disarm). Polling is cooperative: a single non-returning C call
+** (a giant string.rep) never sees a poll — the alloc cap bounds those.
+*/
+int32_t g_deadline_flag;
+
+rt_addr rt_ctrl_addr(void) { return (rt_addr)(size_t)&g_deadline_flag; }
+
+void rt_set_deadline(int32_t on) { g_deadline_flag = on ? 1 : 0; }
+
+int32_t rt_deadline_flag(void) { return g_deadline_flag; }
+
+/* rt_deadline: stage the deadline error and refuse — the emitted poll
+   returns -1 on it, so the error unwinds the wasm frame chain exactly
+   like any rt_* error; the adapter re-raises and pcall can catch. Body
+   text matches the interp oracle's cancellation message byte-for-byte
+   (mainLoopWithContext raises ctx.Err() — "context deadline exceeded"
+   for a deadline context); the position prefix diverges (the poll site
+   has no line info; interp's raise rides an instruction boundary) —
+   ruled in ledger row 37, carried here unchanged. */
+int32_t rt_deadline(void) {
+  if (!err_pending) {
+    if (curL != NULL) {
+      stage_str_error("context deadline exceeded", 1); /* prefixed: no pos */
+    } else { /* exported entry, no state set: buffer-only staging */
+      static const char msg[] = "context deadline exceeded";
+      size_t n = sizeof msg - 1;
+      setnilvalue(&err_value);
+      memcpy(err_buf, msg, n + 1);
+      err_buf_len = (int)n;
+      err_prefixed = 1;
+      err_pending = 1;
+    }
+  }
+  return RT_ERR;
 }
 
 /* ---- raising from emitted code ---- */
@@ -1750,6 +1916,15 @@ static void rtw_dispatch_body(lua_State *L, void *ud) {
     c->frame = rt_disp_frame; /* adopt this level's latest restage */
     rt_disp_frame = saved_df;
     if (c->nret != RTW_TAIL) break;
+    /* U6b (row 37): the restage loop is an unbounded back edge the
+       backend's own poll may never see (ABI-level tail chains) — poll
+       the control-block flag directly and map it to the same staged
+       deadline error. Mirrors the wasm-side poll in lua_dispatch. */
+    if (g_deadline_flag) {
+      rt_deadline();
+      c->nret = RTW_ERR;
+      break;
+    }
     /* M5c restage: a fresh frame push at the same adapter level */
     c->frame = rt_tail_restage();
     c->idx = rt_tail_clidx();

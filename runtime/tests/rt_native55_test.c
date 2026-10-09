@@ -215,6 +215,30 @@ static int dostring_msg(lua_State *L, const char *src, const char **msg) {
   return 0;
 }
 
+/* U6b: cpcall55 — 5.5 retired lua_cpcall; the protected-C-call idiom is
+   pushcfunction + pcall (the batteries' bodies need no argument upvalue:
+   the OOM payload rides a file-static). */
+static int cpcall55(lua_State *L, lua_CFunction fn) {
+  lua_settop(L, 0);
+  lua_pushcfunction(L, fn);
+  return lua_pcall(L, 0, 0, 0);
+}
+
+/* M6d (D3) bodies: allocation-hungry work under protection — an
+   unprotected ERRMEM would abort the test; the point is that it is
+   CATCHABLE */
+static const char *g_oom_payload;
+
+static int oom_body(lua_State *L) {
+  lua_pushlstring(L, g_oom_payload, 200 * 1024); /* over the 64 KiB cap */
+  return 1;
+}
+
+static int small_body(lua_State *L) {
+  lua_pushliteral(L, "fits");
+  return 1;
+}
+
 int main(void) {
   TValue c[16];
   rt_addr cc[16];
@@ -1188,6 +1212,69 @@ int main(void) {
       int32_t h3 = rt_hint_put((rt_addr)(uintptr_t)" (global 'g')", 13);
       CHECK(h1 >= 0 && h2 == h1 + 1 && h3 == h2 + 1);
     }
+  }
+
+  /* ---- U6b (rows 36/93, M6d D3): the allocation cap ---- */
+  {
+    /* A capped state: creation succeeds, allocation over the budget
+       refuses, the refusal raises a catchable LUA_ERRMEM carrying the
+       bare "not enough memory" (seterrorobj's literal, no position), and
+       the retry still refuses (a 200 KiB ask exceeds even the emergency
+       slack cap of limit+64 KiB — the refusal is not per-catch). 5.5
+       nuance vs the v3 battery: the failed alloc first runs tryagain's
+       emergency fullgc on M (gcstopem is 0 on this plain stock state —
+       the rt blob's rt_set_state pins it for the WASM-cells hazard, row
+       93); from M's real roots that is exactly stock behavior, then the
+       retry refuses again. */
+    static char big[200 * 1024];
+    lua_State *M;
+    memset(big, 'x', sizeof big);
+    g_oom_payload = big;
+    rt_set_memlimit(64 * 1024);
+    M = lua_newstate(rt_alloc, NULL, 42);
+    CHECK(M != NULL); /* state + core structs fit the budget */
+    CHECK(cpcall55(M, oom_body) == LUA_ERRMEM);
+    CHECK(lua_isstring(M, -1));
+    CHECK(strcmp(lua_tostring(M, -1), "not enough memory") == 0);
+    lua_pop(M, 1);
+    /* still over budget (and over the slack cap) → still refused */
+    CHECK(cpcall55(M, oom_body) == LUA_ERRMEM);
+    lua_pop(M, 1);
+    /* small allocations keep working at/under the cap (slack-eligible) */
+    CHECK(cpcall55(M, small_body) == 0);
+    CHECK(rt_mem_used_bytes() > 0);
+    /* unbounded again */
+    rt_set_memlimit(0);
+    CHECK(cpcall55(M, oom_body) == 0);
+    lua_close(M);
+    /* rt_set_memlimit is process-global (engines create one VM per
+       instance — the documented posture); zeroed here for the rest of
+       the suite. It also re-arms rt_oom_inflight. */
+    rt_set_memlimit(0);
+  }
+
+  /* ---- U6b (row 37, M6d D4): the deadline control block ---- */
+  {
+    char buf[64];
+    rt_set_deadline(0);
+    CHECK(rt_deadline_flag() == 0);
+    CHECK(rt_ctrl_addr() != 0);
+    /* the watchdog contract: a bare 4-byte store at rt_ctrl_addr() */
+    *(int32_t *)(uintptr_t)rt_ctrl_addr() = 1;
+    CHECK(rt_deadline_flag() == 1);
+    CHECK(rt_deadline() == RT_ERR);
+    CHECK(rt_err_pending() == 1);
+    {
+      int32_t n = rt_err_stage_copy((rt_addr)(uintptr_t)buf, sizeof buf);
+      CHECK(n == (int32_t)strlen("context deadline exceeded"));
+      buf[n] = '\0'; /* stage_copy copies err_buf_len bytes, no NUL */
+      CHECK(strcmp(buf, "context deadline exceeded") == 0);
+    }
+    /* sticky: rt_deadline never re-stages over a pending error */
+    CHECK(rt_deadline() == RT_ERR);
+    rt_err_clear();
+    rt_set_deadline(0);
+    CHECK(rt_deadline_flag() == 0);
   }
 
   CHECK(rt_wasm_count() == IDX_TAILVA + 1);

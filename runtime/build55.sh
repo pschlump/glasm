@@ -111,6 +111,9 @@ RT_EXPORTS="$EXPORTS \
   -Wl,--export=rt_close -Wl,--export=rt_close_err \
   -Wl,--export=rt_wasm_push_frame -Wl,--export=rt_frame_cursor \
   -Wl,--export=rt_frame_restore \
+  -Wl,--export=rt_set_memlimit -Wl,--export=rt_mem_used_bytes \
+  -Wl,--export=rt_ctrl_addr -Wl,--export=rt_set_deadline \
+  -Wl,--export=rt_deadline_flag -Wl,--export=rt_deadline \
   -Wl,--export=rt_tail_stage -Wl,--export=rt_tail_clidx \
   -Wl,--export=rt_tail_nargs -Wl,--export=rt_tail_funcell \
   -Wl,--export=rt_tail_restage"
