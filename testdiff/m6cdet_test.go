@@ -129,10 +129,9 @@ print(math.random())
 // TestM6cTwiceRunIsolation: two fresh VMs running the same mutating script
 // must produce byte-identical logs INCLUDING the GLOBALS serialization (the
 // §8.6 memory-diff of the globals; DiffLogs drops GLOBALS by contract, so
-// the raw logs are compared directly). U6c: a prod determinism leg —
-// re-armed at U6d with lua55_prod.wasm.
+// the raw logs are compared directly). U6d (row 95): the prod determinism
+// leg re-armed on lua55_prod.wasm.
 func TestM6cTwiceRunIsolation(t *testing.T) {
-	skipProdBlobUntilU6d(t)
 	src := `
 G = {}
 for i = 1, 100 do G["k"..i] = i * 2 end
@@ -144,7 +143,7 @@ print(side, t.marker, G.k7, math.random(1, 1000))
 `
 	var runs [][]string
 	for i := 0; i < 2; i++ {
-		e := &WazeroEngine{name: fmt.Sprintf("iso%d", i), RtBin: lua51ProdWasm, Sandbox: true}
+		e := &WazeroEngine{name: fmt.Sprintf("iso%d", i), RtBin: lua55ProdWasm, Sandbox: true}
 		runs = append(runs, e.Run(Case{Name: "isolation.lua", Dir: ".", Source: []byte(src)}))
 	}
 	if !equalLogs(runs[0], runs[1]) {

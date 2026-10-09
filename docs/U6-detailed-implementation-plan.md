@@ -486,3 +486,46 @@ SharedVMSerialization, OneScriptLaw, EventSink; `CGO_ENABLED=0 go build ./host/`
   full matrix/error/glua + U1/U2/U2f + CLua55Conformance + m6d over the rebuilt blob (oracle
   byte-identical, sha re-pinned); `_cli-tests` ×{wasmtime, WAZERO=1}. Ledger row 94;
   note/u6c-implemented.md. Next: U6d (lua55_prod.wasm flavor).
+
+- **U6d COMPLETE (2026-10-09)** — **row 95 NEW** (the zero-patch prod-surface design:
+  linit55.c, the -D'd write macros, the preemption symbol set, the base_funcs-retention
+  reasoning); rows 33/34 re-pinned COMPLETE on the 5.5 tree. `lua55_prod.wasm` (273,644 B)
+  lands as the third build55.sh leg, zero patches to lua55/src/: **(a) the source set** —
+  PROD55_SRC drops liolib/loslib/loadlib/ldblib AND linit.c (stock's stdlibs table
+  references the four excluded luaopen_* — v3 patched linit.c with guards inside the 5.1
+  vendored tree; the zero-patch 5.5 tree drops the file from the link instead).
+  **(b) `runtime/linit55.c`** defines **`luaL_openselectedlibs`** — 5.5's luaL_openlibs is
+  a MACRO over it (lualib.h:62), so the one real symbol serves every caller, no
+  interposition, no duplicate — with stock's mask loop verbatim over the six-lib table in
+  stock order minus skipped rows (base, coroutine, math, string, table, utf8 — pairs-order
+  stability), then nils dofile/load/loadfile/warn (+require, defensively) after base
+  opens. luaL_requiref needs no package lib (_LOADED is registry-lazy). lbaselib still
+  REGISTERS the loaders (base_funcs is data-referenced by luaopen_base) — the nils are the
+  observable equivalent, and rt_sandbox(1) on this blob finds all nine §4.5 names absent,
+  returning 0 (the belt-and-suspenders contract; the Frozen/Matrix gates prove the
+  observable _G ≡ dev+sandbox). **(c) zero-wasi, cheap half** — build55.sh `-D`'s
+  lua_writestring/lua_writeline/lua_writestringerror to EMPTY: lbaselib's print and
+  lauxlib's panic/warn reference no fwrite/fflush/fprintf at all (g_print carries print on
+  every flavor). **(d) zero-wasi, retained half** — the luaL_loadfilex chain the retained
+  base_funcs keeps alive: luawasm55.c's LUAWASM_PROD block preempts
+  fopen/freopen/fclose/getc/fread/ferror (+ __stdio_exit_needed; the three musl FILE
+  structs as aligned zero-arrays for snprintf's never-executed error branches) — stub
+  bodies never called (the loaders are nil; the driver loads via luaL_loadbuffer).
+  Result on the FIRST link: imports exactly **host.{event,wasm_dispatch}**, zero wasi
+  (U3b retired the RNG imports; M7a's host_call is U6e). **(e) driver guards** — env/os
+  shims, tmpfile, system compile out under LUAWASM_PROD; g_print + the time/clock pins
+  stay (non-static, unreferenced, section-GC'd). Determinism: `-D'luai_makeseed()=0u'` on
+  the prod leg. **(f) engines/gates** — testdiff embeds lua55ProdWasm; `UseProdBlob()`
+  re-points to it; TestM6cProdBlobArtifact is the 5.5 edition (imports/exports/sha
+  232954…0a7/byte-cmp with host/'s copy — the embed-dance drift lock); Surface prod legs
+  ×{wazero, wasmtime}, Frozen re-pinned (26 names — 5.5 base minus the four loader
+  entries + coroutine/string/table/math/utf8 + arg), the 1500-case Matrix (dev-sandbox ≡
+  prod, 228s), m6cdet TwiceRunIsolation, and m6d's four wazero-prod legs all re-armed;
+  **skipProdBlobUntilU6d deleted outright** — no prod gate remains skipped. Oracle +
+  lua55_rt blobs verified byte-identical after the rebuild. The 5.1 prod blob
+  (build.sh/lua51_prod.wasm/testdiff embed) stays built but un-gated until U6e's host
+  cutover retires it. Gates green: artifact/surface/frozen/matrix/isolation/m6d ×3 hosts,
+  RT-NATIVE + RT-NATIVE55 ×3 sanitizers, full battery (matrix/error/glua + U1/U2/U2f +
+  CLua55Conformance), `_cli-tests` ×{wasmtime, WAZERO=1}. Ledger row 95;
+  note/u6d-implemented.md. Next: U6e (the host-package cutover: host/ embeds
+  lua55_prod.wasm, the hostfn seam, retire the 5.1 prod blob).

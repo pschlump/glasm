@@ -57,9 +57,6 @@ func TestM6dDeadlineKill(t *testing.T) {
 	}
 	for _, tc := range engines {
 		t.Run(tc.name, func(t *testing.T) {
-			if tc.name == "wazero-prod" {
-				skipProdBlobUntilU6d(t)
-			}
 			log, dt := dlCase(tc.e, "m6d_deadline.lua", src)
 			if dt > d+2*time.Second {
 				t.Errorf("kill took %v (deadline %v) — watchdog/poll failed", dt, d)
@@ -218,9 +215,6 @@ func TestM6dMemCap(t *testing.T) {
 	src := "local t={} for i=1,1000000 do t[i]=string.rep(\"x\",4096) end print(\"done\",#t)\n"
 	for _, tc := range oomEngines(512 * 1024) {
 		t.Run(tc.name, func(t *testing.T) {
-			if tc.name == "wazero-prod" {
-				skipProdBlobUntilU6d(t)
-			}
 			start := time.Now()
 			log := tc.e.Run(Case{Name: "m6d_oom.lua", Dir: ".", Source: []byte(src)})
 			dt := time.Since(start)
@@ -257,9 +251,6 @@ print("still alive", type(string.rep("y", 3)))
 `
 	for _, tc := range oomEngines(512 * 1024) {
 		t.Run(tc.name, func(t *testing.T) {
-			if tc.name == "wazero-prod" {
-				skipProdBlobUntilU6d(t)
-			}
 			log := tc.e.Run(Case{Name: "m6d_oomcatch.lua", Dir: ".", Source: []byte(src)})
 			var prints []string
 			for _, l := range log {
@@ -289,9 +280,6 @@ func TestM6dMemCapSingleCall(t *testing.T) {
 	src := "print(#string.rep(\"x\", 512*1024*1024))\n"
 	for _, tc := range oomEngines(2 * 1024 * 1024) {
 		t.Run(tc.name, func(t *testing.T) {
-			if tc.name == "wazero-prod" {
-				skipProdBlobUntilU6d(t)
-			}
 			start := time.Now()
 			log := tc.e.Run(Case{Name: "m6d_bigone.lua", Dir: ".", Source: []byte(src)})
 			if dt := time.Since(start); dt > 10*time.Second {

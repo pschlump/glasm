@@ -143,5 +143,60 @@ RT_EXPORTS="$EXPORTS \
 
 cp lua55_rt.wasm ../testdiff/lua55_rt.wasm
 
-ls -la lua55_sjlj.wasm lua55_rt.wasm
+# ---- lua55_prod.wasm: U6d production flavor — zero wasi imports -----
+#
+# Same tree, same driver, same EH dialect and the SAME rt_* export
+# surface as lua55_rt.wasm (plus nothing new); differs by:
+#   -DLUAWASM_PROD        the driver's prod guards (luawasm55.c): the
+#                         env/os shims and tmpfile/system compile out,
+#                         the stdio preemption block compiles in
+#   linit55.c             the prod luaL_openlibs (base minus
+#                         load/dofile/loadfile/warn, coroutine, string,
+#                         table, math, utf8) REPLACES stock linit.c —
+#                         dropped from the source list because its
+#                         stdlibs table references the excluded
+#                         luaopen_{package,io,os,debug}
+#   excluded sources      liolib/loslib/loadlib/ldblib (+linit): even
+#                         dead-referenced, their object-level stdio
+#                         undefineds pull wasi-libc's preopen/stdio
+#                         cluster (row 34's archaeology, v3 precedent)
+#   -D'd write macros     lua_writestring/lua_writeline/
+#                         lua_writestringerror expand to nothing, so
+#                         lbaselib's print and lauxlib's panic/warn
+#                         paths reference no fwrite/fflush/fprintf at
+#                         all (g_print carries print over host.event)
+#   -ffunction-sections   with wasm-ld's default section GC, everything
+#                         unreferenced (the preempted stubs, the
+#                         time/clock pins loslib no longer calls) drops
+#
+# rt_sandbox(1) on this blob finds all nine §4.5 names already absent
+# and returns 0 (belt-and-suspenders — the compiled-out surface IS the
+# lockdown; row 95). The 5.1 prod flavor (build.sh) stays until U6e
+# retires it with the host-package cutover.
+#
+# Determinism: same makeseed pin as the other legs (math.random seeds
+# at build time — the m6cdet isolation gate runs on this blob).
+
+PROD55_SRC=$(ls lua55/src/*.c | grep -v -e /liolib.c -e /loslib.c -e /loadlib.c -e /ldblib.c -e /linit.c)
+
+"$CC" --sysroot="$SYSROOT" \
+  $CFLAGS \
+  -D'luai_makeseed()=0u' \
+  -D'lua_writestring(s,l)=' \
+  -D'lua_writeline()=' \
+  -D'lua_writestringerror(s,p)=' \
+  $RT_EXPORTS \
+  -Wl,--allow-multiple-definition \
+  -DLUA_RT_FLAVOR -DLUAWASM_PROD \
+  -ffunction-sections -fdata-sections \
+  -o lua55_prod.wasm luawasm55.c rt_abi55.c rt_seam55.c ltable_stock55.c linit55.c $PROD55_SRC
+
+cp lua55_prod.wasm ../testdiff/lua55_prod.wasm
+# the host package embeds its own copy at U6e (go:embed cannot cross
+# package dirs); cp keeps the two from drifting (the SHA pin in the
+# artifact gate is the second lock).
+mkdir -p ../host
+cp lua55_prod.wasm ../host/lua55_prod.wasm
+
+ls -la lua55_sjlj.wasm lua55_rt.wasm lua55_prod.wasm
 exit 0

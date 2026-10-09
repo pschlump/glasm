@@ -2,7 +2,6 @@ package testdiff
 
 import (
 	"path/filepath"
-	"testing"
 )
 
 // CorpusSkips is the single source of truth for ledgered corpus skips,
@@ -116,12 +115,6 @@ var ledgeredErrSkips = map[string]string{
 	"e007.lua": "nil error object renders differently on wasm — row 60 seam (U5 re-pin)",
 }
 
-// skipProdBlobUntilU6d: the prod flavor is still the 5.1 lua51_prod.wasm
-// blob (v3 ABI), which cannot host v4-compiled modules (row 60) — the
-// gates' prod legs wait for the 5.5 prod flavor (U6d). The engine
-// entries stay visible so U6d re-arms them by deleting these guards
-// alone. (U6c deleted skipRtSurfacesUntilU6 outright: the sandbox +
-// globals lockdown run on the dev blob now — ledger row 94.)
-func skipProdBlobUntilU6d(t *testing.T) {
-	t.Skip("the prod blob is 5.1/v3 and cannot host v4 modules until the 5.5 prod flavor — ledger row 60, U6d")
-}
+// skipProdBlobUntilU6d was deleted at U6d (ledger row 95): lua55_prod.wasm
+// shipped and every prod leg runs live — the guards came out of
+// m6c/m6cdet/m6d wholesale. skipRtSurfacesUntilU6 had gone at U6c (row 94).

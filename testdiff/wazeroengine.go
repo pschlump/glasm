@@ -93,10 +93,12 @@ type WazeroEngine struct {
 func NewWazeroEngine(name string) *WazeroEngine { return &WazeroEngine{name: name} }
 
 // UseProdBlob switches the engine to the embedded production blob with the
-// sandbox lockdown — the M6c "wazero-prod" configuration (ledger rows
-// 33-34): zero wasi imports, rt_sandbox(1) globals surface.
+// sandbox lockdown — the U6d "wazero-prod" configuration (ledger rows
+// 33-34 re-pinned, row 95): lua55_prod.wasm (the 5.5 flavor), zero wasi
+// imports, the §4.3 compiled-down surface — rt_sandbox(1) is the
+// belt-and-suspenders no-op returning 0.
 func (e *WazeroEngine) UseProdBlob() {
-	e.RtBin = lua51ProdWasm
+	e.RtBin = lua55ProdWasm
 	e.Sandbox = true
 }
 

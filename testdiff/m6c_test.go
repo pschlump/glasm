@@ -11,8 +11,10 @@ package testdiff
 // the matrix proves dev-blob+sandbox ≡ prod-blob over the full corpus.
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
+	"os"
 	"sort"
 	"strings"
 	"testing"
@@ -20,14 +22,21 @@ import (
 	"github.com/pschlump/golua55/wasm"
 )
 
-// lua51ProdSHA256 pins the embedded prod blob. Rebuild runtime/build.sh →
-// update this constant (the artifact test is the self-check that forces
-// the bump). Brittle by design (A8: checksummed artifact). M7a bump: the
-// hostfn seam (host.host_call import + rt_hostfn/rt_encode_value exports).
-const lua51ProdSHA256 = "4325f355a86e7144c2229e24653f3995f3d9a5caa16e131dae7afc0640b9333f"
+// lua55ProdSHA256 pins the embedded 5.5 prod blob (U6d, row 95).
+// Rebuild runtime/build55.sh → update this constant (the artifact test
+// is the self-check that forces the bump). Brittle by design (A8:
+// checksummed artifact). U6e bumps it: the hostfn seam (host.host_call
+// import + rt_hostfn/rt_encode_value exports).
+const lua55ProdSHA256 = "23295471893353ed32e263b073593981aee4d867da01d2b75c8bb5a0d99ed0a7"
 
+// TestM6cProdBlobArtifact (U6d edition, ledger row 95): lua55_prod.wasm
+// — the 5.5 production flavor of the rt blob. The build's output is
+// self-checking (A8): zero wasi imports (any leak — a vendored edit, a
+// wasi-sdk change — fails here before any engine runs), exactly the two
+// host.* imports the driver declares, the full v4 rt_* export surface,
+// and byte-identity with host/'s copy (the embed dance's drift lock).
 func TestM6cProdBlobArtifact(t *testing.T) {
-	imps, err := wasm.Imports(lua51ProdWasm)
+	imps, err := wasm.Imports(lua55ProdWasm)
 	if err != nil {
 		t.Fatalf("parse prod blob imports: %v", err)
 	}
@@ -39,8 +48,7 @@ func TestM6cProdBlobArtifact(t *testing.T) {
 		}
 		got[im.Name] = true
 	}
-	want := []string{"event", "random01", "randomint", "randomseed", "wasm_dispatch",
-		"host_call"} // M7a: the Lua→Go function seam (redis.call)
+	want := []string{"event", "wasm_dispatch"}
 	for _, w := range want {
 		if !got[w] {
 			t.Errorf("host.%s missing from prod blob (have %v)", w, got)
@@ -50,7 +58,7 @@ func TestM6cProdBlobArtifact(t *testing.T) {
 		t.Errorf("prod blob has %d imports, want exactly the %d host.* ones", len(imps), len(want))
 	}
 
-	exports, err := wasm.Exports(lua51ProdWasm)
+	exports, err := wasm.Exports(lua55ProdWasm)
 	if err != nil {
 		t.Fatalf("parse prod blob exports: %v", err)
 	}
@@ -58,22 +66,39 @@ func TestM6cProdBlobArtifact(t *testing.T) {
 	for _, e := range exports {
 		exp[e.Name] = true
 	}
-	for _, name := range []string{"rt_sandbox", "lnewstate", "ldostring", "lglobals",
-		"rt_set_state", "rt_set_dialect", "rt_abi_version", "rt_frame_alloc", "linbuf", "lnamebuf",
-		// M6d: the cap + deadline surface (ledger rows 36-37)
+	for _, name := range []string{
+		// driver surface
+		"lnewstate", "lclose", "ldostring", "lglobals", "linbuf", "lnamebuf",
+		"lerrlen", "lerrcopy",
+		// ABI v4 core
+		"rt_abi_version", "rt_set_state", "rt_frame_alloc", "rt_settable",
+		"rt_gettable", "rt_arith", "rt_concat", "rt_call_addr", "rt_forprep",
+		"rt_getglobal", "rt_setglobal", "rt_wasm_proto", "rt_newclosure",
+		"rt_varargtab", "rt_close", "rt_wasm_push_frame", "rt_frame_restore",
+		// U6b: the cap + deadline surface (ledger rows 36-37)
 		"rt_set_memlimit", "rt_mem_used_bytes", "rt_ctrl_addr", "rt_set_deadline",
-		// M7a: the hostfn seam + wire result readback
-		"rt_hostfn", "rt_encode_value", "rt_err_line",
-		"rt_deadline_flag", "rt_deadline"} {
+		"rt_deadline_flag", "rt_deadline",
+		// U6c: the lockdown surface (row 94)
+		"rt_sandbox", "rt_protect_globals", "rt_globals_readonly"} {
 		if !exp[name] {
 			t.Errorf("prod blob export %s missing", name)
 		}
 	}
 
-	sum := sha256.Sum256(lua51ProdWasm)
-	if hex.EncodeToString(sum[:]) != lua51ProdSHA256 {
+	sum := sha256.Sum256(lua55ProdWasm)
+	if hex.EncodeToString(sum[:]) != lua55ProdSHA256 {
 		t.Errorf("prod blob checksum %s != pinned %s (stale embed? rebuild + go clean -testcache, then bump the const)",
-			hex.EncodeToString(sum[:]), lua51ProdSHA256)
+			hex.EncodeToString(sum[:]), lua55ProdSHA256)
+	}
+
+	// the host package embeds its own copy (U6e's cutover; go:embed
+	// cannot cross package dirs) — the two must be byte-identical.
+	hostCopy, err := os.ReadFile("../host/lua55_prod.wasm")
+	if err != nil {
+		t.Fatalf("read host copy: %v", err)
+	}
+	if !bytes.Equal(hostCopy, lua55ProdWasm) {
+		t.Error("host/lua55_prod.wasm differs from testdiff's copy — re-run runtime/build55.sh (the copies must move together)")
 	}
 
 	// dev-blob sanity: the parser reads the sjlj blob's wasi imports fine
@@ -100,9 +125,10 @@ func TestM6cSandboxSurface(t *testing.T) {
 	// U6c (ledger row 94): the sandbox surface re-pinned on the 5.5 dev
 	// blob — rt_sandbox(1) nils io os package require dofile loadfile
 	// load debug warn (loadstring/module never existed in 5.5; utf8 and
-	// print stay — m6 plan §4.3's list, 5.5-shaped). The prod legs (same
-	// script on the compile-time-removal flavor) return with U6d's
-	// lua55_prod.wasm.
+	// print stay — m6 plan §4.3's list, 5.5-shaped). U6d (row 95): the
+	// prod legs run the same script on lua55_prod.wasm, where the
+	// surface is COMPILED OUT (linit55.c) — rt_sandbox is the no-op
+	// returning 0 and the observable _G is identical to dev+sandbox.
 	src := `
 local killed = {"io","os","package","require","dofile","loadfile","load","debug","warn"}
 for _, g in ipairs(killed) do
@@ -127,18 +153,14 @@ print(type(string.format("%d", 7)))
 
 	engines := []struct {
 		name string
-		prod bool
 		e    Engine
 	}{
-		{"dev-wazero-sandbox", false, &WazeroEngine{name: "dev-wazero-sandbox", Sandbox: true}},
-		{"prod-wazero", true, &WazeroEngine{name: "prod-wazero", RtBin: lua51ProdWasm, Sandbox: true}},
-		{"prod-wasmtime", true, &WasmEngine{name: "prod-wasmtime", RtBin: lua51ProdWasm, Sandbox: true}},
+		{"dev-wazero-sandbox", &WazeroEngine{name: "dev-wazero-sandbox", Sandbox: true}},
+		{"prod-wazero", &WazeroEngine{name: "prod-wazero", RtBin: lua55ProdWasm, Sandbox: true}},
+		{"prod-wasmtime", &WasmEngine{name: "prod-wasmtime", RtBin: lua55ProdWasm, Sandbox: true}},
 	}
 	for _, tc := range engines {
 		t.Run(tc.name, func(t *testing.T) {
-			if tc.prod {
-				skipProdBlobUntilU6d(t)
-			}
 			log := sandboxCase(t, tc.e, src)
 			var prints []string
 			for _, l := range log {
@@ -242,17 +264,18 @@ print(priv())
 
 // TestM6cSandboxGlobalsFrozen pins the exact _G key set under the prod
 // sandbox — the frozen allowlist (any change to the sandbox surface or the
-// kept libraries is a ledger-row-33 change and must update this constant).
-// U6c: prod-pinned (the 5.1 prod blob list); U6d re-pins it on lua55_prod.
+// kept libraries is a ledger-row-33/95 change and must update this
+// constant). U6d: re-pinned on lua55_prod.wasm — 5.5 base minus the
+// loader entries, plus coroutine/string/table/math/utf8 and the host's
+// arg table.
 func TestM6cSandboxGlobalsFrozen(t *testing.T) {
-	skipProdBlobUntilU6d(t)
 	src := `
 local t = {}
 for k in pairs(_G) do t[#t+1] = k end
 table.sort(t)
 print(table.concat(t, ","))
 `
-	log := sandboxCase(t, &WazeroEngine{name: "prod", RtBin: lua51ProdWasm, Sandbox: true}, src)
+	log := sandboxCase(t, &WazeroEngine{name: "prod", RtBin: lua55ProdWasm, Sandbox: true}, src)
 	var got string
 	for _, l := range log {
 		if strings.HasPrefix(l, "PRINT\t") {
@@ -262,7 +285,7 @@ print(table.concat(t, ","))
 	names := strings.Split(got, ",")
 	sort.Strings(names)
 	gotSorted := strings.Join(names, ",")
-	want := "_G,_VERSION,arg,assert,collectgarbage,coroutine,error,gcinfo,getfenv,getmetatable,ipairs,math,newproxy,next,pairs,pcall,print,rawequal,rawget,rawset,select,setfenv,setmetatable,string,table,tonumber,tostring,type,unpack,xpcall"
+	want := "_G,_VERSION,arg,assert,collectgarbage,coroutine,error,getmetatable,ipairs,math,next,pairs,pcall,print,rawequal,rawget,rawlen,rawset,select,setmetatable,string,table,tonumber,tostring,type,utf8,xpcall"
 	if gotSorted != want {
 		t.Errorf("frozen _G set drifted:\n got  %q\n want %q", gotSorted, want)
 	}
@@ -272,9 +295,9 @@ print(table.concat(t, ","))
 // indistinguishable from the prod blob over the full opcode-matrix corpus
 // (GLOBALS lines are dropped by DiffLogs by contract; no corpus case uses
 // the removed surface outside dead code — see the ledger row 33 notes).
-// U6c: dev-sandbox ≡ prod re-established at U6d (the 5.5 prod flavor).
+// U6d (row 95): re-armed on lua55_prod.wasm — dev-sandbox's nine nils
+// vs the compiled-out surface must be the SAME observable engine.
 func TestM6cSandboxMatrix(t *testing.T) {
-	skipProdBlobUntilU6d(t)
 	cases, err := LoadCorpus("../_wasm-tests")
 	if err != nil {
 		t.Fatalf("load corpus: %v", err)
@@ -283,7 +306,7 @@ func TestM6cSandboxMatrix(t *testing.T) {
 		t.Fatal("empty corpus")
 	}
 	dev := &WazeroEngine{name: "dev-sandbox", Sandbox: true, SkipUnsupported: true}
-	prod := &WazeroEngine{name: "prod-sandbox", RtBin: lua51ProdWasm, Sandbox: true, SkipUnsupported: true}
+	prod := &WazeroEngine{name: "prod-sandbox", RtBin: lua55ProdWasm, Sandbox: true, SkipUnsupported: true}
 	for _, c := range cases {
 		a := dev.Run(c)
 		b := prod.Run(c)

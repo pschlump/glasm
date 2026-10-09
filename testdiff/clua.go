@@ -33,6 +33,18 @@ var lua51SjljWasm []byte
 //go:embed lua51_prod.wasm
 var lua51ProdWasm []byte
 
+// lua55_prod.wasm — U6d (ledger row 95): the 5.5 production flavor of
+// the rt blob. Zero wasi imports (host.{event,wasm_dispatch} only); the
+// library surface is compiled down to the §4.3 allowlist (linit55.c —
+// base minus load/dofile/loadfile/warn, coroutine, string, table,
+// math, utf8) so rt_sandbox(1) finds all nine §4.5 names absent and
+// returns 0. The U6d gates (m6c/m6cdet/m6d prod legs) parse and run
+// this artifact; host/ embeds its own copy (build55.sh keeps them
+// identical — the artifact test's cmp is the drift lock).
+//
+//go:embed lua55_prod.wasm
+var lua55ProdWasm []byte
+
 // value-protocol tags (must match runtime/luawasm.c)
 const (
 	ptNil = iota

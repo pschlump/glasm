@@ -209,8 +209,11 @@ static void emit_globals(lua_State *L) {
   if (off > 0) host_event(EVT_GLOBALS, (int32_t)(size_t)evbuf, off);
 }
 
-/* ---- deterministic environment map for os.getenv/os.setenv ---- */
-
+/* ---- deterministic environment map for os.getenv/os.setenv ----
+** (dev engines only — U6d: prod never opens os, so the shims compile
+** out rather than sit as unused statics referencing the preemption
+** stubs' signatures) */
+#ifndef LUAWASM_PROD
 typedef struct { char *k, *v; } envpair;
 static envpair envmap[8];
 static int envmap_n = 0;
@@ -265,6 +268,7 @@ static int g_setlocale(lua_State *L) {
   }
   return 1;
 }
+#endif /* !LUAWASM_PROD (env + os shims) */
 
 /* ---- the pinned clock: stock os.time/date/clock over a fixed instant --
 **
@@ -284,7 +288,8 @@ clock_t clock(void) { return 0; }
 
 /* os.tmpname: unique per call (files.lua renames tmpname() A to tmpname()
    B — a constant name would make that a rename onto itself); deterministic
-   per module instance */
+   per module instance. Dev engines only (prod: os never opens). */
+#ifndef LUAWASM_PROD
 static int tmpname_counter = 0;
 static int g_tmpname(lua_State *L) {
   char buf[64];
@@ -292,11 +297,14 @@ static int g_tmpname(lua_State *L) {
   lua_pushstring(L, buf);
   return 1;
 }
+#endif /* !LUAWASM_PROD (g_tmpname) */
 
 /* WASI gaps: tmpfile/system are not provided. system returns -1 (only
    main.lua — skipped — exercises os.execute). tmpfile is backed by a
    unique deterministic name in the preopen FS; the engine removes
-   testdiff.tmp* after the run. */
+   testdiff.tmp* after the run. Prod compiles both out (LUAWASM_PROD:
+   tmpfile's fopen and the shims below reference the stdio cluster). */
+#ifndef LUAWASM_PROD
 static int tmpfile_counter = 0;
 FILE *tmpfile(void) {
   char name[64];
@@ -304,6 +312,53 @@ FILE *tmpfile(void) {
   return fopen(name, "w+");
 }
 int system(const char *cmd) { (void)cmd; return -1; }
+#else
+/* ---- U6d prod preemption (row 95, v3's row-34 technique) ----
+**
+** lua55_prod.wasm must import nothing but host.{event,wasm_dispatch}.
+** The 5.5 tree still COMPILES the file paths even with io/os/package/
+** debug excluded and the loader entries nil'd at open: lbaselib's
+** base_funcs table (data-referenced by luaopen_base) retains
+** luaB_load/loadfile/dofile, whose lauxlib luaL_loadfilex chain
+** references fopen/getc/fread/ferror/fclose — and every one of those
+** pulls wasi-libc stdio objects that root fd_* imports in .init_array
+** data or ops-pointer tables that function-level GC cannot drop.
+** Defining the symbols HERE stops the archive pull at link time; the
+** stubs are never called at runtime (no script-facing caller remains:
+** the loader globals are nil, and the driver loads only via
+** luaL_loadbuffer) and the stub sections themselves are GC'd.
+**
+** print/warn/panic writes are cheaper still: build55.sh -D's
+** lua_writestring/lua_writeline/lua_writestringerror to nothing for the
+** prod leg, so lbaselib/lauxlib reference no fwrite/fflush/fprintf at
+** all (g_print carries print over host.event on every flavor).
+**
+** musl's lazy stdio-exit chain and the FILE structs stay preempted as
+** in v3: snprintf's vfprintf references __stderr_FILE & co on error
+** branches prod never executes — zero byte arrays stand in so the real
+** objects (whose initializers embed __stdio_write/__stdio_close ops
+** pointers) stay out of the link.
+*/
+FILE *fopen(const char *path, const char *mode) {
+  (void)path; (void)mode; return NULL;
+}
+FILE *freopen(const char *path, const char *mode, FILE *f) {
+  (void)path; (void)mode; (void)f; return NULL;
+}
+int fclose(FILE *f) { (void)f; return 0; }
+int getc(FILE *f) { (void)f; return -1; }
+size_t fread(void *buf, size_t sz, size_t n, FILE *f) {
+  (void)buf; (void)sz; (void)n; (void)f; return 0;
+}
+int ferror(FILE *f) { (void)f; return 0; }
+void __stdio_exit_needed(void) {}
+/* struct _IO_FILE is opaque in the public header; generous aligned byte
+   arrays stand in for the FILE objects (link-time symbol preemption
+   only — libc indexes into them on error branches prod never runs). */
+char __stderr_FILE[256] __attribute__((aligned(8)));
+char __stdin_FILE[256] __attribute__((aligned(8)));
+char __stdout_FILE[256] __attribute__((aligned(8)));
+#endif /* LUAWASM_PROD */
 
 /* ---- host I/O staging buffers ---- */
 
@@ -316,7 +371,9 @@ int32_t lnamebuf(void) { return (int32_t)(size_t)namebuf; }
 /* ---- exported driver API ---- */
 
 static void install_shims(lua_State *L) {
+#ifndef LUAWASM_PROD
   env_store("PATH", "/bin:/usr/bin");
+#endif
 
   lua_pushcfunction(L, g_print);
   lua_setglobal(L, "print");
@@ -324,12 +381,18 @@ static void install_shims(lua_State *L) {
   /* U3b: no math.random shim on any flavor — stock xoshiro everywhere
      (the D5 host-RNG shim retired; see the host-imports note above). */
 
+#ifndef LUAWASM_PROD
+  /* U6d: the dev engines' deterministic os.* surface. Prod never opens
+     the os lib (linit55.c) — setfield into a nil `os' would raise
+     through the unprotected driver, and the shims below would drag the
+     preempted stdio stubs back into the call graph. */
   lua_getglobal(L, "os");
   lua_pushcfunction(L, g_tmpname);  lua_setfield(L, -2, "tmpname");
   lua_pushcfunction(L, g_getenv);   lua_setfield(L, -2, "getenv");
   lua_pushcfunction(L, g_setenv);   lua_setfield(L, -2, "setenv");
   lua_pushcfunction(L, g_setlocale); lua_setfield(L, -2, "setlocale");
   lua_pop(L, 1);
+#endif
 }
 
 /* the default allocator (mirrors lauxlib.c's luaL_alloc: realloc+free;
