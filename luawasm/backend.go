@@ -255,6 +255,7 @@ func (b *backend) declareImports() {
 		"rt_le":            m.ImportFunc("rt", "rt_le", iiii, i32v),
 		"rt_concat":        m.ImportFunc("rt", "rt_concat", iiiiii, i32v),
 		"rt_call":          m.ImportFunc("rt", "rt_call", iiiiii, i32v),
+		"rt_call_addr":     m.ImportFunc("rt", "rt_call_addr", iiiiii, i32v),
 		"rt_call_count":    m.ImportFunc("rt", "rt_call_count", i32v, i32v),
 		"rt_forprep":       m.ImportFunc("rt", "rt_forprep", ii, i32v),
 		"rt_frame_alloc":   m.ImportFunc("rt", "rt_frame_alloc", i32v, i32v),

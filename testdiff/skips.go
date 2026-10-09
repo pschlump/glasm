@@ -48,19 +48,14 @@ var u5WasmSkips = map[string]string{
 	// the row-60 CClosure seam presentation
 	"getinfo01.lua": "getinfo over the CClosure seam (no `name`, isvararg false) — row 60",
 	"udata01.lua":   "upvalueid identity across the rt-owned upvalue registry — row 60",
-	// the row-86 frame layout (extras above the register window vs
-	// multret destinations that legitimately reach past nregs)
-	"var07.lua":  "call's arg shift clobbers the saved callee at n>=12 (extras-above-window) — row 86",
-	"vgap01.lua": "multret VARARG flush tramples extra[0] (extras-above-window) — row 86",
 	// U5f-1: dump/binary-load. A backend-compiled function is a CClosure
 	// over host.wasm_dispatch on the rt side (row 60's seam) — there is no
 	// L closure, no proto to serialize, so string.dump of one is refused
 	// ("Lua function expected") and the dump/load round trips cannot run.
 	"dump01.lua": "string.dump of a backend-compiled function (a CClosure over the dispatch seam — no rt-side proto) — row 60",
 	"load01.lua": "string.dump of a backend-compiled function (a CClosure over the dispatch seam — no rt-side proto) — row 60",
-	// U5f-1: the 254-value return feeding select's arg window is the row-86
-	// stale-cell shape (the staged tens clobber the callee's register)
-	"limits01.lua": "255-wide multret call window (select('#', loaded()) reads staged tens as the callee) — row 86",
+	// U6a closed row 86 (extras below the window + rt_call_addr): var07/
+	// vgap01/limits01 run on the wasm legs now.
 }
 
 // CorpusSkipsFor was retired with the row-71 seam strip (U5e): the seam

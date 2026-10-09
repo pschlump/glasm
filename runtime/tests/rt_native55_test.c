@@ -98,8 +98,10 @@ enum {
                        the backend's lowering (luaB_error's level-1 where()
                        sees a C frame over the wasm closure — the position
                        comes from rt_run's line parameter) */
-  IDX_TBCRAISE = 16 /* register two tbc cells (ok at [1], failing at [0]),
+  IDX_TBCRAISE = 16,/* register two tbc cells (ok at [1], failing at [0]),
                        then raise — mirrors a compiled body that errors */
+  IDX_TAILVA = 17  /* U6a (row 86): vararg tailcall staged with the BLOCK
+                       operand (window - 16*nv) — the exact-cursor trim */
 };
 
 static TValue g_sum_closure;    /* CClosures over IDX_SUM / IDX_RECURSE */
@@ -169,6 +171,24 @@ int32_t wasm_dispatch_host(int32_t idx, rt_addr frame, rt_addr cl,
       return -1;
     rt_error((rt_addr)(uintptr_t)"orig", 4, 9);
     return -1;
+  }
+  case IDX_TAILVA: {
+    /* U6a (row 86): a vararg frame tailcalls with the callee in place
+       and the args at their natural R(1).. positions, passing the BLOCK
+       address (window - 16*nv, nv = nargs - numparams) as the cursor
+       operand — exactly the backend's varargBase() lowering. The old
+       window operand left `used` 16*nv too high (a per-tail-call
+       leak). */
+    TValue *w = (TValue *)(size_t)frame;
+    int nv = nargs > 1 ? nargs - 1 : 0;
+    rt_addr blk = frame - (rt_addr)sizeof(TValue) * (rt_addr)nv;
+    rt_mkinteger(cell_of(&w[1]), 30); /* the body's staged args */
+    rt_mkinteger(cell_of(&w[2]), 12);
+    if (rt_tail_stage(cell_of(&g_sum_closure),
+                      frame + (rt_addr)sizeof(TValue), 2, blk) < 0)
+      return -1;
+    CHECK(rt_frame_cursor() == blk); /* trimmed to the BLOCK exactly */
+    return RTW_TAIL;
   }
   default:
     return RTW_REFUSED;
@@ -604,6 +624,98 @@ int main(void) {
     }
   }
 
+  /* ---- U6a (row 86(A)): rt_call_addr — callee by address, args at
+     their natural position, results moved down to argcells-16 ---- */
+  {
+    TValue cells[3];
+    {
+      const char *src = "local function add(a,b) return a+b end return add";
+      CHECK(luaL_loadbuffer(L, src, strlen(src), "=test") == 0);
+      CHECK(lua_pcall(L, 0, 1, 0) == 0);
+      cells[0] = *s2v(L->top.p - 1); /* the callee AT R(A), unshifted */
+      rt_mkinteger(cell_of(&cells[1]), 20); /* args at natural R(A+1).. */
+      rt_mkinteger(cell_of(&cells[2]), 22);
+      int32_t st = rt_call_addr(cell_of(&cells[0]), cell_of(&cells[1]), 2, 1,
+                                60, -1);
+      L->top.p--;
+      CHECK(st == RT_OK);
+      CHECK(ttisinteger(&cells[0]) && ivalue(&cells[0]) == 42); /* dst */
+      CHECK(ttisinteger(&cells[1]) && ivalue(&cells[1]) == 20); /* intact */
+    }
+    /* multret: n results land at dst.. and legitimately consume the
+       arg cells (they were copied to the L stack first) */
+    {
+      const char *src2 = "return function(...) return ... end";
+      CHECK(luaL_loadbuffer(L, src2, strlen(src2), "=t2") == 0);
+      CHECK(lua_pcall(L, 0, 1, 0) == 0);
+      cells[0] = *s2v(L->top.p - 1);
+      rt_mkinteger(cell_of(&cells[1]), 1);
+      rt_mkinteger(cell_of(&cells[2]), 2);
+      int32_t enc = rt_call_addr(cell_of(&cells[0]), cell_of(&cells[1]), 2,
+                                -1, 60, -1);
+      L->top.p--;
+      CHECK(enc < 0 && rt_call_count(enc) == 2);
+      CHECK(ttisinteger(&cells[0]) && ivalue(&cells[0]) == 1);
+      CHECK(ttisinteger(&cells[1]) && ivalue(&cells[1]) == 2);
+    }
+    /* want=0: nothing written; the callee cell keeps the closure (the
+       backend's C-1==0 discard) */
+    {
+      const char *src3 = "return function(a) return a, a+1 end";
+      CHECK(luaL_loadbuffer(L, src3, strlen(src3), "=t3") == 0);
+      CHECK(lua_pcall(L, 0, 1, 0) == 0);
+      cells[0] = *s2v(L->top.p - 1);
+      rt_mkinteger(cell_of(&cells[1]), 5);
+      TValue keep = cells[0];
+      int32_t st0 = rt_call_addr(cell_of(&cells[0]), cell_of(&cells[1]), 1,
+                                 0, 60, -1);
+      L->top.p--;
+      CHECK(st0 == RT_OK);
+      CHECK(rawtt(&cells[0]) == rawtt(&keep)); /* untouched by the move */
+    }
+  }
+
+  /* ---- U6a (row 86(B)): the below-window extras layout ---- */
+  {
+    TValue src[4];
+    rt_addr win, blk, before;
+    /* registered below for IDX_TAILVA: numparams=1, vararg, framecells 8 */
+    CHECK(rt_wasm_proto(IDX_TAILVA, 1, 1, 0, 8) == RT_OK);
+    rt_mkinteger(cell_of(&src[0]), 7); /* the fixed param */
+    rt_mkinteger(cell_of(&src[1]), 11); /* extras (arg order) */
+    rt_mkinteger(cell_of(&src[2]), 12);
+    rt_mkinteger(cell_of(&src[3]), 13);
+    before = rt_frame_cursor();
+    win = rt_push_frame_from(IDX_TAILVA, 4, src); /* nargs=4 -> nv=3 */
+    blk = win - (rt_addr)(3 * sizeof(TValue));
+    CHECK(win != 0);
+    /* the block need: nv + framecells + 1 cells (the spare above) */
+    CHECK(rt_frame_cursor() ==
+          blk + (rt_addr)((3 + 8 + 1) * sizeof(TValue)));
+    {
+      TValue *w = (TValue *)(size_t)win, *e = (TValue *)(size_t)blk;
+      CHECK(ttisinteger(&w[0]) && ivalue(&w[0]) == 7); /* param in window */
+      CHECK(ttisinteger(&e[0]) && ivalue(&e[0]) == 11); /* extras BELOW */
+      CHECK(ttisinteger(&e[1]) && ivalue(&e[1]) == 12);
+      CHECK(ttisinteger(&e[2]) && ivalue(&e[2]) == 13);
+      /* vgap01's shape: a multret flush reaching past the window top
+         (the spare, then virgin chunk) must not touch the extras */
+      {
+        int k;
+        for (k = 0; k < 8 + 4; k++) rt_mkinteger(cell_of(&w[k]), 999);
+        CHECK(ivalue(&e[0]) == 11 && ivalue(&e[1]) == 12 &&
+              ivalue(&e[2]) == 13);
+      }
+    }
+    /* the block operand trims the cursor exactly (rt_tail_stage's
+       contract — the old window operand leaked 16*nv per tailcall).
+       Note the cursor is an address: `before` was 0 (no chunk yet);
+       after the trim it is the (now non-NULL) chunk base == blk. */
+    rt_frame_restore(blk);
+    CHECK(rt_frame_cursor() == blk);
+    (void)before;
+  }
+
   /* ---- rt_error: emitted-code raise with position + string value ---- */
   {
     rt_error((rt_addr)(uintptr_t)"boom", 4, 12);
@@ -726,6 +838,19 @@ int main(void) {
     L->top.p++;
     lua_setglobal(L, "wasmtail");
     CHECK(dostring_msg(L, "return wasmtail(30, 12)", &msg) == 0);
+    CHECK(lua_isinteger(L, -1) && lua_tointeger(L, -1) == 42);
+
+    /* U6a (row 86): the vararg flavor — IDX_TAILVA registered in the
+       layout battery above (numparams=1, vararg, framecells 8). The
+       stub stages the tailcall with the BLOCK operand; the restage
+       pushes a fresh frame from the staging buffer under the new
+       layout, and the exact-cursor CHECK lives in the stub itself. */
+    CHECK(rt_newclosure(cell_of(&fcell), IDX_TAILVA, 0, 0, 1) == RT_OK);
+    luaD_checkstack(L, 1);
+    setobj2s(L, L->top.p, &fcell);
+    L->top.p++;
+    lua_setglobal(L, "wasmtailva");
+    CHECK(dostring_msg(L, "return wasmtailva(30, 12)", &msg) == 0);
     CHECK(lua_isinteger(L, -1) && lua_tointeger(L, -1) == 42);
 
     /* depth guard: rt_wasm_enter stages "stack overflow"; the Lua-level
@@ -1065,7 +1190,7 @@ int main(void) {
     }
   }
 
-  CHECK(rt_wasm_count() == IDX_TBCRAISE + 1);
+  CHECK(rt_wasm_count() == IDX_TAILVA + 1);
   CHECK(rt_wasm_proto(-1, 0, 0, 0, 0) == RT_ERR);
 
   if (failures == 0) printf("RT-NATIVE55 PASS\n");

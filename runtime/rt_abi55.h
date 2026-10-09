@@ -181,9 +181,16 @@ int32_t rt_concat(rt_addr cells, int32_t count, rt_addr dstcell, int32_t line,
 /* calls: the universal fallback for dynamic callees. Results overwrite
    the arg cells; want<0 means multret and the negative result count is
    returned (rt_call_count decodes). hcallee = the call-error hint
-   (funcnamefromcode's answer for the call site; U5e, row 71). */
+   (funcnamefromcode's answer for the call site; U5e, row 71).
+   U6a (row 86(A)): rt_call_addr is the form the backend emits — the
+   callee by ADDRESS (funcaddr) with the args at their natural
+   R(A+1).. position; results are moved down to argcells-16 (R(A))
+   here, so the emitted code saves/shifts nothing. rt_call remains
+   exported (ABI v4 additive-only, D9; native tests cover it). */
 int32_t rt_call(rt_addr funcell, rt_addr argcells, int32_t nargs, int32_t want,
                 int32_t line, int32_t hcallee);
+int32_t rt_call_addr(rt_addr funcaddr, rt_addr argcells, int32_t nargs,
+                     int32_t want, int32_t line, int32_t hcallee);
 int32_t rt_call_count(int32_t encoded);
 
 /* numeric-for preparation on the three control cells (init, limit, step),
@@ -261,16 +268,24 @@ int32_t rt_close(rt_addr level);
 void rt_close_err(rt_addr level);
 int32_t rt_tbc_count(void);
 
-/* frame stack (chunked bump region; args copied at push) */
+/* frame stack (chunked bump region; args copied at push). U6a (row
+   86(B)): each block is [extras nv][window framecells][1 spare] — the
+   extras sit BELOW the window (stock/interp placement), so dynamic
+   windows staged past the window top land in the spare/virgin chunk
+   space instead of on the extras. Returns the WINDOW base
+   (block+16*nv); the backend addresses extras at window-16*nv, and
+   rt_tail_stage/rt_frame_restore take the BLOCK address. */
 rt_addr rt_wasm_push_frame(void *L, void *base, int mdidx, int nargs);
 rt_addr rt_frame_cursor(void);
 void rt_frame_restore(rt_addr saved);
 
 /* M5c tailcall staging: stage a descriptor, return the callee's clidx
    (>=0) with the tailcalling frame's cursor restored, or -1 to decline
-   (the emitted code then falls back to rt_call) */
+   (the emitted code then falls back to rt_call_addr on the same
+   operands). U6a: `block` is the frame's BLOCK address
+   (window - 16*nv; == the window for non-vararg protos). */
 int32_t rt_tail_stage(rt_addr funcell, rt_addr argcells, int32_t nargs,
-                      rt_addr frame);
+                      rt_addr block);
 int32_t rt_tail_clidx(void);
 int32_t rt_tail_nargs(void);
 rt_addr rt_tail_funcell(void);

@@ -75,23 +75,8 @@ define check3
 	diff out/$(1).c.out ref/$(1).out
 endef
 
-# xfailu2e NAME PROG ARGS — like xfailw but for the U2e open backend bug
-# (ledger row 61): the wasm leg is EXPECTED to diverge until the
-# arg-window GETTABLE shape is fixed.
-define xfailu2e
-	@echo "== $(1) (xfail wasm: ledger row 61 — U2e follow-up)"
-	$(GLUA) -w tmp/$(2).wasm ./$(2).lua > /dev/null
-	$(GLUA) ./$(2).lua $(3) > out/$(1).i.out
-	$(CLUA) ./$(2).lua $(3) > out/$(1).c.out
-	diff out/$(1).i.out ref/$(1).out
-	diff out/$(1).c.out ref/$(1).out
-	timeout 30 $(GLUA) -W tmp/$(2).wasm $(3) > out/$(1).w.out 2>&1 || true
-	if diff -q out/$(1).w.out ref/$(1).out; then \
-		echo "$(1): wasm now matches — promote to check3"; exit 1; \
-	else \
-		echo "  wasm diverges as expected (ledger row 61)"; \
-	fi
-endef
+# xfailu2e was retired at U6a: both of its users (life1, tsort1) rode
+# the row-86 arg-window family and are check3 now.
 
 # xfailw NAME PROG ARGS — interp and clua match the shared ref; the wasm
 # leg must still DIFFER (ledger row 31: silent exit, garbage error, trap,
@@ -207,12 +192,12 @@ test025:
 
 # ---- life ----
 
-# U2e (ledger row 61): life's `string.sub(grid[r], c, c) == "O"` shape —
-# GETTABLE feeding the call arg window inside a closure — reads stale
-# cells on wasm in specific register layouts; register-allocation
-# sensitive (any instrumentation masks it). Follow-up backend bug.
+# U6a (row 61(d) closed): life's GETTABLE-feeding-the-call-arg-window
+# shape was the row-86 family — rt_call_addr reads the callee in place
+# and the args at their natural positions, so the stale-cell read is
+# gone. Promoted from xfailu2e to check3.
 test026:
-	$(call xfailu2e,life1,life,data/glider.life 8 4)
+	$(call check3,life1,life,data/glider.life 8 4)
 
 # ---- kvdb: one command sequence, three engines, one shared db ----
 
@@ -326,11 +311,10 @@ test036:
 
 # ---- table.sort (row 10u regression) ----
 
-# U2e: tsort1's comparator-error counting hits the row-10 family (sort
-# comparators + the CClosure seam's return path) — xfail until the seam
-# hardening; tsort2 (no erroring comparators) stays check3.
+# U6a (row 61(d) closed): tsort1's comparator path rode the same row-86
+# arg-window family; promoted from xfailu2e to check3.
 test037:
-	$(call xfailu2e,tsort1,tsort,300)
+	$(call check3,tsort1,tsort,300)
 test038:
 	$(call check3,tsort2,tsort,1000)
 

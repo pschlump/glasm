@@ -585,7 +585,7 @@ int32_t rt_concat(rt_addr cells, int32_t count, rt_addr dstcell, int32_t line,
    arg cells; want<0 = multret with the negative encoded count returned */
 
 static TValue ca_f;
-static TValue *ca_args;
+static TValue *ca_args, *ca_dst;
 static int ca_n, ca_w, ca_nres;
 
 /* Reentrancy law: the callee may be a wasm closure re-entering the ABI
@@ -594,7 +594,7 @@ static int ca_n, ca_w, ca_nres;
    only ca_nres is written back at the very end. */
 static void call_body(void) {
   int i, n = ca_n, w = ca_w, nres;
-  TValue *args = ca_args;
+  TValue *args = ca_args, *dst = ca_dst;
   StkId func;
   luaD_checkstack(curL, n + 1);
   setobj2s(curL, curL->top.p, &ca_f);
@@ -619,7 +619,7 @@ static void call_body(void) {
   nres = cast_int(curL->top.p - func);
   if (nres < 0) nres = 0;
   if (w >= 0) nres = w;
-  for (i = 0; i < nres; i++) args[i] = *s2v(func + i);
+  for (i = 0; i < nres; i++) dst[i] = *s2v(func + i);
   curL->top.p = func;
   ca_nres = nres;
 }
@@ -629,6 +629,7 @@ int32_t rt_call(rt_addr funcell, rt_addr argcells, int32_t nargs, int32_t want,
   int w = (int)want, nres;
   ca_f = *(TValue *)(size_t)funcell;
   ca_args = (TValue *)(size_t)argcells;
+  ca_dst = (TValue *)(size_t)argcells; /* results overwrite the args */
   ca_n = (int)nargs;
   ca_w = w;
   ca_nres = 0;
@@ -636,6 +637,29 @@ int32_t rt_call(rt_addr funcell, rt_addr argcells, int32_t nargs, int32_t want,
   if (st != RT_OK) return RT_ERR;
   nres = ca_nres; /* read before encoding — a nested call may follow */
   return w < 0 ? -(nres + 1) : RT_OK; /* encode count; -1 means zero */
+}
+
+/* U6a (row 86(A)): the callee-address form. funcaddr reads the callee
+   in place and argcells stay at their natural R(A+1).. position — the
+   emitted code saves and shifts nothing; results are moved down to
+   argcells-16 (R(A), where OP_CALL/TFORCALL expect them) by the body
+   itself, multret top bookkeeping included. Same body, same reentrancy
+   law: the callee TValue is copied into ca_f (a C static) before any
+   re-entry can overwrite the cells. The ABI stays v4 — additive entry
+   (D9); rt_call remains exported for the native tests. */
+int32_t rt_call_addr(rt_addr funcaddr, rt_addr argcells, int32_t nargs,
+                     int32_t want, int32_t line, int32_t hcallee) {
+  int w = (int)want, nres;
+  ca_f = *(TValue *)(size_t)funcaddr;
+  ca_args = (TValue *)(size_t)argcells;
+  ca_dst = (TValue *)(size_t)(argcells - (rt_addr)sizeof(TValue));
+  ca_n = (int)nargs;
+  ca_w = w;
+  ca_nres = 0;
+  int st = rt_run(call_body, line, -1, -1, hcallee, NULL);
+  if (st != RT_OK) return RT_ERR;
+  nres = ca_nres;
+  return w < 0 ? -(nres + 1) : RT_OK;
 }
 
 int32_t rt_call_count(int32_t encoded) { return -(encoded + 1); }
@@ -859,19 +883,41 @@ struct rt_frchunk {
 };
 static struct rt_frchunk *rt_fr;
 
+/* Row 92: multret staging headroom, in cells, guaranteed ABOVE every
+   frame window (chunk-resident ones here; the main block gets the same
+   margin through the backend's gFrameCells — the twin constant
+   multretHeadroomCells in luawasm/emit.go; keep them equal). A call's
+   results stage at R(A).. with a count only the callee knows (want=-1);
+   stock grows the Lua stack there, the wasm window is fixed, so the
+   region must absorb this many result cells past the window without
+   running off its end into the malloc heap (limits01's 254-wide
+   select('#', loaded()) is the covering corpus case). A count beyond it
+   is memory corruption until growable windows exist. */
+#define RT_HEADROOM_CELLS 4096
+
 /* size, bump and arg-fill a frame from a TValue array (the trampoline
    passes the L stack; the M5c tail restage passes the staging buffer). */
 static rt_addr rt_push_frame_from(int mdidx, int nargs, const TValue *src) {
   struct rt_wasm_md *m;
-  uint32_t need;
-  rt_addr frame;
+  uint32_t need, needhr;
+  rt_addr block, frame;
   int np, nv, i;
 
   m = &rt_md[mdidx];
   nv = (m->isvararg && nargs > m->numparams) ? nargs - m->numparams : 0;
-  need = (uint32_t)sizeof(TValue) * (uint32_t)(m->framecells + 1 + nv);
-  if (rt_fr == NULL || rt_fr->cap - rt_fr->used < need) {
-    uint32_t cap = need > (1u << 20) ? need * 2 : (1u << 20);
+  /* U6a (row 86): the extras sit BELOW the register window — the block
+     is [extras nv][window framecells][1 spare] and the window base is
+     block+16*nv. Stock and the interp place them below the frame base;
+     above, every dynamic window the emitted code legitimately stages
+     past the window top (multret VARARG flush tails, call arg windows,
+     result moves) used to land on them (vgap01/var07/limits01, row
+     61(d)); past the window is now spare/virgin chunk space — but only
+     RT_HEADROOM_CELLS of it are GUARANTEED (row 92): the chunk test
+     below abandons a tail that cannot cover window+headroom. */
+  need = (uint32_t)sizeof(TValue) * (uint32_t)(nv + m->framecells + 1);
+  needhr = need + (uint32_t)sizeof(TValue) * RT_HEADROOM_CELLS;
+  if (rt_fr == NULL || rt_fr->cap - rt_fr->used < needhr) {
+    uint32_t cap = needhr > (1u << 20) ? needhr * 2 : (1u << 20);
     struct rt_frchunk *ch = (struct rt_frchunk *)malloc(sizeof *ch);
     void *mem = malloc(cap);
     if (ch == NULL || mem == NULL) {
@@ -885,22 +931,23 @@ static rt_addr rt_push_frame_from(int mdidx, int nargs, const TValue *src) {
     ch->used = 0;
     rt_fr = ch;
   }
-  frame = rt_fr->base + rt_fr->used;
+  block = rt_fr->base + rt_fr->used;
   rt_fr->used += need;
+  frame = block + (rt_addr)sizeof(TValue) * (rt_addr)nv;
 
-  /* copy args: params -> frame+0.., extras -> varargBase (above the
-     nregs+4 register window; plan §3.2). Non-vararg protos drop extras,
-     like stock luaD_precall. */
+  /* copy args: params -> frame+0.., extras -> block+0.. (below the
+     window; the emitted code addresses them at frame-16*nv — its
+     varargBase). Non-vararg protos drop extras, like stock
+     luaD_precall. */
   np = nargs < m->numparams ? nargs : m->numparams;
   for (i = 0; i < np; i++)
     *(TValue *)(size_t)(frame + (rt_addr)sizeof(TValue) * i) = src[i];
   if (m->isvararg) {
-    rt_addr vb = frame + (rt_addr)sizeof(TValue) * m->framecells;
     for (i = 0; i < nv; i++)
-      *(TValue *)(size_t)(vb + (rt_addr)sizeof(TValue) * i) =
+      *(TValue *)(size_t)(block + (rt_addr)sizeof(TValue) * i) =
           src[m->numparams + i];
   }
-  return frame;
+  return frame; /* the window base; rt_frame_restore takes the block */
 }
 
 rt_addr rt_wasm_push_frame(void *L, void *base, int mdidx, int nargs) {
@@ -1485,17 +1532,32 @@ int32_t rt_clidx(rt_addr funcell) {
 ** A wasm-closure tailcall stages its call descriptor here and returns
 ** the -2 sentinel; the trampoline's restage loop turns it into a fresh
 ** dispatch at the SAME adapter level — O(1) wasm stack, O(1) frames.
-** Anything not a registered wasm closure declines (-1) and the emitted
-** code falls back to rt_call. Reentrancy: stage->restage is a closed
-** cycle inside one dispatch — the staged fields are consumed before any
-** nested dispatch can run. */
+** U6a: funcell/argcells take the callee's address with the args at
+** their natural R(A+1).. position (the rt_call_addr form); the decline
+** path leaves the cells untouched, so the emitted code's fallback is a
+** plain rt_call_addr on the same operands. Reentrancy: stage->restage
+** is a closed cycle inside one dispatch — the staged fields are
+** consumed before any nested dispatch can run. */
 
 static TValue *tail_args;
 static int tail_nargs, tail_idx;
 static rt_addr tail_cl;
 
+/* U6a (row 86): the dispatch result-frame shadow. The wasm module's own
+   restage loop (lua_dispatch — the backend's emitDispatch) consumes the
+   -2 sentinel INSIDE one wasm_dispatch_host call and re-dispatches the
+   successor at the tailcaller's BLOCK, which the below-window extras
+   layout put 16*nv under the frame this dispatch level pushed. The
+   successor stages its results at ITS frame, so the dispatch body must
+   copy from the last restaged frame, not the one it pushed (pre-U6a the
+   two coincided). rt_tail_restage publishes each push here; the body
+   brackets its host call save/set/adopt/restore so nesting stays exact —
+   a deeper dispatch's own bracket returns whatever THIS level last
+   staged, so no inner restage can leak its frame up. */
+static rt_addr rt_disp_frame;
+
 int32_t rt_tail_stage(rt_addr funcell, rt_addr argcells, int32_t nargs,
-                      rt_addr frame) {
+                      rt_addr block) {
   const TValue *f = (const TValue *)(size_t)funcell;
   TValue *na;
   int i;
@@ -1517,7 +1579,9 @@ int32_t rt_tail_stage(rt_addr funcell, rt_addr argcells, int32_t nargs,
   for (i = 0; i < nargs; i++)
     tail_args[i] = *(TValue *)(size_t)(argcells + (rt_addr)sizeof(TValue) * i);
   tail_nargs = (int)nargs;
-  rt_frame_restore(frame); /* the tailcalling frame is dead */
+  rt_frame_restore(block); /* the tailcalling frame is dead. U6a: this
+                              is the BLOCK address (window - 16*nv);
+                              the cursor trims to the allocation start */
   return tail_idx;
 }
 
@@ -1526,7 +1590,9 @@ int32_t rt_tail_nargs(void) { return tail_nargs; }
 rt_addr rt_tail_funcell(void) { return tail_cl; }
 
 rt_addr rt_tail_restage(void) {
-  return rt_push_frame_from(tail_idx, tail_nargs, tail_args);
+  rt_addr frame = rt_push_frame_from(tail_idx, tail_nargs, tail_args);
+  if (frame != 0) rt_disp_frame = frame; /* the dispatch body adopts it */
+  return frame;
 }
 
 /* ---- the precall seam: the dispatch trampoline (U2d) ------------------
@@ -1675,7 +1741,14 @@ static void rtw_dispatch_body(lua_State *L, void *ud) {
   struct rtw_ctx *c = (struct rtw_ctx *)ud;
   (void)L;
   for (;;) {
+    /* U6a (row 86): re-base the result frame around the host call — the
+       wasm-side restage loop may move the running frame inside it (see
+       rt_disp_frame above); the copy below reads c->frame afterward. */
+    rt_addr saved_df = rt_disp_frame;
+    rt_disp_frame = c->frame;
     c->nret = wasm_dispatch_host(c->idx, c->frame, c->cl, c->nargs, c->want);
+    c->frame = rt_disp_frame; /* adopt this level's latest restage */
+    rt_disp_frame = saved_df;
     if (c->nret != RTW_TAIL) break;
     /* M5c restage: a fresh frame push at the same adapter level */
     c->frame = rt_tail_restage();

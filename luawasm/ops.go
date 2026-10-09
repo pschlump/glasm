@@ -13,9 +13,15 @@ import (
 	"github.com/pschlump/golua55/wasm"
 )
 
-// tagIs: leaves 1/0 — register k's tag word equals tag
+// tagIs: leaves 1/0 — register k's tag byte equals tag. The load is
+// BYTE-wide: the runtime's TValue stores write tt_ as a lu_byte (one
+// byte), so the tag word's upper three bytes are stale padding whenever
+// a cell's last writer was C-side (rt_eq/rt_len/stack copies) — a 4-byte
+// load would compare garbage (life1's false EQKs, row 61(d)). The
+// backend's own tag stores stay full-width (row 45); they zero the
+// padding, which C never reads.
 func (fe *funcEmitter) tagIs(reg int, tag int) *wasm.Function {
-	return fe.cellAddr(reg).I32Load(8).I32Const(int32(tag)).I32Eq()
+	return fe.cellAddr(reg).I32Load8U(8).I32Const(int32(tag)).I32Eq()
 }
 
 // mmbinFallback: lower the MMBIN/MMBINI/MMBINK slot at pc+1 exactly as
@@ -463,9 +469,10 @@ func (fe *funcEmitter) emitCompare(op, A, B, C, k, pc int) {
 	// condJump: taken (to the JMP partner's target) when cond == k,
 	// else skip the partner word (pc+2). v4 boolean cells carry the
 	// truth in the TAG (VTRUE=17/VFALSE=1 — value_.b reads 0 either way,
-	// unlike v3's shared TBOOLEAN with the bit at word0)
+	// unlike v3's shared TBOOLEAN with the bit at word0). Byte-wide tag
+	// load: rt_eq wrote tt_ as one byte (see tagIs).
 	fe.scratchAddr(0)
-	f.I32Load(8)
+	f.I32Load8U(8)
 	f.I32Const(rtTagTrue).I32Eq()
 	f.I32Const(int32(k)).I32Eq().If(wasm.Void)
 	fe.setBlk(fe.branchPartner(pc))
@@ -484,16 +491,16 @@ func (fe *funcEmitter) kcellFn(i int) func() *wasm.Function {
 }
 
 // emitCall: OP_CALL (tail=false) and OP_TAILCALL (tail=true; C is 0).
-// The callee executes through rt_call — the runtime's lvm runs Lua
+// The callee executes through rt_call_addr — the runtime's lvm runs Lua
 // closures (re-entering compiled code through the CClosure seam) and C
 // functions alike.
 //
-// rt_call(funcell, argcells, nargs, want, line) reads args from argcells
-// and writes results back over the SAME cells. OP_CALL has the callee at
-// R(A), args at R(A+1).., and results at R(A).. — so before the call the
-// callee is saved to the dynamic scratch cell and the args are shifted
-// one cell down into R(A)..; results then land exactly where the VM
-// expects them (static and multret alike).
+// U6a (row 86(A)): rt_call_addr(funcaddr, argcells, nargs, want, line)
+// reads the callee's ADDRESS in place and the args at their natural
+// R(A+1).. position, moving results down to R(A) itself. The old
+// save-to-scratch + shift-args-down machinery is gone — it was the
+// row-86 hazard (the scratch lived above the window where multret
+// arg windows legitimately reach).
 func (fe *funcEmitter) emitCall(A, B, C, pc int, tail bool) {
 	f := fe.f
 	if tail {
@@ -519,49 +526,27 @@ func (fe *funcEmitter) emitCall(A, B, C, pc int, tail bool) {
 	}
 	f.LocalSet(fe.lT1)
 
-	// save the callee: dynScratch := R(A)
-	fe.copyCell(fe.scratchDyn0Cell(), fe.cell(A))
-
-	// shift args down one cell: R(A+i) := R(A+1+i), ascending (each src
-	// is read before the next step overwrites it)
-	if B == 0 {
-		// dynamic count = nargs (lT0); index lives in lSt — free until the
-		// rt_call result lands there. lT1 must survive: it holds want.
-		f.I32Const(0).LocalSet(fe.lSt)
-		f.Block(wasm.Void)
-		f.Loop(wasm.Void)
-		f.LocalGet(fe.lSt).LocalGet(fe.lT0).I32GeS().BrIf(1)
-		fe.copyCell(func() *wasm.Function { return fe.dynCellAddrSt(A) },
-			func() *wasm.Function { return fe.dynCellAddrSt(A + 1) })
-		f.LocalGet(fe.lSt).I32Const(1).I32Add().LocalSet(fe.lSt)
-		f.Br(0)
-		f.End()
-		f.End()
-	} else {
-		for i := 0; i < B-1; i++ {
-			fe.copyCell(fe.cell(A+i), fe.cell(A+1+i))
-		}
-	}
-
 	// M5c: try a staged tailcall — a wasm-closure callee re-dispatches at
 	// the same adapter level via the -2 sentinel (O(1) wasm stack, O(1)
-	// frames). Anything else (C function, __call'd object) declines and
-	// takes the rt_call fallback; its results then flow through the
+	// frames). Anything else (C function, __call'd object) declines
+	// WITHOUT touching the cells and takes the rt_call_addr fallback
+	// below on the same operands; its results then flow through the
 	// RETURN B=0 sentinel that follows (top = A + count).
 	if tail {
-		fe.scratchDyn0()
-		fe.cellAddr(A)
+		fe.cellAddr(A)  // funcell (callee in place)
+		fe.cellAddr(A + 1) // argcells (natural positions)
 		f.LocalGet(fe.lT0)
-		f.LocalGet(0) // frame — staging restores the cursor to here
+		fe.varargBase() // the BLOCK address — staging restores the
+		//                 cursor to the allocation start (U6a)
 		f.Call(fe.b.imp("rt_tail_stage")).LocalSet(fe.lSt)
 		f.LocalGet(fe.lSt).I32Const(0).I32GeS().If(wasm.Void)
 		f.I32Const(-2).Return()
 		f.End()
 	}
 
-	// rt_call(dynScratch, &R(A), nargs, want, line, hcallee)
-	fe.scratchDyn0()
+	// rt_call_addr(&R(A), &R(A+1), nargs, want, line, hcallee)
 	fe.cellAddr(A)
+	fe.cellAddr(A + 1)
 	f.LocalGet(fe.lT0)
 	f.LocalGet(fe.lT1)
 	f.I32Const(fe.line(pc))
@@ -569,7 +554,7 @@ func (fe *funcEmitter) emitCall(A, B, C, pc int, tail bool) {
 	// site ("global 'foo'", "method 'bar'", ...; -1 when unattributable,
 	// the interp's register value-scan residual)
 	f.I32Const(int32(fe.hintCallSite(pc)))
-	f.Call(fe.b.imp("rt_call")).LocalSet(fe.lSt)
+	f.Call(fe.b.imp("rt_call_addr")).LocalSet(fe.lSt)
 	f.LocalGet(fe.lSt).I32Const(1).I32Eq().If(wasm.Void)
 	f.I32Const(-1).Return()
 	f.End()
@@ -582,10 +567,6 @@ func (fe *funcEmitter) emitCall(A, B, C, pc int, tail bool) {
 	} else {
 		f.I32Const(int32(A + C - 1)).LocalSet(fe.lTop)
 	}
-}
-
-func (fe *funcEmitter) scratchDyn0Cell() func() *wasm.Function {
-	return func() *wasm.Function { return fe.scratchDyn0() }
 }
 
 // emitReturn: results at R(A); B==0 → up to top. The frame's open upvalues
@@ -731,33 +712,32 @@ func (fe *funcEmitter) emitForloop(A, Bx, pc int) {
 // emitTForcall: the generic-for call, fused with the TFORLOOP at pc+1
 // (the interp dispatches them back-to-back the same way). Staging per
 // _vm.go: the triple goes to R(A+3..A+5) — R(A+5)←control, R(A+4)←
-// state, R(A+3)←iterator — then the OP_CALL shape (callee saved to the
-// dynamic scratch, args shifted down one) puts C results at R(A+3)..,
-// where the loop names read them. Continue iff R(A+3) is non-nil.
+// state, R(A+3)←iterator. U6a (row 86(A)): the callee stays at R(A+3)
+// with its two args at their natural R(A+4).. — rt_call_addr takes the
+// address and moves the C results down to R(A+3) itself (the old
+// save-to-scratch + shift is gone). Continue iff R(A+3) is non-nil.
 func (fe *funcEmitter) emitTForcall(A, C, pc int) {
 	f := fe.f
 	fe.bumpTop(A + 6)
 	fe.copyCell(fe.cell(A+5), fe.cell(A+3)) // control → arg slot
 	fe.copyCell(fe.cell(A+4), fe.cell(A+1)) // state
 	fe.copyCell(fe.cell(A+3), fe.cell(A))   // iterator (callee)
-	fe.copyCell(fe.scratchDyn0Cell(), fe.cell(A+3))
-	fe.copyCell(fe.cell(A+3), fe.cell(A+4)) // args ↓ 1
-	fe.copyCell(fe.cell(A+4), fe.cell(A+5))
-	fe.scratchDyn0()
-	fe.cellAddr(A + 3)
+	fe.cellAddr(A + 3)                       // funcell (callee in place)
+	fe.cellAddr(A + 4)                       // argcells (natural)
 	f.I32Const(2)
 	f.I32Const(int32(C))
 	f.I32Const(fe.line(pc))
 	// row-71: funcnamefromcode over TFORCALL names the for iterator
 	f.I32Const(int32(fe.hintCallSite(pc)))
-	f.Call(fe.b.imp("rt_call")).LocalSet(fe.lSt)
+	f.Call(fe.b.imp("rt_call_addr")).LocalSet(fe.lSt)
 	f.LocalGet(fe.lSt).I32Const(1).I32Eq().If(wasm.Void)
 	f.I32Const(-1).Return()
 	f.End()
 	f.I32Const(int32(A + 3 + C)).LocalSet(fe.lTop)
-	// TFORLOOP (at pc+1): continue iff R(A+3) ~= nil
+	// TFORLOOP (at pc+1): continue iff R(A+3) ~= nil (byte-wide tag load —
+	// the iterator cell is C-written)
 	fe.cellAddr(A + 3)
-	f.I32Load(8).I32Const(rtTagNil).I32Ne().If(wasm.Void)
+	f.I32Load8U(8).I32Const(rtTagNil).I32Ne().If(wasm.Void)
 	fe.setBlk(fe.blockOf(fe.forloopTarget(pc + 1))) // body (back edge)
 	f.Else()
 	fe.setBlk(fe.blockOf(pc + 2)) // exit: past the TFORLOOP
@@ -765,11 +745,11 @@ func (fe *funcEmitter) emitTForcall(A, C, pc int) {
 }
 
 // emitVararg: R(A).. := the actual varargs. k=0 (hidden model): the
-// extras at varargBase (above the register window); nvarargs =
-// max(0, nargs - np). C==0 → multret (copy all, top = A+nvarargs);
-// C==1 → zero values (top = A); C>=2 → exactly C-1 values, copying
-// min(C-1, nvarargs) and nil-padding the rest (top = A+C-1 — registry
-// CopyRange truncates to regv+n).
+// extras at varargBase (BELOW the register window since U6a/row 86);
+// nvarargs = max(0, nargs - np). C==0 → multret (copy all, top =
+// A+nvarargs); C==1 → zero values (top = A); C>=2 → exactly C-1
+// values, copying min(C-1, nvarargs) and nil-padding the rest (top =
+// A+C-1 — registry CopyRange truncates to regv+n).
 //
 // k=1 (table model, U5e row 85 — the interp spec, _vm.go): B is the
 // vararg TABLE's register; rt_vararg_read reads t.n + the raw values
@@ -787,19 +767,16 @@ func (fe *funcEmitter) emitVararg(A, B, C, k, pc int) {
 		} else {
 			f.I32Const(int32(C - 1))
 		}
-		// dstcap — the whole frame allocation past dst, mirroring the
-		// hidden model's multret posture (writes may reach past nregs
-		// into the slack push_frame sized for: framecells + extras):
-		// frameCells + max(0, nargs-np) - A. t.n is user-editable in
-		// the table model, so unlike the hidden model's nargs-bounded
-		// count it needs the explicit bound (the interp grows its
-		// register stack instead; unobservable in the corpus).
-		f.I32Const(int32(frameCells(fe.nregs))).I32Const(int32(A)).I32Sub()
-		f.LocalGet(2).I32Const(int32(fe.np)).I32Sub()
-		f.I32Const(0)
-		f.LocalGet(2).I32Const(int32(fe.np)).I32Sub().I32Const(0).I32GtS()
-		f.Select()
-		f.I32Add()
+		// dstcap — the allocated cells past dst, mirroring the hidden
+		// model's multret posture (writes may reach past nregs into the
+		// slack push_frame sized for): framecells + 1 (the window's
+		// cells past A plus the spare above it) - A. The extras are
+		// BELOW the window since U6a, so they no longer bound the
+		// flush. t.n is user-editable in the table model, so unlike
+		// the hidden model's nargs-bounded count it needs the explicit
+		// bound (the interp grows its register stack instead;
+		// unobservable in the corpus).
+		f.I32Const(int32(frameCells(fe.nregs) + 1)).I32Const(int32(A)).I32Sub()
 		f.I32Const(fe.line(pc))
 		f.Call(fe.b.imp("rt_vararg_read")).LocalSet(fe.lSt)
 		// NOT checkStatus: a legitimate count can be 1 (RT_ERR's value)

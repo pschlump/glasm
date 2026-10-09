@@ -90,7 +90,8 @@ RT_EXPORTS="$EXPORTS \
   -Wl,--export=rt_newtable -Wl,--export=rt_gettable -Wl,--export=rt_settable \
   -Wl,--export=rt_arith -Wl,--export=rt_len -Wl,--export=rt_eq \
   -Wl,--export=rt_lt -Wl,--export=rt_le -Wl,--export=rt_concat \
-  -Wl,--export=rt_call -Wl,--export=rt_call_count -Wl,--export=rt_forprep \
+  -Wl,--export=rt_call -Wl,--export=rt_call_addr \
+  -Wl,--export=rt_call_count -Wl,--export=rt_forprep \
   -Wl,--export=rt_frame_alloc -Wl,--export=rt_error \
   -Wl,--export=rt_getglobal -Wl,--export=rt_setglobal \
   -Wl,--export=rt_set_chunkname -Wl,--export=rt_chunkname_ptr \

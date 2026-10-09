@@ -24,6 +24,17 @@ import (
 	"github.com/pschlump/golua55/wasm"
 )
 
+// multretHeadroomCells (row 92): call results stage at R(A).. with a
+// count only the callee knows (want=-1 multret) — stock grows the Lua
+// stack there, the wasm window is fixed. Every frame region therefore
+// carries this many spare cells ABOVE the window: the main block through
+// gFrameCells (below) and the rt's bump chunks through RT_HEADROOM_CELLS
+// in runtime/rt_abi55.c — the twin constant; keep them equal. limits01's
+// 254-wide select('#', loaded()) is the covering corpus case; a call
+// returning more than this past the window is memory corruption until
+// growable windows exist.
+const multretHeadroomCells = 4096
+
 // scInt decodes an sC immediate (opcode.go keeps int2sC/sC2int
 // unexported; the bias is the stable stock encoding OFFSET_sC = 127).
 func scInt(v int) int { return v - 127 }
@@ -107,24 +118,25 @@ func (fe *funcEmitter) scratchAddr(k int) *wasm.Function {
 	return fe.f.LocalGet(0).I32Const(int32(cellSize * (fe.nregs + 2 + k))).I32Add()
 }
 
-// dynamic scratch cell 0 — the trampoline's spare cell ABOVE the vararg
-// staging area. Dynamic for vararg protos: multret VARARG destinations
-// reach R(A+nv-1) with A up to nregs-1, so any static position can
-// collide (M5b bug: `g(2, ...)` saved its callee over the third vararg).
-// frame+16*(framecells+nv) is provably above both the register window
-// and every vararg copy; rt_wasm_push_frame's need covers exactly one.
-func (fe *funcEmitter) scratchDyn0() *wasm.Function {
+// nvOff: pushes 16*max(0, nargs-np) for hidden-vararg protos — the
+// byte distance from the window base DOWN to the extras' first cell
+// (and to the block base). U6a (row 86(B)): the extras sit BELOW the
+// register window — block = [extras nv][window framecells][1 spare] —
+// so dynamic multret destinations reaching past the window top land in
+// the spare/virgin chunk space, never on the extras (vgap01/var07/
+// limits01, row 61(d)). Zero for non-vararg protos (extras are dropped
+// at push, stock luaD_precall).
+func (fe *funcEmitter) nvOff() *wasm.Function {
 	f := fe.f
-	base := f.LocalGet(0).I32Const(int32(cellSize * frameCells(fe.nregs))).I32Add()
 	if fe.proto.IsVarArg&lua.VarArgAny == 0 {
-		return base
+		return f.I32Const(0)
 	}
-	// + 16 * max(0, nargs - np) — Select keeps live locals untouched
+	// max(0, nargs - np) * 16 — Select keeps live locals untouched
 	f.LocalGet(2).I32Const(int32(fe.np)).I32Sub().I32Const(16).I32Mul()
 	f.I32Const(0)
 	f.LocalGet(2).I32Const(int32(fe.np)).I32Sub().I32Const(0).I32GtS()
 	f.Select()
-	return f.I32Add()
+	return f
 }
 
 // constant cell: i in Constants (the single global pool)
@@ -151,38 +163,50 @@ func (fe *funcEmitter) dynCellAddr(baseReg int) *wasm.Function {
 		LocalGet(fe.lT1).I32Const(16).I32Mul().I32Add()
 }
 
-// like dynCellAddr but indexed by lSt — for copy loops where lT0/lT1
-// hold live values (nargs/want)
-func (fe *funcEmitter) dynCellAddrSt(baseReg int) *wasm.Function {
-	return fe.f.LocalGet(0).I32Const(int32(cellSize * baseReg)).I32Add().
-		LocalGet(fe.lSt).I32Const(16).I32Mul().I32Add()
-}
-
 func (fe *funcEmitter) frameDynCell() *wasm.Function {
 	return fe.f.LocalGet(0).LocalGet(fe.lT1).I32Const(16).I32Mul().I32Add()
 }
 
-// vararg cells live above the register window (rt_wasm_push_frame's
-// split): varargBase = frame + 16*framecells
+// vararg cell j: the extras' j-th cell — BELOW the register window
+// since the U6a layout (rt_wasm_push_frame's split): frame - 16*nv + 16*j.
+// Like varargCellDyn, the base subtraction folds before the index term —
+// frame-(nvOff-16j) would read BELOW the block for j>0 (var12's nil b).
 func (fe *funcEmitter) varargCell(j int) *wasm.Function {
-	return fe.f.LocalGet(0).I32Const(int32(cellSize * (frameCells(fe.nregs) + j))).I32Add()
+	f := fe.f
+	f.LocalGet(0)
+	fe.nvOff()
+	f.I32Sub()
+	f.I32Const(int32(cellSize * j)).I32Add()
+	return f
 }
 
-// vararg cell indexed by lT1 (dynamic copy loops)
+// vararg cell indexed by lT1 (dynamic copy loops): frame - 16*nv + 16*lT1.
+// The subtraction folds BEFORE the index term — (frame-nvOff) + 16*lT1 —
+// matching varargCell(j); the natural spelling frame-(nvOff-16*lT1) reads
+// the spare cells above the window (var00's nil flush).
 func (fe *funcEmitter) varargCellDyn() *wasm.Function {
-	return fe.f.LocalGet(0).I32Const(int32(cellSize * frameCells(fe.nregs))).I32Add().
-		LocalGet(fe.lT1).I32Const(16).I32Mul().I32Add()
+	f := fe.f
+	f.LocalGet(0)
+	fe.nvOff()
+	f.I32Sub()
+	f.LocalGet(fe.lT1).I32Const(16).I32Mul()
+	return f.I32Add()
 }
 
 // varargBase: the extras' first cell — rt_wasm_push_frame staged the
-// call's extra arguments at frame+16*framecells (U5e's rt_varargtab/
-// rt_getvarg src/vabase operand)
+// call's extra arguments below the window (U5e's rt_varargtab/
+// rt_getvarg src/vabase operand; U6a's below-window placement). For
+// non-vararg protos this is the frame itself = the BLOCK base, which
+// is what rt_tail_stage's cursor operand needs.
 func (fe *funcEmitter) varargBase() *wasm.Function {
-	return fe.f.LocalGet(0).I32Const(int32(cellSize * frameCells(fe.nregs))).I32Add()
+	f := fe.f
+	f.LocalGet(0)
+	fe.nvOff()
+	return f.I32Sub()
 }
 
 // pushNextra: max(0, nargs - np) — the live extra count (the same
-// Select idiom as scratchDyn0, as a count not a byte offset)
+// Select idiom as nvOff, as a count not a byte offset)
 func (fe *funcEmitter) pushNextra() {
 	f := fe.f
 	f.LocalGet(2).I32Const(int32(fe.np)).I32Sub()
@@ -202,15 +226,16 @@ func (fe *funcEmitter) bumpTop(n int) {
 
 // truth: leaves 1/0 on the stack — Lua truthiness of register k. v4
 // variant tags: falsy iff tt==VNIL(0) or tt==VFALSE(1) — distinct tags,
-// unlike v3's shared TBOOLEAN.
+// unlike v3's shared TBOOLEAN. Byte-wide tag loads (see tagIs): a
+// C-written false would read as a nonzero tag word otherwise — truthy.
 func (fe *funcEmitter) truth(reg int) {
 	f := fe.f
 	fe.cellAddr(reg)
-	f.I32Load(8)
+	f.I32Load8U(8)
 	f.I32Const(rtTagNil)
 	f.I32Ne()
 	fe.cellAddr(reg)
-	f.I32Load(8)
+	f.I32Load8U(8)
 	f.I32Const(rtTagFalse)
 	f.I32Ne()
 	f.I32And()
@@ -286,9 +311,12 @@ func (fe *funcEmitter) emitBody() {
 	// gFrameCells (main proto only): the TOTAL cell count the host must
 	// allocate for lua_main's frame — the registered window plus the one
 	// dynamic spare above it (main is vararg with nargs=0, so the spare
-	// sits directly at framecells).
+	// sits directly at framecells) plus multretHeadroomCells: the hosts
+	// malloc EXACTLY this many bytes (wasmengine/wazeroengine/vm.go), and
+	// a tight block made limits01's 254-wide multret staging run off its
+	// end into the malloc heap (row 92).
 	if fe.isMain {
-		fe.b.m.ExportGlobal("gFrameCells", fe.b.m.GlobalI32(int32(frameCells(fe.nregs)+1), false))
+		fe.b.m.ExportGlobal("gFrameCells", fe.b.m.GlobalI32(int32(frameCells(fe.nregs)+1+multretHeadroomCells), false))
 	}
 
 	// prologue: bind this frame's line cell into the CURRENT shadow
