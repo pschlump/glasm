@@ -220,8 +220,14 @@ type WasmEngine struct {
 	// the RTDBG env var still wins). M6c gates pass lua51ProdWasm.
 	RtBin []byte
 	// Sandbox: call rt_sandbox(1) after rt_set_state (M6c globals
-	// lockdown, ledger row 33) and skip the io.flush drain.
+	// lockdown, ledger row 33; U6c re-pins the list on 5.5 — ledger row
+	// 94) and skip the io.flush drain.
 	Sandbox bool
+	// Protect: call rt_protect_globals(1) after every other host write
+	// into _G — the Redis 7.2.7 script-env lockdown: missing-global reads
+	// raise, and every table reachable from _G (plus the string
+	// metatable) rejects writes (U6c, ledger row 94).
+	Protect bool
 	// MaxMem: per-VM allocation budget in bytes (0 = unlimited). Applied
 	// via rt_set_memlimit BEFORE lnewstate so the whole VM lifetime
 	// counts; over-budget allocation dies with a clean pcall-catchable
@@ -466,10 +472,15 @@ func (e *WasmEngine) Run(c Case) (log []string) {
 	if _, err := call(rtInst, "rt_set_state", L); err != nil {
 		return []string{"ENGINE-ERROR\trt_set_state: " + err.Error()}
 	}
-	// M6c: the sandbox globals lockdown (ledger row 33) — rt_sandbox is
-	// v3-only until U6 (row 60); refuse rather than run unsandboxed.
+	// U6c (ledger rows 33/94): the sandbox globals lockdown back
+	// on ABI v4 — rt_sandbox(1) nils the 5.5 untrusted surface (io os
+	// package require dofile loadfile load debug warn) out of the globals
+	// table; the dev flavor opens all 9 (the U6d prod flavor compiles
+	// them out and returns 0). Body runs under rt_run protection.
 	if e.Sandbox {
-		return []string{"ENGINE-ERROR\tsandbox is not on the ABI v4 blob until U6 (row 60)"}
+		if _, err := call(rtInst, "rt_sandbox", int32(1)); err != nil {
+			return []string{"ENGINE-ERROR\trt_sandbox: " + err.Error()}
+		}
 	}
 	// v1 GC stop: register cells are not GC roots (the M3 ABI obligation —
 	// a full GC-rooted frame arrives with the M6 arena lifecycle); any
@@ -483,6 +494,17 @@ func (e *WasmEngine) Run(c Case) (log []string) {
 	// this runs after it and owns the full surface)
 	if err := e.setArgGlobal(store, rtInst, call, L, c.Name, c.Args); err != nil {
 		return []string{"ENGINE-ERROR\targ setup: " + err.Error()}
+	}
+	// U6c (ledger row 94): the script-env lockdown, LAST host write into
+	// _G — rt_protect_globals(1) installs the Redis 7.2.7 error metatable
+	// (missing-global reads raise) and the protected set behind the seven
+	// interposed table-write guards (writes raise "Attempt to modify a
+	// readonly table"). Order contract: sandbox -> gcStop -> arg ->
+	// protect -> init -> main.
+	if e.Protect {
+		if _, err := call(rtInst, "rt_protect_globals", int32(1)); err != nil {
+			return []string{"ENGINE-ERROR\trt_protect_globals: " + err.Error()}
+		}
 	}
 	// U2e: no dialect layer on the v4 blob — the 5.5 tree speaks stock
 	// texts natively, which is what the interp oracle was re-pinned to

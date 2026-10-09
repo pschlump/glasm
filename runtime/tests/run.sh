@@ -31,7 +31,10 @@ run_suite() {
 
 run_suite55() {
   name=$1; shift
-  SRC="$name lua55/src/*.c"
+  # ltable_stock55.c (U6c): the renamed second compile whose rt_lts_*
+  # bodies the seven table-write guards delegate to (linked beside the
+  # stock tree, mirroring the blob's RT flavor link order)
+  SRC="$name ltable_stock55.c lua55/src/*.c"
   echo "== 5.5 / ABI v4 plain"
   run_build plain && ./tests/rt_native_plain
   echo "== 5.5 / ABI v4 ASan"

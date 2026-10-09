@@ -116,7 +116,9 @@ RT_EXPORTS="$EXPORTS \
   -Wl,--export=rt_deadline_flag -Wl,--export=rt_deadline \
   -Wl,--export=rt_tail_stage -Wl,--export=rt_tail_clidx \
   -Wl,--export=rt_tail_nargs -Wl,--export=rt_tail_funcell \
-  -Wl,--export=rt_tail_restage"
+  -Wl,--export=rt_tail_restage \
+  -Wl,--export=rt_sandbox -Wl,--export=rt_protect_globals \
+  -Wl,--export=rt_globals_readonly"
 
 # U5e (row 60): the error-position seam — rt_seam55.c interposes
 # luaL_where/lua_error/luaG_runerror for the RT blob only. It must link
@@ -125,6 +127,11 @@ RT_EXPORTS="$EXPORTS \
 # definition on the command line, so the seam's replicas win and the
 # stock tree stays untouched. No -flto in CFLAGS, so object-level
 # interposition holds (an LTO link would fold the duplicates first).
+# U6c (row 94): ltable_stock55.c follows the seam — the renamed second
+# compile of ltable.c whose rt_lts_* bodies the seam's seven table-write
+# guards delegate to (the zero-patch globals lockdown). Also after the
+# seam, before the stock $SRC: the real ltable.o stays in the link, but
+# every cross-object write caller resolves to a guard first.
 "$CC" --sysroot="$SYSROOT" \
   $CFLAGS \
   -D'luai_makeseed()=0u' \
@@ -132,7 +139,7 @@ RT_EXPORTS="$EXPORTS \
   $RT_EXPORTS \
   -Wl,--allow-multiple-definition \
   -DLUA_RT_FLAVOR \
-  -o lua55_rt.wasm luawasm55.c rt_abi55.c rt_seam55.c $SRC
+  -o lua55_rt.wasm luawasm55.c rt_abi55.c rt_seam55.c ltable_stock55.c $SRC
 
 cp lua55_rt.wasm ../testdiff/lua55_rt.wasm
 

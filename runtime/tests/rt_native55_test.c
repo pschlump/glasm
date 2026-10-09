@@ -37,6 +37,18 @@
 #define luaG_opinterror rt_sea_native_opinterror
 #define luaG_tointerror rt_sea_native_tointerror
 #define luaG_concaterror rt_sea_native_concaterror
+/* U6c (row 94): the seven table-write guards join the rename family —
+   natively the stock ltable.c definitions serve every public-API path
+   (interposition is blob-side, the U5e coverage split), so the battery
+   calls these renamed guards DIRECTLY. Their rt_lts_* delegates come
+   from ltable_stock55.c (linked by run.sh's suite55). */
+#define luaH_pset rt_sea_native_pset
+#define luaH_psetstr rt_sea_native_psetstr
+#define luaH_psetshortstr rt_sea_native_psetshortstr
+#define luaH_psetint rt_sea_native_psetint
+#define luaH_setint rt_sea_native_setint
+#define luaH_set rt_sea_native_set
+#define luaH_finishset rt_sea_native_finishset
 /* the stock headers above were consumed unrenamed (include guards), so
    the replicas that call each other before their definitions need the
    renamed prototypes re-issued here (in the blob build each file is its
@@ -63,6 +75,13 @@ LUAI_FUNC l_noret rt_sea_native_tointerror(lua_State *L, const TValue *p1,
 #undef luaG_opinterror
 #undef luaG_tointerror
 #undef luaG_concaterror
+#undef luaH_pset
+#undef luaH_psetstr
+#undef luaH_psetshortstr
+#undef luaH_psetint
+#undef luaH_setint
+#undef luaH_set
+#undef luaH_finishset
 
 static int failures = 0;
 #define CHECK(cond) do { \
@@ -237,6 +256,36 @@ static int oom_body(lua_State *L) {
 static int small_body(lua_State *L) {
   lua_pushliteral(L, "fits");
   return 1;
+}
+
+/* U6c (row 94): guard-call bodies — the renamed guards called DIRECTLY
+   under cpcall55 (natively every public-API write path binds to stock
+   ltable.c; the guards are the blob's interposition layer — the U5e
+   coverage split: logic here, interposition e2e on the blob gates). */
+static Table *g_guard_t;
+static TValue g_guard_k, g_guard_v;
+
+static int guard_set_body(lua_State *L) {
+  rt_sea_native_set(L, g_guard_t, &g_guard_k, &g_guard_v);
+  return 0;
+}
+
+static int guard_setint_body(lua_State *L) {
+  rt_sea_native_setint(L, g_guard_t, 1, &g_guard_v);
+  return 0;
+}
+
+static int missing_read_body(lua_State *L) {
+  lua_getglobal(L, "nosuchglobal_u6c");
+  return 0;
+}
+
+static int g_setglobal_ok;
+static int u6c_setglobal_body(lua_State *L) {
+  lua_pushinteger(L, 1);
+  lua_setglobal(L, "u6c_staged");
+  g_setglobal_ok = 1; /* reached: the write raised no error */
+  return 0;
 }
 
 int main(void) {
@@ -1275,6 +1324,95 @@ int main(void) {
     rt_err_clear();
     rt_set_deadline(0);
     CHECK(rt_deadline_flag() == 0);
+  }
+
+  /* ---- U6c (rows 33/50, ledger row 94): sandbox + globals lockdown */
+  {
+    Table *g;
+    /* the sandbox: off refuses; on nils exactly the 5.5 list (all 9
+       present on this luaL_openlibs state — io os package require
+       dofile loadfile load debug warn; utf8/print/coroutine stay); a
+       second pass finds them already nil */
+    CHECK(rt_sandbox(0) == -1);
+    CHECK(rt_sandbox(1) == 9);
+    lua_getglobal(L, "io");
+    CHECK(lua_isnil(L, -1));
+    lua_pop(L, 1);
+    lua_getglobal(L, "warn");
+    CHECK(lua_isnil(L, -1));
+    lua_pop(L, 1);
+    lua_getglobal(L, "string");
+    CHECK(lua_istable(L, -1));
+    lua_pop(L, 1);
+    CHECK(rt_sandbox(1) == 0);
+
+    /* protect: one-way; the metatable + the recursive set */
+    CHECK(rt_protect_globals(0) == -1);
+    CHECK(rt_protect_globals(1) == 0);
+    lua_pushglobaltable(L);
+    g = hvalue(s2v(L->top.p - 1));
+    lua_pop(L, 1);
+    CHECK(rt_prot_isprotected(g));
+    {
+      Table *str;
+      lua_getglobal(L, "string");
+      str = hvalue(s2v(L->top.p - 1));
+      CHECK(rt_prot_isprotected(str)); /* a _G VALUE */
+      lua_pop(L, 1);
+      /* the shared string metatable: probed explicitly by the walk
+         (its __index points back at the string table — the cycle guard
+         absorbs the re-hit) */
+      lua_pushliteral(L, "");
+      CHECK(lua_getmetatable(L, -1) != 0);
+      CHECK(rt_prot_isprotected(hvalue(s2v(L->top.p - 1))));
+      lua_pop(L, 2);
+      /* a fresh table is not protected */
+      lua_newtable(L);
+      CHECK(!rt_prot_isprotected(hvalue(s2v(L->top.p - 1))));
+      lua_pop(L, 1);
+      /* direct guard calls raise the Redis text under pcall */
+      g_guard_t = str;
+      rt_mkinteger(cell_of(&g_guard_v), 42);
+      rt_intern(cell_of(&g_guard_k), (rt_addr)(uintptr_t)"guardkey", 8);
+      CHECK(cpcall55(L, guard_set_body) == LUA_ERRRUN);
+      CHECK(strcmp(lua_tostring(L, -1),
+                   "Attempt to modify a readonly table") == 0);
+      lua_pop(L, 1);
+      CHECK(cpcall55(L, guard_setint_body) == LUA_ERRRUN);
+      CHECK(strcmp(lua_tostring(L, -1),
+                   "Attempt to modify a readonly table") == 0);
+      lua_pop(L, 1);
+    }
+    /* missing-global reads raise through __index (public API — the
+       metatable consult is stock behavior, natively testable) */
+    CHECK(cpcall55(L, missing_read_body) == LUA_ERRRUN);
+    CHECK(strstr(lua_tostring(L, -1),
+                 "Script attempted to access nonexistent global "
+                 "variable 'nosuchglobal_u6c'") != NULL);
+    lua_pop(L, 1);
+    /* an EXISTING global reads without consulting __index at all */
+    lua_getglobal(L, "string");
+    CHECK(lua_istable(L, -1));
+    lua_pop(L, 1);
+
+    /* the KEYS/ARGV staging window: _G leaves the set, writes pass,
+       _G re-enters — and the rest of the set never moved */
+    CHECK(rt_globals_readonly(0) == 0);
+    CHECK(!rt_prot_isprotected(g));
+    g_guard_t = g;
+    g_setglobal_ok = 0;
+    CHECK(cpcall55(L, u6c_setglobal_body) == 0); /* no __newindex: table
+                                                    writes never consult
+                                                    the error metatable */
+    CHECK(g_setglobal_ok);
+    CHECK(cpcall55(L, guard_set_body) == 0); /* the guard itself passes */
+    CHECK(rt_globals_readonly(1) == 0);
+    CHECK(rt_prot_isprotected(g));
+    CHECK(cpcall55(L, guard_set_body) == LUA_ERRRUN);
+    lua_pop(L, 1);
+    lua_getglobal(L, "string");
+    CHECK(rt_prot_isprotected(hvalue(s2v(L->top.p - 1))));
+    lua_pop(L, 1);
   }
 
   CHECK(rt_wasm_count() == IDX_TAILVA + 1);

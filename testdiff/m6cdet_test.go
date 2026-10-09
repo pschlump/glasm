@@ -129,9 +129,10 @@ print(math.random())
 // TestM6cTwiceRunIsolation: two fresh VMs running the same mutating script
 // must produce byte-identical logs INCLUDING the GLOBALS serialization (the
 // §8.6 memory-diff of the globals; DiffLogs drops GLOBALS by contract, so
-// the raw logs are compared directly).
+// the raw logs are compared directly). U6c: a prod determinism leg —
+// re-armed at U6d with lua55_prod.wasm.
 func TestM6cTwiceRunIsolation(t *testing.T) {
-	skipRtSurfacesUntilU6(t)
+	skipProdBlobUntilU6d(t)
 	src := `
 G = {}
 for i = 1, 100 do G["k"..i] = i * 2 end

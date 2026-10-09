@@ -23,10 +23,12 @@
 **     value onto the Lua stack and clears) — the zero-patch replacement for
 **     v3's rt_pcall_caught hook in luaD_pcall.
 **
-** Not in tranche 1 (U6, plan §4 U2d): rt_sandbox / globals lockdown, the
-** host-fn seam, the error()-position line-stack. (The budget alloc +
-** deadline block landed at U6b — rows 36/37 re-pinned on v4; row 93 rules
-** the 5.5 emergency-GC divergence.) LUA_RT_ABI bumps on ANY
+** Not in tranche 1 (U6, plan §4 U2d): the host-fn seam, the
+** error()-position line-stack. (The budget alloc + deadline block landed
+** at U6b — rows 36/37 re-pinned on v4, row 93 rules the 5.5
+** emergency-GC divergence; the sandbox + globals lockdown landed at U6c
+** — rows 33/50 re-pinned on v4, row 94 rules the zero-patch write
+** guards.) LUA_RT_ABI bumps on ANY
 ** signature/semantic change; the
 ** backend refuses to emit against a mismatched module.
 */
@@ -226,6 +228,26 @@ void rt_set_deadline(int32_t on);
 int32_t rt_deadline_flag(void);
 int32_t rt_deadline(void);
 
+/* U6c (rows 33/50 re-pinned, ledger row 94, plan §4.4): the sandbox +
+   globals lockdown. rt_sandbox(1) nils the 5.5 untrusted surface out of
+   the globals table (io os package require dofile loadfile load debug
+   warn — loadstring/module never existed in 5.5) and returns how many
+   were present (the dev flavor opens all 9; the prod flavor at U6d
+   compiles them out and returns 0). rt_protect_globals(1) installs the
+   Redis 7.2.7 script-environment lockdown: an error metatable on the
+   globals table whose __index raises "Script attempted to access
+   nonexistent global variable '<k>'" on missing reads, plus every
+   table reachable from _G — and the shared string metatable — in the
+   rt-owned protected set; the write path (rt_seam55.c's interposed
+   luaH_* guards over ltable_stock55.c delegates) raises "Attempt to
+   modify a readonly table" on any assignment/rawset/seti. One-way per
+   VM (on=0 returns -1, the v3 contract); call AFTER rt_sandbox and
+   after host staging (rt_globals_readonly re-opens _G for KEYS/ARGV).
+   All three run their bodies under rt_run protection. */
+int32_t rt_sandbox(int32_t on);
+int32_t rt_protect_globals(int32_t on);
+int32_t rt_globals_readonly(int32_t on);
+
 /* globals */
 int32_t rt_getglobal(rt_addr dstcell, rt_addr keycell, int32_t line);
 int32_t rt_setglobal(rt_addr keycell, rt_addr valcell, int32_t line);
@@ -344,6 +366,11 @@ int32_t rt_sea_msgh_ran(void);
 void rt_sea_msgh_ran_set(int32_t v);
 struct lua_State;
 struct lua_State *rt_curL(void);
+/* U6c (row 94): the protected-set predicate consulted by rt_seam55.c's
+   seven table-write guards (const void* — the header stays lua.h-only,
+   Table is not known here). Linear scan over a ~dozen-entry set that
+   is empty while unarmed: one length check. */
+int rt_prot_isprotected(const void *t);
 
 /* the varinfo hint seam (U5e, row 71 — same replica family as above).
    rt_hint_put registers one formatted " (local 'x')"-class hint at init

@@ -454,3 +454,35 @@ SharedVMSerialization, OneScriptLaw, EventSink; `CGO_ENABLED=0 go build ./host/`
   U1/U2/U2f + CLua55Conformance over the rebuilt blob; `_cli-tests` ×{wasmtime, WAZERO=1};
   50M-iteration poll spot-check sub-second. Ledger row 93; note/u6b-implemented.md.
   Next: U6c (sandbox surface on v4).
+
+- **U6c COMPLETE (2026-10-08)** — rows 33/34(no-op)/50 re-pinned on ABI v4; **row 94 NEW** (the
+  interposition design + the stacking semantic + the no-op backend finding + the setmetatable
+  parity hole). `rt_sandbox` v4: the §4.5 5.5 list (io os package require dofile loadfile load
+  debug warn — 9; loadstring/module never existed, utf8/print stay), public-API nil-ing,
+  returns the present-count (dev 9, re-run 0, prod 0 at U6d), body under rt_run.
+  `rt_protect_globals` via §4.4's PRIMARY design, zero patches to lua55/: **object-level
+  interposition of the stock table-write path** — `runtime/ltable_stock55.c` renames
+  `luaH_pset/psetstr/psetshortstr/psetint/setint/set/finishset` → `rt_lts_*` (7 delegates +
+  12 internal hides) and re-includes stock ltable.c; `rt_seam55.c` defines the seven
+  `luaH_*` GUARDS (membership check → `Attempt to modify a readonly table`, else delegate),
+  and build55.sh links the renamed TU only into `lua55_rt.wasm`, after the seam and before
+  $SRC (no LTO — the whole mechanism is link-order). rt-owned protected set (linear scan,
+  reset in rt_set_state); metatable install via public API only; recursive walk
+  metatable-first + lua_next, cycle guard = set membership; explicit string-metatable probe
+  (lstrlib puts `__index`→string-lib on the metatable of STRING VALUES; the string table
+  itself has no metatable). `rt_globals_readonly` = the KEYS/ARGV window (set membership
+  only; metatable stays). **Backend gating: NO-OP** — the U2e backend has zero inline
+  table-write fast paths (every table write lowers to rt_settable/rt_setglobal); stock's
+  `luaV_fastseti` array arm is unreachable (protected tables are hash-only). **The stacking
+  semantic the corpus pins:** a sandbox-nil'd global is an ABSENT key, so a bare read under
+  protect raises the Redis text — exactly 7.2.7; presence is probed `rawget` (the first gate
+  run failed on exactly this — implementation right, test expectations rewritten to pin it).
+  Engines: `Protect` on both, order memlimit → lnewstate → rt_set_state → rt_sandbox(1) →
+  gcstop → args → rt_protect_globals(1) → init → main. `skipRtSurfacesUntilU6d` deleted;
+  prod legs + Frozen/Matrix re-pins stay on `skipProdBlobUntilU6d` (U6d). Gates:
+  TestM6cProtectGlobals + SandboxSurface(dev) + TestU6SandboxCorpus (_u6, 4 cases)
+  ×{wasmtime,wazero} green; RT-NATIVE55 extended (direct-guard battery via the rt_sea_native_*
+  rename idiom; sandbox 9/0; protect membership; readonly window round-trip) ×3 sanitizers;
+  full matrix/error/glua + U1/U2/U2f + CLua55Conformance + m6d over the rebuilt blob (oracle
+  byte-identical, sha re-pinned); `_cli-tests` ×{wasmtime, WAZERO=1}. Ledger row 94;
+  note/u6c-implemented.md. Next: U6d (lua55_prod.wasm flavor).

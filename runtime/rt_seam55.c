@@ -52,6 +52,11 @@
 ** fire at every cascade's final reraise). Fresh stagings clear the flag
 ** (the error is new; its handler has not run); stage_error preserves it
 ** (the value is still the same in-flight error); rt_err_clear clears it.
+**
+** The U6c write guards (rows 33/50, plan §4.4): the seven table-
+** write entry points interposed the same way — guard+delegate, the
+** delegates being ltable_stock55.c's renamed second compile of the
+** stock table engine. See the block at the file's end.
 */
 
 #ifndef LUA_CORE
@@ -473,4 +478,91 @@ l_noret luaG_concaterror(lua_State *L, const TValue *p1, const TValue *p2) {
                     rt_sea_hint(cc->hbase + idx));
   }
   sea_typeerror(L, p1, "concatenate", "");
+}
+
+/* ---- U6c (rows 33/50, plan §4.4): interposed table-write guards ----
+**
+** The zero-patch globals lockdown's write half. rt_protect_globals
+** (rt_abi55.c) puts every table reachable from the globals table — and
+** the shared string metatable — into the rt-owned protected set; these
+** seven replicas are the enforcement point: every CROSS-OBJECT path
+** into a stock table write funnels through exactly one of them
+** (lua_settable/setfield/setglobal/seti → the luaV_fastset* macros →
+** luaH_pset/psetstr/psetint; lua_rawset/rawsetp → luaH_set;
+** lua_rawseti → luaH_setint; luaV_finishset → luaH_finishset), so a
+** write to a protected table raises before any cell moves.
+**
+** Why luaH_set/finishset are guarded DIRECTLY (and not just the pset
+** family): stock ltable.o's own luaH_set body calls luaH_pset
+** INTRA-object, which binds to the stock definition — interposition is
+** a cross-object mechanism only (same reason lauxlib's luaL_where
+** never reaches the where replica). psetshortstr gets a guard for the
+** native luaV_execute paths (dead in the blob — no LClosure executes
+** there — but the guards are tree-shape, not blob-shape).
+**
+** The raise goes through THIS file's luaG_runerror replica (the
+** proven sea_typeerror pattern): nopos cleared, so the catching rt_run
+** bolts the raise site's "chunk:line: " prefix on — the tbc/forprep
+** core-raise rule. Replicas with an L parameter raise with it; the
+** pset family has none, so they use rt_curL().
+**
+** The delegates are runtime/ltable_stock55.c — the whole ltable.c
+** compiled again under rt_lts_* names, so the guards call the TRUE
+** stock bodies (static internals included) without patching anything.
+** ltable.h LUA_DEBUG-only luaH_mainposition is not renamed (never
+** compiled). */
+LUAI_FUNC int rt_lts_pset(Table *t, const TValue *key, TValue *val);
+LUAI_FUNC int rt_lts_psetstr(Table *t, TString *key, TValue *val);
+LUAI_FUNC int rt_lts_psetshortstr(Table *t, TString *key, TValue *val);
+LUAI_FUNC int rt_lts_psetint(Table *t, lua_Integer key, TValue *val);
+LUAI_FUNC void rt_lts_setint(lua_State *L, Table *t, lua_Integer key,
+                            TValue *value);
+LUAI_FUNC void rt_lts_set(lua_State *L, Table *t, const TValue *key,
+                         TValue *value);
+LUAI_FUNC void rt_lts_finishset(lua_State *L, Table *t, const TValue *key,
+                               TValue *value, int hres);
+
+LUAI_FUNC int luaH_pset(Table *t, const TValue *key, TValue *val) {
+  if (rt_prot_isprotected(t))
+    luaG_runerror(rt_curL(), "Attempt to modify a readonly table");
+  return rt_lts_pset(t, key, val);
+}
+
+LUAI_FUNC int luaH_psetstr(Table *t, TString *key, TValue *val) {
+  if (rt_prot_isprotected(t))
+    luaG_runerror(rt_curL(), "Attempt to modify a readonly table");
+  return rt_lts_psetstr(t, key, val);
+}
+
+LUAI_FUNC int luaH_psetshortstr(Table *t, TString *key, TValue *val) {
+  if (rt_prot_isprotected(t))
+    luaG_runerror(rt_curL(), "Attempt to modify a readonly table");
+  return rt_lts_psetshortstr(t, key, val);
+}
+
+LUAI_FUNC int luaH_psetint(Table *t, lua_Integer key, TValue *val) {
+  if (rt_prot_isprotected(t))
+    luaG_runerror(rt_curL(), "Attempt to modify a readonly table");
+  return rt_lts_psetint(t, key, val);
+}
+
+LUAI_FUNC void luaH_setint(lua_State *L, Table *t, lua_Integer key,
+                          TValue *value) {
+  if (rt_prot_isprotected(t))
+    luaG_runerror(L, "Attempt to modify a readonly table");
+  rt_lts_setint(L, t, key, value);
+}
+
+LUAI_FUNC void luaH_set(lua_State *L, Table *t, const TValue *key,
+                       TValue *value) {
+  if (rt_prot_isprotected(t))
+    luaG_runerror(L, "Attempt to modify a readonly table");
+  rt_lts_set(L, t, key, value);
+}
+
+LUAI_FUNC void luaH_finishset(lua_State *L, Table *t, const TValue *key,
+                             TValue *value, int hres) {
+  if (rt_prot_isprotected(t))
+    luaG_runerror(L, "Attempt to modify a readonly table");
+  rt_lts_finishset(L, t, key, value, hres);
 }

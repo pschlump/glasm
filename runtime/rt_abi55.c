@@ -132,6 +132,9 @@ static int rt_oom_inflight; /* U6b: the memlimit block's one-time slack
                                flag — tentative here so the re-arms in
                                rt_err_clear/rt_set_state (above it in the
                                file) see it */
+static int prot_n; /* U6c: the protected set's live count — same
+                      tentativity (rt_set_state resets it above the
+                      block that owns the rest of the set) */
 
 /* the raise line for the host's error-position rendering (M8 surface
    kept); the FIRST staging of an in-flight error wins */
@@ -388,6 +391,9 @@ void rt_set_state(rt_addr p) {
      ldo.c's closeprotected save/restores OUR value. */
   G(curL)->gcstopem = 1;
   rt_oom_inflight = 0; /* U6b: fresh activation re-arms the cap refusal */
+  prot_n = 0; /* U6c: the protected set does not survive a state reset
+                 (fresh VMs only — the set's Table* belong to the dead
+                 state; sandbox/protect re-run per activation) */
   rt_rp_n = 0; /* row 85: no protects of ours survive a state reset */
 }
 
@@ -926,6 +932,194 @@ int32_t rt_deadline(void) {
     }
   }
   return RT_ERR;
+}
+
+/* ---- U6c (rows 33/50, ledger row 94): sandbox + globals lockdown ---
+**
+** The v3 surface (rt_abi.c :240-379) re-pinned on 5.5 globals. The list
+** is 5.5-shaped: loadstring/module never existed here, warn is new
+** (it writes through a host callback the prod flavor does not ship).
+** lua_getglobal/lua_setglobal address the registry globals table —
+** exactly what the main proto's seeded _ENV cell points at — so the
+** nil-ing is visible to compiled readers with no _ENV plumbing.
+**
+** The protection half is zero-patch (plan §4.4 primary design): v3
+** flagged the Table struct itself (our row-50 patches into the 5.1
+** tree); stock 5.5 offers no readonly-table API, so the rt owns a
+** protected-set and rt_seam55.c's seven interposed luaH_* write guards
+** consult it (delegates = ltable_stock55.c, the renamed second
+** compile). The set holds ~20-30 tables; every compiled table write
+** already crosses rt_settable -> lua_settable -> a guard, so the
+** linear scan is noise.
+**
+** rt_sandbox runs its whole body under rt_run protection: v3 ran it
+** bare, but engines may combine MaxMem+Sandbox and an OOM inside a
+** bare setglobal would longjmp with errorJmp NULL (the state dies).
+** Same defensive shape for the protect walk (its allocations are
+** OOM-able). The one-way contract is v3's: on=0 returns -1, there is
+** no unprotect.
+*/
+static const char *const rt_sandbox_nil[] = {
+    "io",     "os",    "package", "require", "dofile",
+    "loadfile", "load", "debug",  "warn",   NULL};
+
+static int sb_count; /* the body's live count, read after rt_run */
+
+static void sandbox_body(void) {
+  lua_State *L = curL;
+  const char *const *p;
+  int n = 0;
+  for (p = rt_sandbox_nil; *p != NULL; p++) {
+    lua_getglobal(L, *p);
+    {
+      int was_there = !lua_isnil(L, -1);
+      lua_pop(L, 1);
+      if (was_there) {
+        lua_pushnil(L);
+        lua_setglobal(L, *p);
+        n++;
+      }
+    }
+  }
+  sb_count = n;
+}
+
+int32_t rt_sandbox(int32_t on) {
+  if (!on || curL == NULL) return -1;
+  if (rt_run(sandbox_body, 0, -1, -1, -1, NULL) != RT_OK) return -1;
+  return sb_count;
+}
+
+/* the rt-owned protected set (rt_seam55.c's guards consult it; empty
+   when unarmed = one length check per guarded write) */
+static Table **prot_set;
+static int prot_cap; /* prot_n lives with the early tentatives above */
+
+int rt_prot_isprotected(const void *t) {
+  int i;
+  for (i = 0; i < prot_n; i++)
+    if (prot_set[i] == (const Table *)t) return 1;
+  return 0;
+}
+
+/* add t (raising on OOM — every caller runs under rt_run); returns
+   whether it was newly added (0 = the cycle guard hit) */
+static int prot_add(lua_State *L, Table *t) {
+  if (rt_prot_isprotected(t)) return 0;
+  if (prot_n == prot_cap) {
+    int ncap = prot_cap ? prot_cap * 2 : 32;
+    Table **ns = (Table **)realloc(prot_set, (size_t)ncap * sizeof *ns);
+    if (ns == NULL) {
+      luaG_runerror(L, "not enough memory");
+      return 0; /* unreachable (noret) */
+    }
+    prot_set = ns;
+    prot_cap = ncap;
+  }
+  prot_set[prot_n++] = t;
+  return 1;
+}
+
+static int prot_remove(Table *t) {
+  int i;
+  for (i = 0; i < prot_n; i++)
+    if (prot_set[i] == t) {
+      prot_set[i] = prot_set[--prot_n]; /* swap-delete: order is not
+                                            observable */
+      return 1;
+    }
+  return 0;
+}
+
+/* rt_protected_index: the __index raise (Redis 7.2.7's
+   luaProtectedTableError — texts verbatim). Missing-global READS only;
+   present keys answer from the table without consulting it. */
+static int rt_protected_index(lua_State *L) {
+  int argc = lua_gettop(L);
+  if (argc != 2)
+    luaL_error(L, "Wrong number of arguments to luaProtectedTableError");
+  if (!lua_isstring(L, -1) && !lua_isnumber(L, -1))
+    luaL_error(L,
+               "Second argument to luaProtectedTableError must be a "
+               "string or number");
+  luaL_error(L, "Script attempted to access nonexistent global variable "
+                "'%s'",
+             lua_tostring(L, -1));
+  return 0; /* unreachable (noret) */
+}
+
+/* the recursive walk: the table sits at the top of the stack. Depth is
+   bounded by the stdlib's nesting (~3: _G -> string -> its metatable);
+   the C stack cost is fine. The set doubles as the visited set —
+   shared metatables and _G's self-reference re-hit the cycle guard. */
+static void prot_walk_rec(lua_State *L) {
+  Table *t = hvalue(s2v(L->top.p - 1));
+  if (rt_prot_isprotected(t)) return;
+  (void)prot_add(L, t);
+  luaD_checkstack(L, 3);
+  if (lua_getmetatable(L, -1)) { /* has one? (pushed at the top) */
+    prot_walk_rec(L);
+    lua_pop(L, 1);
+  }
+  lua_pushnil(L);
+  while (lua_next(L, -2)) { /* key at -2, value at -1 */
+    if (lua_istable(L, -1)) prot_walk_rec(L);
+    lua_pop(L, 1); /* the value; lua_next keeps iterating from the key */
+  }
+}
+
+static void protect_body(void) {
+  lua_State *L = curL;
+  luaD_checkstack(L, 5);
+  lua_pushglobaltable(L);
+  /* the error metatable (public API only; setmetatable writes
+     t->metatable directly, so installing it over a protected table is
+     the one sanctioned write — see row 94's rulings) */
+  lua_newtable(L);
+  lua_pushcfunction(L, rt_protected_index);
+  lua_setfield(L, -2, "__index");
+  lua_setmetatable(L, -2);
+  /* walk from _G itself (the walk protects the fresh metatable too —
+     its contents are then unmodifiable) */
+  prot_walk_rec(L);
+  lua_pop(L, 1);
+  /* the shared string metatable is not reachable from _G fields —
+     probe it explicitly (Redis parity: string-library writes raise) */
+  lua_pushliteral(L, "");
+  if (lua_getmetatable(L, -1)) {
+    prot_walk_rec(L);
+    lua_pop(L, 1);
+  }
+  lua_pop(L, 1);
+}
+
+int32_t rt_protect_globals(int32_t on) {
+  if (!on || curL == NULL) return -1; /* one-way per VM (v3 contract) */
+  return rt_run(protect_body, 0, -1, -1, -1, NULL) != RT_OK ? -1 : 0;
+}
+
+/* the KEYS/ARGV staging window: _G leaves/re-enters the protected set
+   (v3 toggled _G's own readonly flag; the zero-patch set does the
+   membership instead). The metatable stays installed either way —
+   reads of MISSING globals still raise, which is correct during
+   staging (the host writes KEYS/ARGV, never reads-missing). */
+static int ro_on;
+
+static void readonly_body(void) {
+  Table *g;
+  lua_pushglobaltable(curL);
+  g = hvalue(s2v(curL->top.p - 1));
+  if (ro_on)
+    (void)prot_add(curL, g);
+  else
+    (void)prot_remove(g);
+  curL->top.p--;
+}
+
+int32_t rt_globals_readonly(int32_t on) {
+  if (curL == NULL) return -1;
+  ro_on = (on != 0);
+  return rt_run(readonly_body, 0, -1, -1, -1, NULL) != RT_OK ? -1 : 0;
 }
 
 /* ---- raising from emitted code ---- */
