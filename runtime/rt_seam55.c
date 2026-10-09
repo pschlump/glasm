@@ -160,6 +160,14 @@ int32_t rt_sea_nopos(void) { return rt_sea_nopos_flag; }
 
 void rt_sea_nopos_set(int32_t v) { rt_sea_nopos_flag = (int)v; }
 
+/* U6e (row 96): the hostfn raise mark — rt_hf_closure's errors are
+   COMPLETE messages (Redis command texts propagate verbatim; the v3
+   rt_where_mark analog). Setting wheremiss (not nopos directly) rides
+   the interposed lua_error's own verdict plumbing: the replica copies
+   wheremiss into rt_sea_nopos and consumes it, so the catching rt_run's
+   staging skips the chunk:line prefix for exactly this one raise. */
+void rt_sea_raise_nopos(void) { rt_sea_wheremiss = 1; }
+
 /* the msgh-ran flag (U5e, row 85 — see the file header): 1 while the
    in-flight error has already had its message handler run at a
    C-land raise (the errormsg replica below sets it before dispatching

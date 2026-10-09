@@ -43,7 +43,10 @@ func PrintArg(v lua.LValue) string {
 	case lua.LNumber:
 		return NumRepr(float64(x))
 	case lua.LInteger:
-		return NumRepr(float64(x))
+		// U6e: integers render lossless (the wire gained PT_INTEGER with
+		// it); equals NumRepr below 1e15, correct above — where the f64
+		// detour printed 14-sig-fig 'g' forms
+		return strconv.FormatInt(int64(x), 10)
 	case *lua.LNilType:
 		return "nil"
 	case lua.LBool:
@@ -74,7 +77,7 @@ func ValueRepr(v lua.LValue, depth int, seen map[*lua.LTable]bool) string {
 	case lua.LNumber:
 		return NumRepr(float64(x))
 	case lua.LInteger:
-		return NumRepr(float64(x))
+		return strconv.FormatInt(int64(x), 10) // U6e: lossless (see PrintArg)
 	case *lua.LNilType:
 		return "nil"
 	case lua.LBool:

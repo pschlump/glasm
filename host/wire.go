@@ -1,6 +1,6 @@
 package host
 
-// The value wire protocol shared with runtime/luawasm.c (the PT_* tags):
+// The value wire protocol shared with runtime/luawasm55.c (the PT_* tags):
 // tag-first, self-describing, little-endian.
 //
 //	args   = u32 count, count × value   (guest→host, hostfn arguments)
@@ -12,6 +12,9 @@ package host
 //	                                     PT_MORE byte after n when the
 //	                                     guest truncated the expansion)
 //	       | 6 function | 10 cycle | 11 depth-truncated   (args side only)
+//	       | 13 i64                     (integer — U6e: LUA_VNUMINT crosses
+//	                                     lossless; results keep Lua
+//	                                     semantics, integers print bare)
 //
 // The host never sends 6/10/11 back (the guest decoder rejects them);
 // host-to-guest tables are always complete.
@@ -22,9 +25,10 @@ import (
 	"fmt"
 	"math"
 	"strconv"
+	"strings"
 )
 
-// ValueKind mirrors the wire tags (PT_* in runtime/luawasm.c).
+// ValueKind mirrors the wire tags (PT_* in runtime/luawasm55.c).
 type ValueKind uint8
 
 const (
@@ -37,6 +41,7 @@ const (
 	KindFunction ValueKind = 6
 	KindCycle    ValueKind = 10
 	KindDeep     ValueKind = 11
+	KindInteger  ValueKind = 13
 )
 
 const wireMore byte = 12 // PT_MORE: an args-side table was truncated
@@ -50,6 +55,7 @@ type KV struct {
 type Value struct {
 	Kind  ValueKind
 	Num   float64 // KindNumber
+	Int   int64   // KindInteger (U6e: lossless, not narrowed through Num)
 	Str   string  // KindString
 	Pairs []KV    // KindTable
 	More  bool    // KindTable: the guest truncated the expansion
@@ -64,7 +70,7 @@ func Bool(b bool) Value {
 	return Value{Kind: KindFalse}
 }
 func Number(f float64) Value { return Value{Kind: KindNumber, Num: f} }
-func Int(n int64) Value      { return Value{Kind: KindNumber, Num: float64(n)} }
+func Int(n int64) Value      { return Value{Kind: KindInteger, Int: n} }
 func String(s string) Value  { return Value{Kind: KindString, Str: s} }
 func Table(pairs ...KV) Value {
 	return Value{Kind: KindTable, Pairs: pairs}
@@ -85,6 +91,8 @@ func (v Value) String() string {
 		return "true"
 	case KindNumber:
 		return numRepr(v.Num)
+	case KindInteger:
+		return strconv.FormatInt(v.Int, 10)
 	case KindString:
 		return v.Str
 	case KindTable:
@@ -99,14 +107,33 @@ func (v Value) String() string {
 	return "?"
 }
 
-// numRepr formats a number the way the fork's interpreter renders numbers
-// in messages: integers plain, otherwise Go's shortest round-trip %g.
+// numRepr formats a FLOAT the way stock Lua 5.5 renders floats in
+// tostring (lobject.c tostringbuffFloat): %.15g, re-read, %.17g when the
+// round-trip loses the value, ".0" appended when the result looks like a
+// plain integer (2.0 stays "2.0"), inf/nan in the libc spellings.
+// Integers (KindInteger) never come through here — they print bare via
+// FormatInt (U6e; ported from formatlib.go's numberToStringStock so the
+// package carries its own copy).
 func numRepr(f float64) string {
-	if f == math.Trunc(f) && !math.IsInf(f, 0) &&
-		math.Abs(f) < 1e15 {
-		return fmt.Sprintf("%d", int64(f))
+	switch {
+	case math.IsNaN(f):
+		if math.Signbit(f) {
+			return "-nan"
+		}
+		return "nan"
+	case math.IsInf(f, 1):
+		return "inf"
+	case math.IsInf(f, -1):
+		return "-inf"
 	}
-	return strconv.FormatFloat(f, 'g', -1, 64)
+	s := strconv.FormatFloat(f, 'g', 15, 64)
+	if v, err := strconv.ParseFloat(s, 64); err != nil || v != f {
+		s = strconv.FormatFloat(f, 'g', 17, 64)
+	}
+	if strings.Trim(s, "-0123456789") == "" {
+		s += ".0"
+	}
+	return s
 }
 
 // decodeValue reads one wire value at buf[off]. depth guards malformed
@@ -130,6 +157,11 @@ func decodeValue(buf []byte, off, depth int) (Value, int, error) {
 			return Value{}, off, errors.New("host: truncated wire number")
 		}
 		return Number(math.Float64frombits(binary.LittleEndian.Uint64(buf[off+1:]))), off + 9, nil
+	case KindInteger:
+		if off+9 > len(buf) {
+			return Value{}, off, errors.New("host: truncated wire integer")
+		}
+		return Int(int64(binary.LittleEndian.Uint64(buf[off+1:]))), off + 9, nil
 	case KindString:
 		if off+5 > len(buf) {
 			return Value{}, off, errors.New("host: truncated wire string header")
@@ -209,6 +241,11 @@ func encodeValue(out []byte, v Value) ([]byte, error) {
 		var b [8]byte
 		binary.LittleEndian.PutUint64(b[:], math.Float64bits(v.Num))
 		out = append(out, byte(KindNumber))
+		return append(out, b[:]...), nil
+	case KindInteger:
+		var b [8]byte
+		binary.LittleEndian.PutUint64(b[:], uint64(v.Int))
+		out = append(out, byte(KindInteger))
 		return append(out, b[:]...), nil
 	case KindString:
 		if len(v.Str) > 64<<20 {

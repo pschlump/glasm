@@ -78,8 +78,10 @@ cp lua55_sjlj.wasm ../testdiff/lua55_sjlj.wasm
 # (no ldo.c precall hook), cells are native 5.5 TValues (integer/float
 # subtypes cross losslessly), errors carry stock 5.5 texts. Tranche 1
 # scope (docs/U2-implementation-plan.md §4 U2d): arith/compare/concat/
-# tables/globals/upvalues/calls/forprep + the seam; sandbox/memlimit/
-# deadline/hostfn are U6. Determinism: same pins as the oracle blob.
+# tables/globals/upvalues/calls/forprep + the seam; memlimit/deadline
+# landed at U6b, sandbox at U6c, and the hostfn seam (rt_hostfn/
+# rt_encode_value + the host.host_call import, luawasm55.c's RT-flavor
+# block) at U6e. Determinism: same pins as the oracle blob.
 # Not consumed by any Go host yet (U2e wires the backend); build-gated
 # here + the native ABI tests (tests/rt_native55_test.c).
 
@@ -118,7 +120,8 @@ RT_EXPORTS="$EXPORTS \
   -Wl,--export=rt_tail_nargs -Wl,--export=rt_tail_funcell \
   -Wl,--export=rt_tail_restage \
   -Wl,--export=rt_sandbox -Wl,--export=rt_protect_globals \
-  -Wl,--export=rt_globals_readonly"
+  -Wl,--export=rt_globals_readonly \
+  -Wl,--export=rt_hostfn -Wl,--export=rt_encode_value"
 
 # U5e (row 60): the error-position seam — rt_seam55.c interposes
 # luaL_where/lua_error/luaG_runerror for the RT blob only. It must link

@@ -31,22 +31,20 @@
 **                       lua_next order). The interp engine grows the
 **                       matching in-process xoshiro at U3.
 **
-** Everything M7a (host functions) and rt_* ABI related is 5.1-only until
-** the ABI v4 port (U2/U6): this driver is pure public C API — no
-** lua51/lua55 internals are included, and the blob imports exactly one
-** host function (host.event).
+** Everything rt_* ABI related lives in rt_abi55.c (ABI v4, U2d); the
+** RT flavor additionally compiles the hostfn seam below (U6e, row 96)
+** — still pure public C API: no lua55 internals are included outside
+** the rt_abi55.h include. The oracle flavor (sjlj) imports exactly one
+** host function (host.event); the rt/prod flavors import
+** host.{event,wasm_dispatch} (+ host.host_call since U6e).
 **
 ** Value protocol (tag-first, self-describing, little-endian) — identical
 ** to luawasm.c so the Go decoders are shared:
 **   tag byte: 0 nil, 1 false, 2 true, 3 number (f64), 4 string (u32 len,
 **   bytes), 5 table (u32 nentries, then 2n values; PT_MORE sentinel if
 **   truncated), 6 function, 7 userdata, 8 thread, 9 lightuserdata,
-**   10 cycle, 11 depth-truncated table.
-**
-** (U0 caveat, resolved at U2 when the protocol gains integer tags: numbers
-** cross as f64 only, so integer/float subtype is not observable in event
-** logs yet — harmless for the U0 self-run gate, whose pass criterion is
-** per-file completion, not cross-engine byte equality.)
+**   10 cycle, 11 depth-truncated table, 13 integer (i64 — U6e: LUA_VNUMINT
+**   crosses lossless; the f64-only U0 caveat is retired).
 **
 ** Build: runtime/build55.sh (wasi-sdk clang, reactor exec model, EH-based
 ** setjmp — 5.5's LUAI_THROW is still setjmp/longjmp, ldo.c).
@@ -83,7 +81,14 @@ enum { EVT_PRINT = 1, EVT_GLOBALS = 2 };
 enum {
   PT_NIL = 0, PT_FALSE = 1, PT_TRUE = 2, PT_NUMBER = 3, PT_STRING = 4,
   PT_TABLE = 5, PT_FUNCTION = 6, PT_USERDATA = 7, PT_THREAD = 8,
-  PT_LIGHTUSERDATA = 9, PT_CYCLE = 10, PT_DEEPTABLE = 11, PT_MORE = 12
+  PT_LIGHTUSERDATA = 9, PT_CYCLE = 10, PT_DEEPTABLE = 11, PT_MORE = 12,
+  /* U6e (row 96): LUA_VNUMINT crosses as its own tag — int64 lossless
+     (v4's reason to exist). The Go decoders (testdiff/clua.go, host/
+     wire.go) grew the arm with it; rendering is unchanged for every
+     value the event corpora exercise (FormatInt equals %.14g for
+     integers below 1e15 — and is correct above it, where the old f64
+     crossing was silently lossy). */
+  PT_INTEGER = 13
 };
 
 #define EVBUF_CAP (256 * 1024)
@@ -112,6 +117,12 @@ static int enc_f64(int off, double v) {
   return off + 8;
 }
 
+static int enc_i64(int off, int64_t v) {
+  if (oob(off, 8)) return -1;
+  memcpy(evbuf + off, &v, 8);
+  return off + 8;
+}
+
 static int enc_str(int off, const char *s, size_t len) {
   if (oob(off, 5 + len)) return -1;
   off = enc_u32(off, (uint32_t)len);
@@ -128,6 +139,13 @@ static int enc_value(lua_State *L, int idx, int off, int expand, int depth,
   case LUA_TNIL: return enc_byte(off, PT_NIL);
   case LUA_TBOOLEAN: return enc_byte(off, lua_toboolean(L, idx) ? PT_TRUE : PT_FALSE);
   case LUA_TNUMBER: {
+    /* U6e: variant-faithful — LUA_VNUMINT as PT_INTEGER (lossless
+       int64), LUA_VNUMFLT as PT_NUMBER (f64) */
+    if (lua_isinteger(L, idx)) {
+      off = enc_byte(off, PT_INTEGER);
+      if (off < 0) return -1;
+      return enc_i64(off, lua_tointeger(L, idx));
+    }
     off = enc_byte(off, PT_NUMBER);
     if (off < 0) return -1;
     return enc_f64(off, lua_tonumber(L, idx));
@@ -208,6 +226,193 @@ static void emit_globals(lua_State *L) {
   lua_pop(L, 1);
   if (off > 0) host_event(EVT_GLOBALS, (int32_t)(size_t)evbuf, off);
 }
+
+#ifdef LUA_RT_FLAVOR
+/* ---- U6e (row 96): the hostfn seam — v3's M7a block on v4 ------------
+**
+** A Lua-visible function whose body lives in the Go host (the
+** redis.call mechanism). Arguments cross guest->host in the same
+** tag-first wire protocol g_print uses (tables expanded one argument
+** deep, cycle/deep sentinels for pathological graphs); results cross
+** host->guest in the mirror format and are pushed as ordinary Lua
+** values. Errors are one wire value + a negative return: the value is
+** pushed and lua_error'd with rt_sea_raise_nopos — the catching rt_run's
+** staging adds no chunk:line prefix, so command error texts propagate
+** verbatim (Redis semantics; the v3 rt_where_mark analog).
+**
+** Wire formats (little-endian, PT_* tags above):
+**   args   = u32 count, count × value          (written into evbuf)
+**   result = u32 count, count × value          (host-written, hf_retbuf)
+**   error  = 1 value                           (host-written, hf_retbuf)
+**
+** Staging rides hf_retbuf — one hostfn call is in flight per VM image
+** (the host's per-image lock serializes runs, and the Go callback cannot
+** re-enter the guest), so static buffers are safe. RT flavor only: the
+** sjlj oracle links this file without LUA_RT_FLAVOR and keeps its
+** import-free host_call surface (byte-identical oracle). */
+
+__attribute__((import_module("host"), import_name("host_call")))
+int32_t host_host_call(int32_t fnidx, int32_t args_ptr, int32_t args_len,
+                       int32_t ret_ptr, int32_t ret_cap);
+
+#define HF_RET_CAP (256 * 1024)
+#define HF_DEC_MAX_DEPTH 64
+
+static char hf_retbuf[HF_RET_CAP];
+
+/* hf_error / hf_error_value: raise with the position already decided
+   (rt_sea_raise_nopos seeds the interposed lua_error's verdict) so the
+   catching rt_run adds no "chunk:line:" prefix — host-function messages
+   are complete as written. */
+static int hf_error(lua_State *L, const char *msg) {
+  lua_pushstring(L, msg);
+  rt_sea_raise_nopos();
+  return lua_error(L);
+}
+
+/* the decoded error value is already on top of the stack */
+static int hf_error_value(lua_State *L) {
+  rt_sea_raise_nopos();
+  return lua_error(L);
+}
+
+/* push one wire value at buf[off] onto the Lua stack; returns the new
+   offset or -1 on malformed input (a host bug: surfaced as a Lua error,
+   never a trap). Every level checks stack space BEFORE pushing — an
+   unchecked run past the stack block corrupts adjacent memory (v3's
+   65-deep chaos case found it). lua_checkstack is the public-API form
+   v3's luaD_checkstack served — this TU stays internals-free outside
+   the rt_abi55.h include. */
+static int dec_push_value(lua_State *L, const char *buf, int len, int off,
+                          int depth) {
+  uint32_t u;
+  if (off < 0 || off + 1 > len || depth > HF_DEC_MAX_DEPTH) return -1;
+  uint8_t tag = (uint8_t)buf[off++];
+  switch (tag) {
+  case PT_NIL:
+    if (!lua_checkstack(L, 1)) return -1;
+    lua_pushnil(L);
+    return off;
+  case PT_FALSE:
+    if (!lua_checkstack(L, 1)) return -1;
+    lua_pushboolean(L, 0);
+    return off;
+  case PT_TRUE:
+    if (!lua_checkstack(L, 1)) return -1;
+    lua_pushboolean(L, 1);
+    return off;
+  case PT_INTEGER: {
+    lua_Integer v;
+    if (off + 8 > len) return -1;
+    memcpy(&v, buf + off, 8);
+    if (!lua_checkstack(L, 1)) return -1;
+    lua_pushinteger(L, v);
+    return off + 8;
+  }
+  case PT_NUMBER: {
+    double v;
+    if (off + 8 > len) return -1;
+    memcpy(&v, buf + off, 8);
+    if (!lua_checkstack(L, 1)) return -1;
+    lua_pushnumber(L, v);
+    return off + 8;
+  }
+  case PT_STRING: {
+    if (off + 4 > len) return -1;
+    memcpy(&u, buf + off, 4);
+    off += 4;
+    if (u > (uint32_t)(len - off)) return -1;
+    if (!lua_checkstack(L, 1)) return -1;
+    lua_pushlstring(L, buf + off, (size_t)u);
+    return off + (int)u;
+  }
+  case PT_TABLE: {
+    if (off + 4 > len) return -1;
+    memcpy(&u, buf + off, 4);
+    off += 4;
+    if (!lua_checkstack(L, 1)) return -1;
+    lua_createtable(L, 0, (int)(u < 4096 ? u : 4096));
+    for (uint32_t i = 0; i < u; i++) {
+      if (!lua_checkstack(L, 2)) return -1; /* key + value live simultaneously */
+      off = dec_push_value(L, buf, len, off, depth + 1); /* key */
+      if (off < 0) return -1;
+      off = dec_push_value(L, buf, len, off, depth + 1); /* value */
+      if (off < 0) return -1;
+      lua_settable(L, -3);
+    }
+    return off;
+  }
+  default: return -1; /* functions/userdata/cycles never cross this way */
+  }
+}
+
+/* rt_hf_closure (rt_abi55.c's rt_hostfn registers it as the CClosure):
+   marshal the call into the Go host and the results back. */
+int rt_hf_closure(lua_State *L) {
+  int fnidx = (int)lua_tointeger(L, lua_upvalueindex(1));
+  int n = lua_gettop(L);
+
+  /* encode arguments into evbuf (safe: mutually exclusive with g_print /
+     emit_globals — the host callback cannot trigger guest re-entry) */
+  const void *anc[ENC_MAX_DEPTH + 1];
+  int off = enc_u32(0, (uint32_t)n);
+  for (int i = 1; i <= n && off > 0; i++)
+    off = enc_value(L, i, off, 1, 0, anc, 0);
+  if (off < 0) {
+    return hf_error(L, "host function call: argument encoding overflow");
+  }
+
+  int32_t r = host_host_call(fnidx, (int32_t)(size_t)evbuf, off,
+                             (int32_t)(size_t)hf_retbuf, HF_RET_CAP);
+  if (r < 0) {
+    /* one error value in hf_retbuf; a malformed buffer falls back to a
+       generic message rather than trusting host bytes */
+    int mark = lua_gettop(L);
+    int o = dec_push_value(L, hf_retbuf, HF_RET_CAP, 0, 0);
+    if (o < 0) {
+      lua_settop(L, mark); /* a partial table decode leaves junk below */
+      return hf_error(L, "host function call failed");
+    }
+    return hf_error_value(L);
+  }
+  if (r < 4 || r > HF_RET_CAP) {
+    return hf_error(L, "host function call: malformed result framing");
+  }
+  {
+    uint32_t count;
+    int o = 0;
+    memcpy(&count, hf_retbuf, 4);
+    o = 4;
+    if (count > 4096) {
+      return hf_error(L, "host function call: too many results");
+    }
+    for (uint32_t i = 0; i < count; i++) {
+      o = dec_push_value(L, hf_retbuf, r, o, 0);
+      if (o < 0) {
+        return hf_error(L, "host function call: malformed result value");
+      }
+    }
+    return (int)count;
+  }
+}
+
+/* rt_hf_encode_top: rt_abi55.c's rt_encode_value pushes the cell onto
+   the stack (internals — the TValue cell copy); this half runs the
+   shared wire encoder over it and copies out. Quiescent-state call
+   (host-driven, between runs): exclusive with g_print/emit_globals by
+   the same host sequencing, and allocation-free (lua_next and the push
+   only). Returns the FULL encoded length (the host detects truncation
+   when the return exceeds cap); -1 on overflow. */
+int32_t rt_hf_encode_top(lua_State *L, rt_addr dst, int32_t cap) {
+  const void *anc[ENC_MAX_DEPTH + 1];
+  int off = enc_value(L, -1, 0, 1, 0, anc, 0);
+  if (off < 0) return -1;
+  int32_t n = (int32_t)off < cap ? (int32_t)off : cap;
+  if (n > 0) memcpy((void *)(size_t)dst, evbuf, (size_t)n);
+  return (int32_t)off;
+}
+
+#endif /* LUA_RT_FLAVOR */
 
 /* ---- deterministic environment map for os.getenv/os.setenv ----
 ** (dev engines only — U6d: prod never opens os, so the shims compile

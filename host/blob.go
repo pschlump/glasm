@@ -21,26 +21,26 @@ import (
 	"github.com/pschlump/golua55/wasm"
 )
 
-// The production runtime blob: -DLUAWASM_PROD flavor — base/table/string/
-// math libraries only, imports exactly the six host.* functions, zero
-// WASI imports (no fs/env/clock ever enters the guest). Rebuilt by
-// runtime/build.sh, which copies it here; the SHA pin below is the lock
-// that forces a conscious bump on every rebuild.
+// The production runtime blob: lua55_prod.wasm, the zero-patch Lua 5.5.1
+// tree's prod flavor (U6d, ledger row 95) — base/coroutine/string/table/
+// math/utf8 libraries with loaders nil'd, imports exactly the three
+// host.* functions, zero WASI imports (no fs/env/clock ever enters the
+// guest). ABI v4: variant-tag TValue cells (int64 lossless) and the
+// hostfn seam (rt_hostfn/rt_encode_value + host.host_call, U6e row 96).
+// Rebuilt by runtime/build55.sh, which copies it here; the SHA pin below
+// is the lock that forces a conscious bump on every rebuild.
 //
-//go:embed lua51_prod.wasm
+//go:embed lua55_prod.wasm
 var prodBlob []byte
 
-const prodBlobSHA256 = "4325f355a86e7144c2229e24653f3995f3d9a5caa16e131dae7afc0640b9333f"
+const prodBlobSHA256 = "6f174d0e70859b75939a49e371fc6d8fc4677561c301a29544d7a9af427fc708"
 
 // hostImports is the frozen import surface the blob expects this package
 // to provide (mirrored by testdiff/m6c_test.go's artifact gate).
 var hostImports = []string{
 	"event",         // print/library event stream out of the guest
-	"random01",      // math.random()
-	"randomint",     // math.random(lo,hi)
-	"randomseed",    // math.randomseed(n)
 	"wasm_dispatch", // C adapter → compiled-proto dispatch (same goroutine)
-	"host_call",     // M7a: Lua→Go host functions (redis.call)
+	"host_call",     // Lua→Go host functions (redis.call; U6e row 96)
 }
 
 // verifyBlob enforces the artifact contract on engine construction: the

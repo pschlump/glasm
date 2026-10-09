@@ -24,12 +24,6 @@ func mustEngine(t *testing.T, opts ...Option) *Engine {
 }
 
 func mustCompile(t *testing.T, e *Engine, src string) *Script {
-	// U2e brought the backend back: luawasm.Compile emits ABI v4
-	// modules again, but the host still pins the 5.1 prod blob (v3) —
-	// a v4 module cannot instantiate against it, and the host result
-	// seam (rt_encode_value/rt_hostfn) is U6 surface. Every
-	// compile-based host gate returns with the U6 prod-blob cutover.
-	t.Skip("host run path awaits the U6 prod-blob cutover (v4 module over the 5.1 blob) — ledger row 60")
 	t.Helper()
 	s, err := e.Compile([]byte(src), "=test")
 	if err != nil {
@@ -137,12 +131,16 @@ func TestScriptRuntimeError(t *testing.T) {
 	if !strings.Contains(se.ErrValue.String(), "boom") {
 		t.Fatalf("error value %q missing boom", se.ErrValue.String())
 	}
-	// pcall catches; ok=false + the message survive the round trip
+	// pcall catches; ok=false + the message survive the round trip. The
+	// level-0 raise gains the position prefix on the v4 blob — the ruled
+	// row-85b residual (luaB_error's level-0 arm calls no luaL_where, so
+	// the seam's nopos verdict never fires and the catching rt_run
+	// prefixes; stock Lua would answer bare "inner")
 	res, err := runScript(t, e, `local ok, e = pcall(function() error("inner", 0) end) return ok, e`, RunOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if res.Values[0].BoolVal() || res.Values[1].Str != "inner" {
+	if res.Values[0].BoolVal() || res.Values[1].Str != "=test:1: inner" {
 		t.Fatalf("pcall round-trip: %#v", res.Values)
 	}
 }
@@ -442,9 +440,11 @@ func TestDeterminism(t *testing.T) {
 			continue
 		}
 		for j := range first.Values[0].Pairs {
+			// math.random yields integers — they cross as KindInteger
+			// (U6e wire: payload in .Int, .Num stays 0)
 			a, b := first.Values[0].Pairs[j].Val, res.Values[0].Pairs[j].Val
-			if a.Num != b.Num {
-				t.Fatalf("run %d value %d diverged: %v vs %v", i, j, a.Num, b.Num)
+			if a.Int != b.Int {
+				t.Fatalf("run %d value %d diverged: %v vs %v", i, j, a.Int, b.Int)
 			}
 		}
 	}
@@ -455,7 +455,7 @@ func TestDeterminism(t *testing.T) {
 	}
 	same := true
 	for j := range res2.Values[0].Pairs {
-		if first.Values[0].Pairs[j].Val.Num != res2.Values[0].Pairs[j].Val.Num {
+		if first.Values[0].Pairs[j].Val.Int != res2.Values[0].Pairs[j].Val.Int {
 			same = false
 			break
 		}
@@ -489,7 +489,6 @@ func TestSandbox(t *testing.T) {
 // --- concurrency (A9) — the -race CI requirement -------------------------------
 
 func TestConcurrentFreshVMs(t *testing.T) {
-	t.Skip("host run path awaits the U6 prod-blob cutover (v4 module over the 5.1 blob) — ledger row 60")
 	e := mustEngine(t)
 	const W, N = 8, 15 // goroutines × runs
 	var wg sync.WaitGroup
@@ -547,7 +546,10 @@ func TestSharedVMSerialization(t *testing.T) {
 				t.Error(err)
 				return
 			}
-			results[i] = int64(res.Values[0].Num)
+			// the counter is integer arithmetic end-to-end: KindInteger
+			// crosses lossless (U6e), so read .Int — not .Num (0 for
+			// integer kinds)
+			results[i] = res.Values[0].Int
 		}(i)
 	}
 	wg.Wait()
@@ -622,6 +624,8 @@ func (v Value) Equal(o Value) bool {
 	switch v.Kind {
 	case KindNumber:
 		return v.Num == o.Num
+	case KindInteger:
+		return v.Int == o.Int // U6e: integers cross lossless — compare the payload
 	case KindString:
 		return v.Str == o.Str
 	case KindTable:

@@ -288,6 +288,23 @@ static int u6c_setglobal_body(lua_State *L) {
   return 0;
 }
 
+/* U6e (row 96): the hostfn seam's luawasm55.c halves are RT-flavor only
+   (the host_host_call import); native stubs stand in at link. The
+   closure stub is behaviorally real enough to test rt_hostfn's
+   registration path: it answers its fnidx upvalue. The wire machinery
+   itself (encoding, host_call marshaling, verbatim raises) is covered
+   e2e on the blob gates + the host package. */
+static int hf_stub_runs;
+int rt_hf_closure(lua_State *L) {
+  hf_stub_runs++;
+  lua_pushinteger(L, lua_tointeger(L, lua_upvalueindex(1)));
+  return 1;
+}
+int32_t rt_hf_encode_top(lua_State *L, rt_addr dst, int32_t cap) {
+  (void)L; (void)dst; (void)cap;
+  return -1; /* unsupported natively; rt_encode_value pins the plumbing */
+}
+
 int main(void) {
   TValue c[16];
   rt_addr cc[16];
@@ -1324,6 +1341,42 @@ int main(void) {
     rt_err_clear();
     rt_set_deadline(0);
     CHECK(rt_deadline_flag() == 0);
+  }
+
+  /* ---- U6e (row 96): the hostfn registration seam. Runs BEFORE the
+     U6c lockdown: after rt_protect_globals a missing-global read
+     raises and _G writes are guarded — registration could not touch a
+     fresh table there (the host stages its fns before protect, the
+     engine ordering). ---- */
+  {
+    CHECK(rt_hostfn((rt_addr)(uintptr_t)"hfn_t", (rt_addr)(uintptr_t)"go", 7) ==
+          0);
+    CHECK(hf_stub_runs == 0); /* registered, not yet called */
+    lua_getglobal(L, "hfn_t");
+    CHECK(lua_istable(L, -1)); /* auto-vivified (was absent) */
+    lua_getfield(L, -1, "go");
+    CHECK(lua_iscfunction(L, -1)); /* a CClosure, callable through Lua */
+    CHECK(lua_pcall(L, 0, 1, 0) == 0);
+    CHECK(lua_isinteger(L, -1) && lua_tointeger(L, -1) == 7);
+    CHECK(hf_stub_runs == 1);
+    lua_pop(L, 2);
+    /* re-registration overwrites the slot; the new fnidx answers */
+    CHECK(rt_hostfn((rt_addr)(uintptr_t)"hfn_t", (rt_addr)(uintptr_t)"go",
+                    10) == 0);
+    lua_getglobal(L, "hfn_t");
+    lua_getfield(L, -1, "go");
+    CHECK(lua_pcall(L, 0, 1, 0) == 0);
+    CHECK(lua_isinteger(L, -1) && lua_tointeger(L, -1) == 10);
+    lua_pop(L, 2);
+    /* rt_encode_value: the stub half reports unsupported (-1) and the
+       entry propagates it — the real encoder is the blob gate's cover */
+    {
+      TValue cell;
+      static char buf[64];
+      rt_mkinteger(cell_of(&cell), 42);
+      CHECK(rt_encode_value(cell_of(&cell), (rt_addr)(uintptr_t)buf,
+                            sizeof buf) == -1);
+    }
   }
 
   /* ---- U6c (rows 33/50, ledger row 94): sandbox + globals lockdown */

@@ -20,7 +20,8 @@ type ValueError struct{ V Value }
 
 func (e *ValueError) Error() string { return "host function error: " + e.V.String() }
 
-// EVT_PRINT is the event kind g_print emits (runtime/luawasm.c).
+// EVT_PRINT is the event kind g_print emits (runtime/luawasm55.c — the
+// 5.5 driver; same tag-first wire as the 5.1 one, plus PT_INTEGER).
 const EVT_PRINT = 1
 
 // hostEvent receives the guest's event stream (print). The payload is

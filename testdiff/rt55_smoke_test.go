@@ -2,7 +2,7 @@ package testdiff
 
 // U2d smoke gate for the ABI v4 runtime blob: lua55_rt.wasm (stock Lua
 // 5.5.1 + rt_abi55.c, zero patches) must instantiate on the production
-// engine (wazero) with its two host imports, answer LUA_RT_ABI=4, and
+// engine (wazero) with its three host imports, answer LUA_RT_ABI=4, and
 // run a chunk through the driver — integer semantics intact. The full
 // ABI surface is exercised natively by runtime/tests (rt_native55_test,
 // the U2d gate proper); the engines wire up at U2e.
@@ -37,8 +37,9 @@ func TestRT55BlobSmoke(t *testing.T) {
 		t.Fatalf("wasi: %v", err)
 	}
 
-	// the blob imports host.event (the oracle driver) and
-	// host.wasm_dispatch (the ABI v4 trampoline seam)
+	// the blob imports host.event (the oracle driver),
+	// host.wasm_dispatch (the ABI v4 trampoline seam), and
+	// host.host_call (the U6e hostfn seam — row 96)
 	var events []string
 	host, err := r.NewHostModuleBuilder("host").
 		NewFunctionBuilder().
@@ -53,6 +54,16 @@ func TestRT55BlobSmoke(t *testing.T) {
 			return 0xFFFFFFFD // RTW_REFUSED (-3): no script module here
 		}).
 		Export("wasm_dispatch").
+		// U6e (row 96): the hostfn seam import — refused like the engines
+		// (the smoke run registers no host functions, so this never fires)
+		NewFunctionBuilder().
+		WithFunc(func(fnidx, argsPtr, argsLen, retPtr, retCap int32) int32 {
+			if m := r.Module("lua55rt"); m != nil {
+				_ = m.Memory().Write(uint32(retPtr), wireErrHostFns)
+			}
+			return -1
+		}).
+		Export("host_call").
 		// U2e: the D5 host-RNG shim imports (math.random determinism)
 		NewFunctionBuilder().WithFunc(func() float64 { return 0.5 }).Export("random01").
 		NewFunctionBuilder().WithFunc(func(lo, hi uint32) uint32 { return lo }).Export("randomint").

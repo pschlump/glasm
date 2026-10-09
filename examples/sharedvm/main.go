@@ -48,7 +48,9 @@ func main() {
 				log.Print(err)
 				return
 			}
-			results <- int64(res.Values[0].Num)
+			// integer arithmetic end-to-end: the counter crosses as
+			// KindInteger (payload in .Int — .Num stays 0 for integers)
+			results <- res.Values[0].Int
 		}()
 	}
 	wg.Wait()

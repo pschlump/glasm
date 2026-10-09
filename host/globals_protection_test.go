@@ -50,9 +50,16 @@ func TestGlobalsProtectionErrors(t *testing.T) {
 		{"_G.pairs = nil return 1", "=test:1: Attempt to modify a readonly table"},
 		{"return _G[nil]",
 			"=test:1: Second argument to luaProtectedTableError must be a string or number"},
-		// rawset/rawseti raise WITHOUT the position prefix (Redis's
-		// luaG_runerror has no Lua ci inside the C base function)
-		{"rawset(_G, 'g3', 1) return 1", "Attempt to modify a readonly table"},
+		// rawset/rawseti: caught INSIDE the script (pcall) the raise is
+		// bare — the m6c corpus pin (row 94; the raise happens under the
+		// rawset C function frame, no position anywhere). UNCAUGHT (this
+		// shape), the v4 seam re-pins it prefixed: the guard raises via
+		// the luaG_runerror replica (nopos cleared — the core-raise
+		// rule), so the catching rt_run bolts the raise site's
+		// chunk:line on (row 85b family; v3/Redis's bare form was an
+		// isLua(ci) artifact of C-VM execution with no compiled-frame
+		// analog)
+		{"rawset(_G, 'g3', 1) return 1", "=test:1: Attempt to modify a readonly table"},
 	}
 	for _, c := range cases {
 		res, err := runProtected(t, e, c.src)

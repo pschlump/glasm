@@ -13,11 +13,13 @@ package testdiff
 // its own call sites.
 //
 // The protocol mirrors wasmengine.go (the wasmtime host): shared memory
-// owned by the blob, host.event/random*/wasm_dispatch imports, the M2
+// owned by the blob, host.{event,wasm_dispatch,host_call} imports, the M2
 // driver exports (lnewstate/ldostring/lglobals...), gc-stop + arg-setup
-// ldostrings, rt_set_dialect(1), luawasm_init, rt_frame_alloc, lua_main,
+// ldostrings, luawasm_init, rt_frame_alloc, lua_main,
 // staged-error readback, io.flush before reading the stdout capture. stdout
 // is a bytes.Buffer (wazero WASI WithStdout) instead of a temp file.
+// (No rt_set_dialect on v4 — the dialect layer retired at U3/row 56, when
+// the interp oracle was re-pinned to stock texts.)
 
 import (
 	"bytes"

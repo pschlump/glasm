@@ -248,6 +248,23 @@ int32_t rt_sandbox(int32_t on);
 int32_t rt_protect_globals(int32_t on);
 int32_t rt_globals_readonly(int32_t on);
 
+/* U6e (row 96): the host-fn seam — v3's M7a block ported onto v4.
+** rt_hostfn installs <table_ptr>.<name_ptr> = host function #fnidx
+** (NUL-terminated names in the host staging buffers, the v3 contract),
+** the CClosure being rt_hf_closure (luawasm55.c: it marshals args over
+** host.host_call through the wire staging buffers, raises verbatim
+** via rt_sea_raise_nopos, decodes results back onto the Lua stack).
+** Registration runs under rt_run (it allocates). rt_encode_value
+** encodes the TValue CELL at `cell` in the wire protocol (tables
+** expanded, PT_INTEGER distinct — int64 lossless) for the host's
+** result reads; called between runs with the state quiescent, like
+** v3. rt_hf_encode_top is the luawasm55.c half (evbuf encoder over the
+** value at the stack top) the native ABI tests stub. */
+int32_t rt_hostfn(rt_addr table_ptr, rt_addr name_ptr, int32_t fnidx);
+int32_t rt_encode_value(rt_addr cell, rt_addr dst, int32_t cap);
+int rt_hf_closure(lua_State *L);          /* luawasm55.c (RT flavor) */
+int32_t rt_hf_encode_top(lua_State *L, rt_addr dst, int32_t cap);
+
 /* globals */
 int32_t rt_getglobal(rt_addr dstcell, rt_addr keycell, int32_t line);
 int32_t rt_setglobal(rt_addr keycell, rt_addr valcell, int32_t line);
@@ -356,6 +373,12 @@ void rt_sea_reset(void);
 int rt_sea_line(struct CallInfo *ci);
 int32_t rt_sea_nopos(void);
 void rt_sea_nopos_set(int32_t v);
+/* U6e (row 96): mark the NEXT lua_error's verdict "no position" — the
+   hostfn seam raises COMPLETE messages (Redis command texts propagate
+   verbatim); the interposed lua_error reads this into rt_sea_nopos and
+   the catching rt_run's staging skips its chunk:line prefix. One-shot
+   (consumed by the raise), the wheremiss discipline. */
+void rt_sea_raise_nopos(void);
 /* the msgh seam (U5e, row 85): the interposed luaG_errormsg sets this
    when it dispatched an in-flight error's handler at a C-land raise;
    rtw_reraise's handler arm reads it to avoid a double run (errors that

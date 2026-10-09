@@ -45,7 +45,8 @@ var lua51ProdWasm []byte
 //go:embed lua55_prod.wasm
 var lua55ProdWasm []byte
 
-// value-protocol tags (must match runtime/luawasm.c)
+// value-protocol tags (must match runtime/luawasm.c and
+// runtime/luawasm55.c — U6e adds PT_INTEGER=13 there)
 const (
 	ptNil = iota
 	ptFalse
@@ -60,11 +61,13 @@ const (
 	ptCycle
 	ptDeepTable
 	ptMore
+	ptInteger
 )
 
 type cval struct {
 	tag  byte
 	num  float64
+	inum int64 // ptInteger: LUA_VNUMINT, lossless (U6e)
 	str  string
 	tbl  []([2]cval)
 	more bool
@@ -82,6 +85,11 @@ func (p *cparser) f64() float64 {
 	p.off += 8
 	return v
 }
+func (p *cparser) i64() int64 {
+	v := int64(binary.LittleEndian.Uint64(p.b[p.off:]))
+	p.off += 8
+	return v
+}
 
 // value decodes one value. expand selects whether a PT_TABLE tag carries
 // entries (GLOBALS serialization) or is bare (print never expands tables —
@@ -96,6 +104,8 @@ func (p *cparser) value(expand bool) (cval, error) {
 		return cval{tag: t}, nil
 	case ptNumber:
 		return cval{tag: t, num: p.f64()}, nil
+	case ptInteger:
+		return cval{tag: t, inum: p.i64()}, nil
 	case ptString:
 		n := p.u32()
 		s := string(p.b[p.off : p.off+int(n)])
@@ -133,6 +143,8 @@ func cprintArg(v cval) string {
 		return v.str
 	case ptNumber:
 		return NumRepr(v.num)
+	case ptInteger:
+		return strconv.FormatInt(v.inum, 10)
 	case ptNil:
 		return "nil"
 	case ptFalse:
@@ -158,6 +170,8 @@ func crepr(v cval, depth int) string {
 		return strconv.Quote(v.str)
 	case ptNumber:
 		return NumRepr(v.num)
+	case ptInteger:
+		return strconv.FormatInt(v.inum, 10)
 	case ptNil:
 		return "nil"
 	case ptFalse:

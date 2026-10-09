@@ -22,18 +22,20 @@ import (
 	"github.com/pschlump/golua55/wasm"
 )
 
-// lua55ProdSHA256 pins the embedded 5.5 prod blob (U6d, row 95).
+// lua55ProdSHA256 pins the embedded 5.5 prod blob (U6d, row 95;
+// re-bumped at U6e: the hostfn seam — host.host_call import +
+// rt_hostfn/rt_encode_value exports, and the PT_INTEGER wire tag).
 // Rebuild runtime/build55.sh → update this constant (the artifact test
 // is the self-check that forces the bump). Brittle by design (A8:
-// checksummed artifact). U6e bumps it: the hostfn seam (host.host_call
-// import + rt_hostfn/rt_encode_value exports).
-const lua55ProdSHA256 = "23295471893353ed32e263b073593981aee4d867da01d2b75c8bb5a0d99ed0a7"
+// checksummed artifact).
+const lua55ProdSHA256 = "6f174d0e70859b75939a49e371fc6d8fc4677561c301a29544d7a9af427fc708"
 
 // TestM6cProdBlobArtifact (U6d edition, ledger row 95): lua55_prod.wasm
 // — the 5.5 production flavor of the rt blob. The build's output is
 // self-checking (A8): zero wasi imports (any leak — a vendored edit, a
-// wasi-sdk change — fails here before any engine runs), exactly the two
-// host.* imports the driver declares, the full v4 rt_* export surface,
+// wasi-sdk change — fails here before any engine runs), exactly the three
+// host.* imports the driver declares (U6e added host_call), the full v4
+// rt_* export surface,
 // and byte-identity with host/'s copy (the embed dance's drift lock).
 func TestM6cProdBlobArtifact(t *testing.T) {
 	imps, err := wasm.Imports(lua55ProdWasm)
@@ -48,7 +50,7 @@ func TestM6cProdBlobArtifact(t *testing.T) {
 		}
 		got[im.Name] = true
 	}
-	want := []string{"event", "wasm_dispatch"}
+	want := []string{"event", "wasm_dispatch", "host_call"}
 	for _, w := range want {
 		if !got[w] {
 			t.Errorf("host.%s missing from prod blob (have %v)", w, got)
@@ -79,7 +81,9 @@ func TestM6cProdBlobArtifact(t *testing.T) {
 		"rt_set_memlimit", "rt_mem_used_bytes", "rt_ctrl_addr", "rt_set_deadline",
 		"rt_deadline_flag", "rt_deadline",
 		// U6c: the lockdown surface (row 94)
-		"rt_sandbox", "rt_protect_globals", "rt_globals_readonly"} {
+		"rt_sandbox", "rt_protect_globals", "rt_globals_readonly",
+		// U6e: the hostfn seam (row 96)
+		"rt_hostfn", "rt_encode_value"} {
 		if !exp[name] {
 			t.Errorf("prod blob export %s missing", name)
 		}

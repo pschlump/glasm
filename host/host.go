@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"strconv"
 	"strings"
 	"sync"
 
@@ -117,7 +118,7 @@ func (e *Engine) RegisterValue(table, name string, v Value) error {
 		return errors.New("host: RegisterValue requires Lua-identifier table and name")
 	}
 	switch v.Kind {
-	case KindNil, KindFalse, KindTrue, KindNumber, KindString:
+	case KindNil, KindFalse, KindTrue, KindNumber, KindInteger, KindString:
 	default:
 		return errors.New("host: RegisterValue supports only nil/bool/number/string values")
 	}
@@ -150,6 +151,8 @@ func luaValueLit(v Value) string {
 		return "true"
 	case KindNumber:
 		return numRepr(v.Num)
+	case KindInteger:
+		return strconv.FormatInt(v.Int, 10)
 	case KindString:
 		return luaQuote(v.Str)
 	}

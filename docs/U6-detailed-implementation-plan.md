@@ -529,3 +529,46 @@ SharedVMSerialization, OneScriptLaw, EventSink; `CGO_ENABLED=0 go build ./host/`
   CLua55Conformance), `_cli-tests` ×{wasmtime, WAZERO=1}. Ledger row 95;
   note/u6d-implemented.md. Next: U6e (the host-package cutover: host/ embeds
   lua55_prod.wasm, the hostfn seam, retire the 5.1 prod blob).
+
+- **U6e COMPLETE (2026-10-09)** — **row 96 NEW** (the hostfn seam's zero-patch shape, the
+  PT_INTEGER protocol change, the nopos-verbatim error channel, and the four re-pins the
+  revived battery forced). M7a's v3 block ports onto ABI v4 in three pieces:
+  **(a) `rt_hostfn`** (rt_abi55.c) — registration under `rt_run` (v3's lua_cpcall is gone
+  twice: 5.5 dropped it and the row-61 law governs); absent/shadowed global table replaced
+  fresh, `lua_pushcclosure(rt_hf_closure, fnidx)`, setfield. **(b) the wire halves**
+  (luawasm55.c's LUA_RT_FLAVOR block — rt + prod legs, NOT the sjlj oracle):
+  `rt_hf_closure` encodes args via enc_value(expand=1) into evbuf → the new
+  `host.host_call` import (the prod blob's third) → error frames re-raise VERBATIM through
+  `rt_sea_raise_nopos` (rt_seam55.c — the wheremiss verdict rides the interposed
+  lua_error into nopos, so the catching rt_run skips chunk:line for exactly that raise;
+  the v4 analog of v3's rt_where_mark) → results (u32 count ≤4096) materialized by
+  `dec_push_value` on PUBLIC lua_checkstack-per-push (the v3 65-deep lesson),
+  HF_DEC_MAX_DEPTH=64; `rt_hf_encode_top` returns the FULL encoded length so the host can
+  re-encode into a big frame alloc. Neither is a wasm export — rt_abi55.h decls + native
+  stubs keep them alive. **(c) `rt_encode_value(cell,dst,cap)`** — push-nil-then-overwrite
+  onto the real stack, encode, restore top; raw/alloc-free (no rt_run wrap). The host's
+  readCellValue rides it for every result value. **(d) PT_INTEGER=13** in the SHARED
+  enc_value (lua_isinteger split; enc_i64 lossless — the f64-only U0 caveat retires): the
+  oracle blob lua55_sjlj.wasm legitimately CHANGES BYTES this rebuild (no SHA pin on it;
+  D6's law is about sources; clua.go's cparser + normalize.go's LInteger arms grew the
+  FormatInt render — identical below 1e15, CORRECT above; no CLI ref pinned a ≥1e15
+  integer). **(e) the host cutover** — blob.go embeds lua55_prod.wasm (275,160 B, sha
+  6f174d0e…, byte-cmp with testdiff's copy; surface = the three host.* imports +
+  rt_hostfn/rt_encode_value exports; the 5.1 prod blob retires from the package); wire.go
+  KindInteger (Int int64; Int(); encode/decode/String arms) + numRepr re-pinned to stock
+  5.5 float rendering (%.15g/re-read/%.17g/".0"/-nan-inf, from formatlib's
+  numberToStringStock — the daemon package carries its own copy); vm.go: rt_set_dialect
+  GONE (ABI 4, row 56), host module = exactly the blob's three imports, Seed lowers to a
+  guest math.randomseed(n) ldostring, luawasm_init keeps arg 2 (not an ABI version); the
+  mustCompile/TestConcurrentFreshVMs skips deleted. **(f) the four re-pins**: uncaught
+  rawset gains the position (v3/Redis's bare form was an isLua(ci) artifact of C-VM
+  execution — no compiled-frame analog; caught stays bare per the m6c corpus);
+  error(msg,0) keeps the row-85b residual; Determinism/SharedVM/sharedvm-example read
+  `.Int` (stale `.Num` — 0 for integer kinds now); the host-test Value.Equal gained a
+  KindInteger arm (it had been vacuous for integers). Gates green: `go test ./host/ -race
+  -count=1` ×2 (81s), CGO_ENABLED=0 build, go vet, examples {eval, evalserver -race,
+  sharedvm -race}, RT-NATIVE55 ×{plain, ASan, UBSan}, m6c/m6cd/m6d gates (new sha
+  artifact; SandboxMatrix 1500/1500; Determinism5x), root `go test .`, the full testdiff
+  battery, `_cli-tests` ×{wasmtime, WAZERO=1} — refs untouched. Ledger row 96;
+  note/u6e-implemented.md. Next: U6f (closeout — plan §5 retrospection, CLAUDE.md sweep,
+  the U7 arena lifecycle groundwork question).

@@ -20,7 +20,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"math/rand"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -41,9 +41,12 @@ type RunOptions struct {
 	// pcall-catchable error ("context deadline exceeded" — M6d D4). Zero
 	// disables the watchdog.
 	Deadline time.Duration
-	// Seed reseals the VM's math.random stream for this run (determinism
-	// D5). Zero keeps the VM's existing stream (fresh VMs start at 42 —
-	// the harness contract — so set it for reproducible runs).
+	// Seed reseals the VM's math.random stream for this run by running
+	// math.randomseed(n) in the guest (determinism D5): the stock
+	// xoshiro256** stream, identical to the interpreter's — same seed,
+	// same sequence on every engine. Zero keeps the VM's existing stream
+	// (fresh VMs start at the build-pinned stream: luai_makeseed()=0u in
+	// runtime/build55.sh; the host-RNG imports retired at U3b).
 	Seed int64
 }
 
@@ -82,7 +85,7 @@ var ErrReentrant = errors.New("host: VM.Run called from inside a host function (
 var ErrScriptBound = errors.New("host: VM is bound to a different script (v1: one script per VM image)")
 
 // deadlineFlagLE is the watchdog's single store: 1 as 4 little-endian
-// bytes (the rt control-block contract, rt_abi.c).
+// bytes (the rt control-block contract, rt_abi55.c).
 var deadlineFlagLE = []byte{1, 0, 0, 0}
 
 func u32v(v int32) uint64 { return uint64(uint32(v)) }
@@ -98,7 +101,6 @@ type VM struct {
 	mem       api.Memory
 	L         int32 // the lua_State handle from lnewstate
 	ctrlAddr  uint32
-	rng       *rand.Rand
 	hostFns   []registeredFn  // snapshot of the engine registry
 	hostVals  []registeredVal // snapshot of the engine value registry
 	eventSink func(vm *VM, args []Value)
@@ -125,17 +127,17 @@ type VM struct {
 }
 
 // NewVM builds a fresh image: runtime + host module + rt instance + Lua
-// state, sandboxed and dialect-pinned, with the engine's host functions
-// registered. µs–ms (instantiation plus the C state build); the M0-era
-// measurement put wazero instantiation at ~7.4 µs for a tiny module —
-// this one also opens the Lua stdlib.
+// state, sandboxed, with the engine's host functions registered. µs–ms
+// (instantiation plus the C state build); the M0-era measurement put
+// wazero instantiation at ~7.4 µs for a tiny module — this one also
+// opens the Lua stdlib.
 func (e *Engine) NewVM() (*VM, error) {
 	e.mu.Lock()
 	if e.closed {
 		e.mu.Unlock()
 		return nil, errors.New("host: engine closed")
 	}
-	vm := &VM{e: e, rng: rand.New(rand.NewSource(42)), hostFns: e.hostFns, hostVals: e.hostVals, eventSink: e.opts.eventSink}
+	vm := &VM{e: e, hostFns: e.hostFns, hostVals: e.hostVals, eventSink: e.opts.eventSink}
 	e.vms++
 	e.mu.Unlock()
 
@@ -146,16 +148,12 @@ func (e *Engine) NewVM() (*VM, error) {
 	vm.rt = r
 
 	// host module — closures bound to THIS VM (per-runtime instance, so
-	// concurrent VMs never cross-dispatch)
+	// concurrent VMs never cross-dispatch). Exactly the blob's import
+	// surface: event, wasm_dispatch, host_call (the host.random* RNG
+	// imports retired at U3b — math.random is the guest's own stock
+	// xoshiro256** stream now; see RunOptions.Seed)
 	_, err := r.NewHostModuleBuilder("host").
 		NewFunctionBuilder().WithFunc(vm.hostEvent).Export("event").
-		NewFunctionBuilder().WithFunc(func() float64 { return vm.rng.Float64() }).Export("random01").
-		NewFunctionBuilder().WithFunc(func(lo, hi int32) int32 {
-		return int32(vm.rng.Intn(int(hi-lo+1)) + int(lo))
-	}).Export("randomint").
-		NewFunctionBuilder().WithFunc(func(seed int64) {
-		vm.rng = rand.New(rand.NewSource(seed))
-	}).Export("randomseed").
 		NewFunctionBuilder().WithFunc(vm.hostDispatch).Export("wasm_dispatch").
 		NewFunctionBuilder().WithFunc(vm.hostCall).Export("host_call").
 		Instantiate(ctx)
@@ -198,8 +196,10 @@ func (e *Engine) NewVM() (*VM, error) {
 		r.Close(ctx)
 		return nil, fmt.Errorf("host: rt_set_state: %w", err)
 	}
-	// globals lockdown (prod belt-and-suspenders): nils io/os/package/
-	// require/module/dofile/loadfile/load/loadstring/debug
+	// globals lockdown (prod belt-and-suspenders): rt_sandbox nils the
+	// 5.5 untrusted surface — io os package require dofile loadfile load
+	// debug warn (loadstring/module never existed in 5.5; the prod blob
+	// compiles them out and this is the no-op return)
 	if _, err := vm.call0(ctx, "rt_sandbox", 1); err != nil {
 		r.Close(ctx)
 		return nil, fmt.Errorf("host: rt_sandbox: %w", err)
@@ -209,15 +209,11 @@ func (e *Engine) NewVM() (*VM, error) {
 		r.Close(ctx)
 		return nil, fmt.Errorf("host: gc stop: %w", err)
 	}
-	// the gopher message dialect (byte-exact error texts vs the interp
-	// oracle — M5d)
-	if _, err := vm.call0(ctx, "rt_set_dialect", 1); err != nil {
+	// ABI v4 (the 5.5 tree): variant-tag cells, stock 5.5 error texts —
+	// no dialect layer (the interp oracle was re-pinned to stock, row 56)
+	if v, err := vm.call0(ctx, "rt_abi_version"); err != nil || int32(v[0]) != 4 {
 		r.Close(ctx)
-		return nil, fmt.Errorf("host: rt_set_dialect: %w", err)
-	}
-	if v, err := vm.call0(ctx, "rt_abi_version"); err != nil || int32(v[0]) != 3 {
-		r.Close(ctx)
-		return nil, fmt.Errorf("host: ABI version mismatch (need 3)")
+		return nil, fmt.Errorf("host: ABI version mismatch (need 4)")
 	}
 	// host functions: redis.call and friends (names ride namebuf)
 	for i, hf := range vm.hostFns {
@@ -423,7 +419,13 @@ func (vm *VM) Run(ctx context.Context, s *Script, opt RunOptions) (res Result, e
 	}
 
 	if opt.Seed != 0 {
-		vm.rng = rand.New(rand.NewSource(opt.Seed))
+		// D5 determinism: reseal in the guest — math.randomseed(n) over
+		// the stock xoshiro256** stream (identical to the interpreter's;
+		// the host-RNG imports retired at U3b)
+		seed := "math.randomseed(" + strconv.FormatInt(opt.Seed, 10) + ")"
+		if err := vm.ldostring(ctx, seed, "=seed"); err != nil {
+			return Result{}, err
+		}
 	}
 
 	// the deadline watchdog: the timer and ctx cancellation both flip the

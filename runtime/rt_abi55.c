@@ -1122,6 +1122,69 @@ int32_t rt_globals_readonly(int32_t on) {
   return rt_run(readonly_body, 0, -1, -1, -1, NULL) != RT_OK ? -1 : 0;
 }
 
+/* ---- U6e (row 96): the host-fn seam — the registration half ----
+**
+** v3's rt_hostfn rode lua_cpcall, which 5.5 retired; the protection
+** here is rt_run (registration allocates: interned name, CClosure —
+** same defensive shape as the U6c bodies). The CClosure body is
+** rt_hf_closure (luawasm55.c, RT flavor): it marshals the call over
+** host.host_call, raises verbatim via rt_sea_raise_nopos, and decodes
+** results back onto the Lua stack. table/name point into the host's
+** staging namebuf (NUL-terminated, v3's contract); the statics ride
+** the C stack across the protected body — the reentrancy law's uniform
+** discipline, though the constructor call cannot re-enter compiled
+** code. */
+static const char *hf_table, *hf_name;
+static int hf_fnidx;
+
+static void hf_reg_body(void) {
+  lua_State *L = curL;
+  lua_getglobal(L, hf_table);
+  if (!lua_istable(L, -1)) { /* absent or shadowed by a non-table: make one */
+    lua_pop(L, 1);
+    lua_newtable(L);
+    lua_pushvalue(L, -1);
+    lua_setglobal(L, hf_table);
+  }
+  lua_pushinteger(L, hf_fnidx);
+  lua_pushcclosure(L, rt_hf_closure, 1);
+  lua_setfield(L, -2, hf_name);
+  lua_pop(L, 1);
+}
+
+int32_t rt_hostfn(rt_addr table_ptr, rt_addr name_ptr, int32_t fnidx) {
+  if (curL == NULL) return -1;
+  hf_table = (const char *)(size_t)table_ptr;
+  hf_name = (const char *)(size_t)name_ptr;
+  hf_fnidx = (int)fnidx;
+  return rt_run(hf_reg_body, 0, -1, -1, -1, NULL) != RT_OK ? -1 : 0;
+}
+
+/* rt_encode_value: the TValue CELL at `cell` in the wire protocol
+   (tables expanded, PT_INTEGER distinct — int64 lossless) into
+   dst[0..cap). Quiescent-state host call (between runs, like v3):
+   encoding is raw traversal (lua_next honors no metamethods) and
+   allocation-free, so no rt_run protection is needed. The cell is
+   copied onto the stack with the push-nil-then-overwrite idiom (the
+   slot must hold a valid TValue before top moves); rt_hf_encode_top
+   (luawasm55.c) runs the shared encoder over the stack top. Returns
+   the FULL encoded length — the host re-calls with a larger buffer on
+   truncation — or -1. */
+int32_t rt_encode_value(rt_addr cell, rt_addr dst, int32_t cap) {
+  lua_State *L = curL;
+  int base, n;
+  if (L == NULL) return -1;
+  base = lua_gettop(L);
+  luaD_checkstack(L, 1);
+  setnilvalue(s2v(L->top.p));
+  L->top.p++;
+  setobj2s(L, L->top.p - 1, (const TValue *)(size_t)cell);
+  n = rt_hf_encode_top(L, dst, cap);
+  L->top.p--;
+  lua_settop(L, base);
+  return n;
+}
+
 /* ---- raising from emitted code ---- */
 
 void rt_error(rt_addr msgptr, int32_t msglen, int32_t line) {
