@@ -340,10 +340,13 @@ SharedVMSerialization, OneScriptLaw, EventSink; `CGO_ENABLED=0 go build ./host/`
    freeze-per-version discipline. Ledger row records the deprecation.
 2. **The wasm yield surface is noyield parity, not continuations.** Full resumable yields from
    compiled code need Asyncify/CPS — ruled out of scope at design §7.7/row 22, unchanged. U6f's
-   ruling: yields from compiled code raise the catchable `attempt to yield across a C-call
-   boundary` (the interp's own row-84g dialect for C-boundary yields — compiled frames ARE the
-   C boundary), probe-verified, covering tests, ledger row. `coroutine.lua`/`issues.lua` wasm
-   legs stay skipped on row 22 with the narrowed reason.
+   ruling (row 97, as probed — the plan's predicted C-boundary wording was WRONG): the rt ABI is
+   single-state, so every yield from compiled code reaches `lua_yieldk` on the rt-pinned MAIN
+   thread and takes stock's mainthread arm (ldo.c:1015) — the catchable, position-prefixed
+   `attempt to yield from outside a coroutine`; `coroutine.isyieldable()` answers false in a
+   compiled body (interp: true — the one value divergence); caught raises survive, uncaught
+   kills the thread; yield-free bodies run stock. `coroutine.lua`/`issues.lua` wasm legs stay
+   skipped on row 22 with the narrowed reason.
 3. **The GC freeze stays; real rooting is ruled out under zero-patch.** Row 61's aspirational
    "the U6 arena retires the freeze with real rooting" is downgraded: the pool/frame cells live
    in linear memory invisible to stock's collector, and anchoring them requires either patches
@@ -377,9 +380,15 @@ SharedVMSerialization, OneScriptLaw, EventSink; `CGO_ENABLED=0 go build ./host/`
 
 ## 5. U6 exit gate (consolidated)
 
-- `TestWasmFullMatrix` / `TestWasmErrorSuite` / `TestWasmGluaFull` green on the 5.5 corpora ×
-  {`interp`, `clua55`, `wasm`, `wazero`, `wazero-prod`} — the clua55 and wazero-prod columns
-  added (U6f), zero un-ledgered diffs; var07/vgap01/limits01 in the green set (row 86 closed).
+- `TestWasmFullMatrix` / `TestWasmErrorSuite` / `TestWasmGluaFull` / `TestU5WasmGate` green on
+  the 5.5 corpora × {`interp`, `clua55`, `wasm`, `wazero`, `wazero-prod`} — the clua55 and
+  wazero-prod columns added (U6f), zero un-ledgered diffs; var07/vgap01/limits01 in the green
+  set (row 86 closed). Column split (U6f's harness ruling, row 98): the clua55 column is swept
+  inline only on `_glua-tests` — the big corpora's oracle columns are the standing
+  `TestU2fMatrixOracle`/`TestU2fErrorOracle` and `_u5`'s is `TestU5Gate` (corpus whole, a
+  superset); re-sweeping inline crossed the per-process wasmtime Store budget (each Store
+  statically maps the blob's 256 MiB + ~8 GB of arm64 guard region; the M6e SIGTRAP cliff at
+  ~4k stores — `runtime.GC()` cadencing does not reclaim it, note/m6e).
 - M6c artifact/sandbox/determinism gates green **on `lua55_prod.wasm`**: import-section gate
   (zero wasi, exact `host.*` set), SHA pin, sandboxed-dev ≡ prod, D5 determinism legs.
 - M6d memlimit/deadline gates green on the v4 blob (both hosts); native ABI battery
@@ -572,3 +581,72 @@ SharedVMSerialization, OneScriptLaw, EventSink; `CGO_ENABLED=0 go build ./host/`
   battery, `_cli-tests` ×{wasmtime, WAZERO=1} — refs untouched. Ledger row 96;
   note/u6e-implemented.md. Next: U6f (closeout — plan §5 retrospection, CLAUDE.md sweep,
   the U7 arena lifecycle groundwork question).
+
+- **U6f COMPLETE (2026-10-09) — U6 COMPLETE.** **Rows 97 + 98 + 99 NEW.** (a) **The yield
+  posture (row 97, §4.2's probe-first mandate answered)** — the plan predicted the
+  C-boundary wording; the probe found the MAINTHREAD arm, and the mechanism is exact:
+  the rt ABI is single-state (rt_set_state pins curL), so every rt_* call from compiled
+  code runs on the rt-pinned main state — a yield reaches lua_yieldk with L ==
+  mainthread and stock's own branch (ldo.c:1015–1019) raises the catchable,
+  position-prefixed "attempt to yield from outside a coroutine". Posture pinned, ZERO
+  code changes: yield-free bodies run stock (resume/status/returns); a direct yield
+  raises (uncaught → resume false+msg, thread dead; caught → thread survives and
+  completes); coroutine.isyieldable() answers FALSE in a compiled body (interp: true —
+  the one value divergence); the bare/prefixed split follows the seam's nopos rule
+  (pcall calling yield DIRECTLY catches bare — no compiled frame between; through a
+  compiled frame it's prefixed). No corruption/traps — the plan's guard trigger never
+  fired. `_u6/coyield01.lua` (NEW) pins all five shapes absolutely ×{wasm, wazero} in
+  TestU6SandboxCorpus; `_u5/coyield01–06` re-pinned from "row 84 backend at U6" to
+  row 97 (interp/clua55 suspend them — TestU5Gate green). §4.2's text corrected.
+  (b) **Gate expansion (row 98)** — `exitGateEngines` (m5gate_test.go): the four heavy
+  corpus gates (FullMatrix/ErrorSuite/GluaFull/U5WasmGate) run per-column RunCorpus
+  passes — wasm-family {interp, wasm, wazero} under CorpusSkips; oracle {interp,
+  clua55} under oracleSkipsFor (clua55MatrixSkips/clua55ErrOracleSkips); prod
+  {interp, wazero-prod (UseProdBlob)} under the NEW prodBlobSkips — one corpus-wide
+  skip map cannot serve five engines (oracle-only rulings would come off green wasm
+  legs; the prod column alone would lose surface users). TestU5WazeroGate folded
+  into TestU5WasmGate; u5WasmLeg deleted. **The withOracle split the first battery
+  forced:** sweeping clua55 inline on every corpus too crossed the per-process
+  wasmtime Store budget — every Store statically maps the blob's 256 MiB memory +
+  ~8 GB of arm64 guard region, Go finalizers reclaim far too slowly, and
+  `runtime.GC()` cadencing does NOT stop it (M6e's soak finding, note/m6e) — the
+  battery died with SIGTRAP (trace/BPT trap) at ~4.3k stores, mid-TestU2fMatrixOracle
+  (the identical sweep had passed 30s earlier inside the matrix gate's oracle pass;
+  standalone the gate is green in 39s). Ruling: the clua55 column sweeps inline only
+  on _glua-tests (4 cases, no dedicated oracle gate); the big corpora's oracle
+  columns are the standing TestU2fMatrixOracle/TestU2fErrorOracle (same corpus,
+  engines, skip maps — in the same battery) and _u5's is TestU5Gate (corpus whole,
+  zero skips — a superset). ~3.5k stores/battery, the U6e-proven envelope. **The prod audit is the empirical interp-vs-prod probe, not a
+  grep** — the `\brequire\(` pattern missed slu00–07's paren-less `require'utf8'`;
+  16 skips, all row 95 (slu00–07; base.lua's dofile; os.lua; call01's debug.getinfo;
+  gotostar01/limits01/var06/var08's load()) — _wasm-err-tests needs ZERO (96/96);
+  calcshape's io.open at :204 is dead code and STAYS. Stale-skip refresh: calcshape
+  un-skipped from clua55MatrixSkips (U5's read-only for-control vars fixed it); len03
+  re-cited to row 82. (c) **Row 99 — the GC-STW × wazero-JIT wedge** (the first plain-mode
+  `go test -short ./...` sweep wedged the host package; every prior host gate was -race-only
+  and had been passing on GC-phase luck since U6e): an unbounded guest loop runs as
+  unpreemptible wazero-JIT code; a Go GC mark-STW landing inside the watchdog window waits
+  on that M's P forever, the pending STW parks the scheduler — the timer goroutines that
+  would write the deadline flag freeze with it, so the flag never lands, the back-edge poll
+  never raises, and the process wedges (one core at 100%; two SIGQUIT dumps pinned the
+  identical signature, `[stopping the world]` + the JIT-pc spinner). ~30% per plain-mode
+  TestDeadlineKill process; testdiff's TestM6dDeadlineKill 0/30 on shorter windows is the
+  same luck, not a structural difference. Test ruling: the three watchdog tests quiesce the
+  host GC (`noHostGC` — SetGCPercent(-1) + restore; no cycle can start ⇒ no wedge ⇒ the
+  kill contract asserts deterministically in both modes, ×20 plain verified). Production
+  ruling: the deadline mechanism is UNSOUND against a coincident host GC — a Redis-class
+  daemon cannot ship a watchdog a GC can defeat; the durable writer (off-scheduler flag
+  delivery) is U7's FIRST item, ahead of soak. (d) **Closeout** — CLAUDE.md sweep (row-61
+  open bug → closed at
+  U6a; v3-cutover mentions; the GC-freeze invariant re-worded to §4.3's durable
+  posture); parent-plan status header → U6 COMPLETE + milestone row; **the U7 arena
+  question answers §4.3**: the row-61 GC freeze is the durable posture under
+  zero-patch (real rooting needs patches or a parallel GC — D10), U6b's memlimit
+  bounds frozen-GC growth, and the arena/real-rooting work stays OUT of U7 unless a
+  daemon use case forces it — U7 is soak + perf per the parent plan (plus row 99's
+  writer). Gates green: the
+  six rewired gates × their engine sets, TestU6SandboxCorpus, full clean-cache
+  battery, `go test ./host/` plain + `-race` ×2, the `-short ./...` sweep, root
+  `go test .`, `_cli-tests`
+  ×{wasmtime, WAZERO=1}. Ledger rows 97/98/99; note/u6f-implemented.md. Next: U7
+  (row 99's deadline writer, then soak + perf).

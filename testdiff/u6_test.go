@@ -52,6 +52,29 @@ func TestU6SandboxCorpus(t *testing.T) {
 		"sbx04.lua": {
 			"PRINT\tsbx04\t2\t3\t1",
 		},
+		// U6f (row 97): the wasm yield posture — absolute pins, the
+		// backend's own answers. Yield-free bodies run to completion; a
+		// direct yield raises stock's mainthread text (prefixed at the
+		// raise site); pcall calling yield DIRECTLY catches it BARE (no
+		// compiled frame between pcall and yield — the seam's nopos
+		// verdict); the thread survives a caught raise, dies on an
+		// uncaught one; isyieldable is false in a compiled body (interp:
+		// true). The interp/clua55 oracles SUSPEND these shapes
+		// (_u5/coyield01-06 + TestU5Gate).
+		"coyield01.lua": {
+			"PRINT\tcoyield01\tbody:\t42",
+			"PRINT\ttrue\tdone",
+			"PRINT\tdead",
+			"PRINT\tfalse\tcoyield01.lua:21: attempt to yield from outside a coroutine",
+			"PRINT\tdead",
+			"PRINT\tcaught:\tfalse\tattempt to yield from outside a coroutine",
+			"PRINT\talive",
+			"PRINT\ttrue",
+			"PRINT\tdead",
+			"PRINT\tisyieldable:\tfalse",
+			"PRINT\ttrue",
+			"PRINT\tfalse\tcoyield01.lua:42: attempt to yield from outside a coroutine",
+		},
 	}
 	engines := []Engine{
 		&WasmEngine{name: "wasm-u6", Sandbox: true, Protect: true, SkipUnsupported: true},

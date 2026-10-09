@@ -31,14 +31,19 @@ func CorpusSkips(dir string) map[string]string {
 // interp↔clua55) runs the corpus whole: every skip here is an
 // engine-seam divergence, not a language one.
 var u5WasmSkips = map[string]string{
-	// the U5d yield surface is interp-side; the backend grows it at U6
-	// (row 84's wasm clause)
-	"coyield01.lua": "yield through marker frames is interp-side; backend at U6 — row 84",
-	"coyield02.lua": "noyield boundary error is interp-side; backend at U6 — row 84",
-	"coyield03.lua": "yield through marker frames is interp-side; backend at U6 — row 84",
-	"coyield04.lua": "yield through marker frames is interp-side; backend at U6 — row 84",
-	"coyield05.lua": "kind-6 metamethod yields are interp-side; backend at U6 — row 84",
-	"coyield06.lua": "kinds 4/5 close continuations are interp-side; backend at U6 — row 84",
+	// U6f (row 97): the wasm yield posture, ruled. Interp/clua55 suspend
+	// these shapes (TestU5Gate); compiled frames are CClosures over the
+	// dispatch seam AND every rt_* call from compiled code runs on the
+	// rt-pinned MAIN state, so a yield reaches lua_yieldk on the main
+	// thread — stock's own branch (ldo.c:1015) raises the catchable,
+	// position-prefixed "attempt to yield from outside a coroutine".
+	// _u6/coyield01.lua pins the wasm behavior absolutely.
+	"coyield01.lua": "yield from compiled code raises stock's mainthread text (interp suspends) — row 97",
+	"coyield02.lua": "noyield shapes raise the prefixed mainthread text, not the bare C-boundary wording — row 97",
+	"coyield03.lua": "yield from compiled code raises stock's mainthread text (interp suspends) — row 97",
+	"coyield04.lua": "yield from compiled code raises stock's mainthread text (interp suspends) — row 97",
+	"coyield05.lua": "kind-6 metamethod yields raise the mainthread text — row 97",
+	"coyield06.lua": "close-continuation yields raise the mainthread text — row 97",
 	// debug introspection over wasm frames (the row-23 family)
 	"dbg01.lua":    "debug.getlocal level walk over wasm frames — row 23",
 	"rdkctc01.lua": "debug.getlocal level walk over wasm frames (:54) — row 23",
@@ -113,6 +118,33 @@ var ledgeredErrSkips = map[string]string{
 	"e001.lua": "level-0 error gains the rt prefix on wasm — row 60 seam (level-0 arm calls no where)",
 	"e006.lua": "nil error object renders differently on wasm — row 60 seam (U5 re-pin)",
 	"e007.lua": "nil error object renders differently on wasm — row 60 seam (U5 re-pin)",
+}
+
+// prodBlobSkips (U6f, row 98): corpus cases exercising the prod
+// flavor's compiled-out surface (row 95 — io/os/debug/package/require/
+// loadfile/load/dofile/warn are nil there). Applied ONLY to the
+// wazero-prod column of the exit-gate engine set; every other engine
+// runs them (dead-code users like calcshape's io.open pass and stay —
+// the audit was the empirical interp-vs-prod probe over each corpus).
+var prodBlobSkips = map[string]string{
+	// _wasm-tests: the utf8 battery loads its library require'utf8'
+	"slu00.lua": "require'utf8' — require is nil on the prod flavor — row 95",
+	"slu01.lua": "require'utf8' — require is nil on the prod flavor — row 95",
+	"slu02.lua": "require'utf8' — require is nil on the prod flavor — row 95",
+	"slu03.lua": "require'utf8' — require is nil on the prod flavor — row 95",
+	"slu04.lua": "require'utf8' — require is nil on the prod flavor — row 95",
+	"slu05.lua": "require'utf8' — require is nil on the prod flavor — row 95",
+	"slu06.lua": "require'utf8' — require is nil on the prod flavor — row 95",
+	"slu07.lua": "require'utf8' — require is nil on the prod flavor — row 95",
+	// _glua-tests
+	"base.lua": "dofile('notexist') — dofile is nil on the prod flavor — row 95",
+	"os.lua":   "the os library is compiled out of the prod flavor — row 95",
+	// _u5 (the corpus discipline strips semerrors through load())
+	"call01.lua":     "debug.getinfo — debug is nil on the prod flavor — row 95",
+	"gotostar01.lua": "load() — nil on the prod flavor — row 95",
+	"limits01.lua":   "load() — nil on the prod flavor — row 95",
+	"var06.lua":      "load() — nil on the prod flavor — row 95",
+	"var08.lua":      "load() — nil on the prod flavor — row 95",
 }
 
 // skipProdBlobUntilU6d was deleted at U6d (ledger row 95): lua55_prod.wasm

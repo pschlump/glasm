@@ -65,41 +65,17 @@ func TestU5Gate(t *testing.T) {
 // brought the backend onto the 5.5 surface: the Stage A opcodes, the
 // position seam, the hint registry, the msgh seam). Skips are the
 // u5WasmSkips map (CorpusSkips) — every one engine-seam, none language.
-func u5WasmLeg(t *testing.T, eng Engine) {
-	t.Helper()
-	cases, err := LoadCorpus("../_u5")
-	if err != nil {
-		t.Fatal(err)
-	}
-	cases, skipped := FilterSkips(cases, CorpusSkips("../_u5"))
-	engines := []Engine{NewInterp("interp"), eng}
-	results := RunCorpus(cases, engines)
-	bad := 0
-	for _, r := range results {
-		if d := r.Diff(); d != "" {
-			bad++
-			t.Errorf("DIFF %s:\n%s", r.Name, indent(d))
-		} else {
-			t.Logf("[ok] %s", r.Name)
-		}
-	}
-	if len(cases) == 0 {
-		t.Fatal("no cases loaded")
-	}
-	t.Log("\n" + Summary(results, skipped))
-	if bad > 0 {
-		t.Fatalf("%d/%d cases diverge between interp and %s", bad, len(cases), engines[1].Name())
-	}
-}
+//
+// U6f: TestU5WasmGate became the exit-gate engine set (plan §5 — the
+// wazero and wazero-prod columns joined; the separate TestU5WazeroGate
+// folded in). The clua55 column is NOT swept inline: TestU5Gate runs
+// the corpus whole, zero skips — a superset of any layered oracle pass
+// — and the inline sweep would add ~1500 wasmtime Stores toward the
+// M6e SIGTRAP budget (see exitGateEngines in m5gate_test.go).
 
-// TestU5WasmGate: the _u5 corpus on the U2e backend over wasmtime.
+// TestU5WasmGate: the _u5 corpus over the exit-gate engine set.
 func TestU5WasmGate(t *testing.T) {
-	u5WasmLeg(t, NewWasmEngine("wasm"))
-}
-
-// TestU5WazeroGate: the same leg on the production engine.
-func TestU5WazeroGate(t *testing.T) {
-	u5WasmLeg(t, wazeroEngine())
+	exitGateEngines(t, "../_u5", CorpusSkips("../_u5"), nil, false)
 }
 
 // u5SuiteSkips layers the interp-only rulings on clua55Skips (the U5a

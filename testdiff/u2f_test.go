@@ -24,13 +24,13 @@ var clua55MatrixSkips = map[string]string{
 	"gfor01.lua": "pairs iteration order is engine-specific (hash vs insertion) — corpus discipline",
 	// U3b: mod00 un-skipped against the oracle too — the interp's
 	// mathlib is stock xoshiro over the same makeseed=0 pin.
-	// 5.5's read-only for-control variables (calcshape assigns one) are
-	// U5 language work — the interp still allows it
-	"calcshape.lua": "5.5 read-only for control variables — U5 (plan U5 row)",
-	// parser error wording: the fork's recursive-descent shapes differ
-	// from stock's LR messages on the same malformed input — U5 parser
-	// wording pass
-	"len03.lua": "parse-error wording differs (unexpected symbol vs ')' expected) — U5 parser pass",
+	// U6f: calcshape un-skipped — U5 landed 5.5's read-only for-control
+	// variables and the case passes against the oracle now (the stale
+	// skip fell to the refreshed interp-vs-clua55 probe).
+	// Parser error wording: the fork's goyacc has no error productions,
+	// so its near-token texts differ from stock's check_match family on
+	// the same malformed input — the ruled standing divergence.
+	"len03.lua": "goyacc's 'unexpected symbol' vs stock check_match's ')' expected — row 82",
 }
 
 // TestU2fMatrixOracle: the regenerated _wasm-tests matrix, interp vs

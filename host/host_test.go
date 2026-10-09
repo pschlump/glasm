@@ -7,11 +7,27 @@ package host
 import (
 	"context"
 	"errors"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 )
+
+// noHostGC disables Go GC for the test's duration (ledger row 99): a Go
+// GC mark-STW landing inside a guest watchdog window wedges the process —
+// the spinning wasm loop runs as unpreemptible wazero-JIT code, the STW
+// waits on its P forever, and the scheduler freeze takes the timer
+// goroutines down with it, so the deadline flag write that would end the
+// spin never happens. Probabilistic (~30% here in plain mode; -race only
+// shifts the GC phase). Watchdog tests quiesce the host this way so they
+// assert the kill contract deterministically; the daemon-side durable fix
+// is U7.
+func noHostGC(t *testing.T) {
+	t.Helper()
+	old := debug.SetGCPercent(-1)
+	t.Cleanup(func() { debug.SetGCPercent(old) })
+}
 
 func mustEngine(t *testing.T, opts ...Option) *Engine {
 	t.Helper()
@@ -349,6 +365,7 @@ func TestChaosHost(t *testing.T) {
 // --- deadline ----------------------------------------------------------------
 
 func TestDeadlineKill(t *testing.T) {
+	noHostGC(t)
 	e := mustEngine(t)
 	s := mustCompile(t, e, `while true do end`)
 	vm, err := e.NewVM()
@@ -382,6 +399,7 @@ func TestDeadlineKill(t *testing.T) {
 // generous deadline completes normally, and ctx cancellation arms the
 // same watchdog.
 func TestDeadlineNormalAndCancel(t *testing.T) {
+	noHostGC(t) // the cancel leg spins the same unbounded guest loop
 	e := mustEngine(t)
 	if _, err := runScript(t, e, `local s=0 for i=1,100000 do s=s+i end return s`,
 		RunOptions{Deadline: 30 * time.Second}); err != nil {
@@ -411,6 +429,7 @@ func TestDeadlineNormalAndCancel(t *testing.T) {
 // --- memory cap --------------------------------------------------------------
 
 func TestMemoryBudget(t *testing.T) {
+	noHostGC(t) // spins `while true do s = s .. s end` until the budget raises
 	e := mustEngine(t, WithMemoryBudgetBytes(4<<20))
 	_, err := runScript(t, e, `local s = 'x' while true do s = s .. s end`,
 		RunOptions{Deadline: 60 * time.Second})
