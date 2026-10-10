@@ -99,6 +99,7 @@ type backend struct {
 	imports    map[string]uint32
 	gKCells    uint32 // mutable global: constants cells base
 	gDeadline  uint32 // mutable global: the deadline flag's address (U6b)
+	gDeadlinePollCtr uint32 // mutable global: the row-100 backstop's back-edge counter (U7a)
 	protos     []protoInfo
 	protoIdx   map[*lua.FunctionProto]int // proto → dispatch index
 	protoFuncs []*wasm.Function           // dispatch idx → wasm function
@@ -242,9 +243,12 @@ func (b *backend) declareImports() {
 	i32i64 := []wasm.ValueType{wasm.I32, wasm.I64}
 
 	// ABI v4 (runtime/rt_abi55.h). Dropped vs v3: rt_compat_arg (a
-	// 5.1-ism), the dialect layer and the deadline block (U6), and
-	// rt_mknil (inline tag store). New: rt_mkinteger (lossless int64
-	// cells — the reason the 5.1 blob could not serve U2).
+	// 5.1-ism), the dialect layer (U3), and rt_mknil (inline tag store).
+	// New: rt_mkinteger (lossless int64 cells — the reason the 5.1 blob
+	// could not serve U2) and the deadline block's return at U6b.
+	// deadline_poll is the ONE import outside the rt namespace: the host
+	// module every engine already defines for the blob serves it too
+	// (row 100's STW-proof backstop — see emitDeadlinePoll).
 	b.imports = map[string]uint32{
 		"rt_newtable":      m.ImportFunc("rt", "rt_newtable", iii, i32v),
 		"rt_gettable":      m.ImportFunc("rt", "rt_gettable", iiiiii, i32v),
@@ -291,33 +295,68 @@ func (b *backend) declareImports() {
 		"rt_tail_restage":  m.ImportFunc("rt", "rt_tail_restage", nil, i32v),
 		"rt_ctrl_addr":     m.ImportFunc("rt", "rt_ctrl_addr", nil, i32v),
 		"rt_deadline":      m.ImportFunc("rt", "rt_deadline", nil, i32v),
+		"deadline_poll":    m.ImportFunc("host", "deadline_poll", nil, i32v),
 	}
 	b.gKCells = m.GlobalI32(0, true)
 	m.ExportGlobal("gKCells", b.gKCells)
 	b.gDeadline = m.GlobalI32(0, true)
+	b.gDeadlinePollCtr = m.GlobalI32(deadlinePollInterval, true)
 	m.ImportMemory("rt", "memory", 1, 0)
 }
 
-// emitDeadlinePoll (U6b, row 37 — the M6d D4 design, design A5): load the
-// host-owned deadline flag and, when the host has expired the run, raise
-// through rt_deadline — rt_deadline stages the error and always returns
-// RT_ERR, so this returns -1 (the ABI v4 error convention), unwinding the
-// frame chain exactly like any rt_* error (pcall can catch it; the flag
-// stays sticky so the next back edge re-raises). Emitted at (i) every
-// proto's flattened dispatch-loop header — once per basic-block
-// transition, the v3 granularity: calls do NOT split blocks, so a
-// pcall-catch followed by straight-line statements inside one block
-// completes without re-raising (the m6d catch leg), while any loop's
-// back edge re-polls (the reraise leg) — and (ii) lua_dispatch's
-// tail-restage loop (tail-call chains never touch a basic block; the
-// rt's own restage loop polls the flag directly for the ABI-level
-// chains).
+// deadlinePollInterval is the row-100 backstop cadence: one
+// host.deadline_poll call per this many basic-block transitions. At the
+// dispatch rate of a fully-spinning guest (~350M transitions/s measured)
+// the host call lands every ~3ms — negligible call overhead, and a
+// wedge-case kill is bounded by one interval past the deadline.
+const deadlinePollInterval int32 = 1 << 20
+
+// emitDeadlinePoll (U6b, row 37 — the M6d D4 design, design A5; U7a,
+// row 100): load the host-owned deadline flag and, when the host has
+// expired the run, raise through rt_deadline — rt_deadline stages the
+// error and always returns RT_ERR, so this returns -1 (the ABI v4 error
+// convention), unwinding the frame chain exactly like any rt_* error
+// (pcall can catch it; the flag stays sticky so the next back edge
+// re-raises). Emitted at (i) every proto's flattened dispatch-loop
+// header — once per basic-block transition, the v3 granularity: calls do
+// NOT split blocks, so a pcall-catch followed by straight-line
+// statements inside one block completes without re-raising (the m6d
+// catch leg), while any loop's back edge re-polls (the reraise leg) —
+// and (ii) lua_dispatch's tail-restage loop (tail-call chains never
+// touch a basic block; the rt's own restage loop polls the flag directly
+// for the ABI-level chains; every restage hop also re-enters a compiled
+// body through this poll, so the counter covers tail chains).
+//
+// The U7a backstop (row 100, closing row 99's wedge): under a pending GC
+// mark-STW the spinning guest is the ONLY goroutine still executing —
+// the timer that writes the flag is frozen with the scheduler. So every
+// deadlinePollInterval-th transition the guest asks the host directly
+// (host.deadline_poll: "has this run expired?"), and an affirmative
+// answer takes the same rt_deadline raise as the flag path — identical
+// text, staging, and pcall semantics, but delivery that no longer
+// depends on the scheduler.
 func (b *backend) emitDeadlinePoll(f *wasm.Function) {
 	f.GlobalGet(b.gDeadline)
 	f.I32Load(0)
 	f.If(wasm.Void)
 	f.Call(b.imp("rt_deadline")).Drop()
 	f.I32Const(-1).Return()
+	f.End()
+	f.GlobalGet(b.gDeadlinePollCtr)
+	f.I32Eqz()
+	f.If(wasm.Void)
+	f.I32Const(deadlinePollInterval)
+	f.GlobalSet(b.gDeadlinePollCtr)
+	f.Call(b.imp("deadline_poll"))
+	f.If(wasm.Void)
+	f.Call(b.imp("rt_deadline")).Drop()
+	f.I32Const(-1).Return()
+	f.End()
+	f.Else()
+	f.GlobalGet(b.gDeadlinePollCtr)
+	f.I32Const(-1)
+	f.I32Add()
+	f.GlobalSet(b.gDeadlinePollCtr)
 	f.End()
 }
 

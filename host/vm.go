@@ -111,6 +111,14 @@ type VM struct {
 	inAddr     uint32          // cached linbuf staging address (1 MiB)
 	curCtx     context.Context // in-flight Run's ctx (nested dispatches)
 
+	// deadlineAt is the in-flight Run's absolute deadline (UnixNano, 0 =
+	// none) — the row-100 backstop's answer source. Under row 99's wedge
+	// the frozen scheduler starves the flag-writing timer, so the guest's
+	// periodic host.deadline_poll reads THIS instead; set before lua_main
+	// and cleared at teardown (vm.mu serializes runs — the atomic is for
+	// the guest's own goroutine, which never holds the lock).
+	deadlineAt atomic.Int64
+
 	// inRun is the same-goroutine reentrancy guard: checked BEFORE the
 	// mutex (a HostFunc re-entering its VM would otherwise deadlock on
 	// the lock it already holds). A Run from a different goroutine may
@@ -148,14 +156,17 @@ func (e *Engine) NewVM() (*VM, error) {
 	vm.rt = r
 
 	// host module — closures bound to THIS VM (per-runtime instance, so
-	// concurrent VMs never cross-dispatch). Exactly the blob's import
-	// surface: event, wasm_dispatch, host_call (the host.random* RNG
-	// imports retired at U3b — math.random is the guest's own stock
-	// xoshiro256** stream now; see RunOptions.Seed)
+	// concurrent VMs never cross-dispatch). The blob's import surface —
+	// event, wasm_dispatch, host_call (the host.random* RNG imports
+	// retired at U3b — math.random is the guest's own stock xoshiro256**
+	// stream now; see RunOptions.Seed) — plus deadline_poll, imported not
+	// by the blob but by backend-compiled script modules (row 100's
+	// STW-proof backstop; see hostDeadlinePoll)
 	_, err := r.NewHostModuleBuilder("host").
 		NewFunctionBuilder().WithFunc(vm.hostEvent).Export("event").
 		NewFunctionBuilder().WithFunc(vm.hostDispatch).Export("wasm_dispatch").
 		NewFunctionBuilder().WithFunc(vm.hostCall).Export("host_call").
+		NewFunctionBuilder().WithFunc(vm.hostDeadlinePoll).Export("deadline_poll").
 		Instantiate(ctx)
 	if err != nil {
 		r.Close(ctx)
@@ -447,6 +458,10 @@ func (vm *VM) Run(ctx context.Context, s *Script, opt RunOptions) (res Result, e
 		vm.flagMu.Unlock()
 	}
 	if opt.Deadline > 0 {
+		// row 100: the backstop's absolute deadline, readable by the
+		// guest's own host.deadline_poll calls while the timer (and the
+		// rest of the scheduler) may be frozen by a pending STW
+		vm.deadlineAt.Store(time.Now().Add(opt.Deadline).UnixNano())
 		timer = time.AfterFunc(opt.Deadline, arm)
 	}
 	if ctx.Done() != nil {
@@ -473,6 +488,7 @@ func (vm *VM) Run(ctx context.Context, s *Script, opt RunOptions) (res Result, e
 			timer.Stop()
 		}
 		wg.Wait()
+		vm.deadlineAt.Store(0) // retire the row-100 backstop's answer
 	}()
 
 	vm.inRun.Store(true)

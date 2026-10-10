@@ -209,9 +209,20 @@ func (e *WazeroEngine) Run(c Case) (log []string) {
 	if e.NoopHosts {
 		eventFn = func(kind, ptr, length int32) {}
 	}
+	// Row 100 (U7a): the STW-proof backstop's engine-side answer, wired
+	// at the deadline-arming site below (the host module instantiates
+	// before rt/memory exist to close over). Nil = no deadline armed →
+	// constant 0; the guest's periodic poll then costs one import call.
+	var deadlinePoll func() int32
 	_, err = r.NewHostModuleBuilder("host").
 		NewFunctionBuilder().WithFunc(eventFn).Export("event").
 		NewFunctionBuilder().WithFunc(dispatch).Export("wasm_dispatch").
+		NewFunctionBuilder().WithFunc(func() int32 {
+		if deadlinePoll == nil {
+			return 0
+		}
+		return deadlinePoll()
+	}).Export("deadline_poll").
 		NewFunctionBuilder().WithFunc(func(fnidx, argsPtr, argsLen, retPtr, retCap int32) int32 {
 		// M7a: the hostfn seam is a host-package feature; this engine
 		// refuses (the guest raises the staged error value).
@@ -334,13 +345,27 @@ func (e *WazeroEngine) Run(c Case) (log []string) {
 	// store into the linear memory at the control-block flag (wazero's
 	// Memory.Write is a plain buffer copy; no engine state touched, safe
 	// off-thread). The guest's basic-block-transition polls raise
-	// rt_deadline's ordinary error.
+	// rt_deadline's ordinary error. Row 100 (U7a): deadline_poll answers
+	// the same expiry from the guest's own goroutine — under a pending GC
+	// mark-STW (row 99) the timer below is frozen with the scheduler, but
+	// the spinning guest still asks, and its import call transits into
+	// preemptible Go frames (which is also how the STW drains). Both
+	// paths write the flag and raise identical text; delivery no longer
+	// depends on the scheduler.
 	if e.Deadline > 0 {
 		if a, err := call(rtInst, "rt_ctrl_addr"); err == nil {
 			flagAddr := uint32(a[0])
+			deadlineAt := time.Now().Add(e.Deadline)
 			timer := time.AfterFunc(e.Deadline, func() {
 				_ = mem.Write(flagAddr, deadlineFlagLE)
 			})
+			deadlinePoll = func() int32 {
+				if time.Now().Before(deadlineAt) {
+					return 0
+				}
+				_ = mem.Write(flagAddr, deadlineFlagLE)
+				return 1
+			}
 			defer timer.Stop()
 		}
 	}

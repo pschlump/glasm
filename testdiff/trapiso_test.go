@@ -53,6 +53,12 @@ func trapEnvNamedBin(t *testing.T, wasi, script bool, chunkName string, binOverr
 		func(fnidx, argsPtr, argsLen, retPtr, retCap int32) int32 { return -1 }); err != nil {
 		t.Fatal(err)
 	}
+	// Row 100 (U7a): the backstop's stub — no deadline in this env, so
+	// the answer is a constant 0 (script modules import it unconditionally)
+	if err := linker.DefineFunc(store, "host", "deadline_poll",
+		func() int32 { return 0 }); err != nil {
+		t.Fatal(err)
+	}
 	if wasi {
 		w := wt.NewWasiConfig()
 		if err := w.PreopenDir(t.TempDir(), "/", true); err != nil {

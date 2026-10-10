@@ -396,6 +396,22 @@ func (e *WasmEngine) Run(c Case) (log []string) {
 		}); err != nil {
 		return []string{"ENGINE-ERROR\t" + err.Error()}
 	}
+	// Row 100 (U7a): the STW-proof backstop's consult leg — armed at the
+	// deadline site below (0 = not expired / no deadline). wasmtime
+	// preempts a spinning guest at its own store epoch, so unlike wazero
+	// this needs no flag write: the affirmative answer alone makes the
+	// guest raise rt_deadline's ordinary error at its next back-edge
+	// poll; the flag timer stays the primary delivery.
+	var deadlineAt int64
+	if err := linker.DefineFunc(store, "host", "deadline_poll",
+		func() int32 {
+			if deadlineAt != 0 && time.Now().UnixNano() >= deadlineAt {
+				return 1
+			}
+			return 0
+		}); err != nil {
+		return []string{"ENGINE-ERROR\t" + err.Error()}
+	}
 
 	if blobNeedsWASI {
 		wasi := wt.NewWasiConfig()
@@ -541,6 +557,9 @@ func (e *WasmEngine) Run(c Case) (log []string) {
 		if a, err := call(rtInst, "rt_ctrl_addr"); err == nil {
 			flagAddr := uint32(toI32(a))
 			memBase := guestMem.UnsafeData(store)
+			// row 100: arm the consult leg with the same absolute
+			// deadline the timer below fires on
+			deadlineAt = time.Now().Add(e.Deadline).UnixNano()
 			timer := time.AfterFunc(e.Deadline, func() {
 				// 4-byte little-endian 1 — one aligned store
 				b := memBase[flagAddr : flagAddr+4 : flagAddr+4]

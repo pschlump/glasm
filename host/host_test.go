@@ -7,6 +7,7 @@ package host
 import (
 	"context"
 	"errors"
+	"runtime"
 	"runtime/debug"
 	"strings"
 	"sync"
@@ -392,6 +393,90 @@ func TestDeadlineKill(t *testing.T) {
 	se2, ok := err.(*ScriptError)
 	if !ok || !strings.Contains(se2.Error(), "context deadline exceeded") {
 		t.Fatalf("second run after kill: %T %v — image wedged", err, err)
+	}
+}
+
+// TestDeadlineSTWWedge is row 100's covering probe (the U7a fix): force
+// the row-99 conditions — a spinning unbounded guest loop with GC
+// mark-STWs landing throughout its watchdog window — and require the
+// deadline kill anyway. Pre-fix this wedged ~30% per process even
+// without forcing (the pending STW freezes the scheduler and starves the
+// flag-writing timer); with GC percent pinned at 1 plus a churn
+// goroutine the collision becomes near-certain. The row-100 backstop
+// answers from the only goroutine still executing (the guest itself,
+// via host.deadline_poll), the kill unwinds through pure-Go frames, and
+// the post-run liveness check proves any pending STW drained — the
+// process recovers instead of wedging.
+func TestDeadlineSTWWedge(t *testing.T) {
+	old := debug.SetGCPercent(1)
+	t.Cleanup(func() { debug.SetGCPercent(old) })
+	stop := make(chan struct{})
+	t.Cleanup(func() { close(stop) })
+	go func() { // churn: keep the heap moving so mark phases keep starting
+		buf := make([]byte, 1<<20)
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			for i := range buf {
+				buf[i] = byte(i)
+			}
+			buf = append(buf, make([]byte, 1<<20)...)
+			if len(buf) >= 8<<20 {
+				buf = make([]byte, 1<<20)
+			}
+		}
+	}()
+	e := mustEngine(t)
+	s := mustCompile(t, e, `while true do end`)
+	vm, err := e.NewVM()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer vm.Close()
+	// self-verification (the row-100 evidence requirement): bracket the
+	// run with GC counters and prove the collision this probe exists to
+	// force actually happened. With the guest spinning unpreemptibly for
+	// the whole window, a cycle COMPLETING in-window means its mark STW
+	// was satisfied through the poll's Go-frames safe point — the row-99
+	// wedge, survived. NumGC/PauseTotalNs deltas, not the pauses
+	// histogram (its STW-wait boundary semantics are the disputed part;
+	// these counters are unambiguous). Without this the probe can pass
+	// green having exercised nothing (GC never engaged).
+	var ms0, ms1 runtime.MemStats
+	runtime.ReadMemStats(&ms0)
+	start := time.Now()
+	_, err = vm.Run(context.Background(), s, RunOptions{Deadline: 250 * time.Millisecond})
+	if dt := time.Since(start); dt > 5*time.Second {
+		t.Fatalf("deadline did not fire promptly (%v)", dt)
+	}
+	runtime.ReadMemStats(&ms1)
+	t.Logf("row-100 collision evidence: %d GC cycles completed in-window, %d pause-ns total (kill at %v)",
+		ms1.NumGC-ms0.NumGC, ms1.PauseTotalNs-ms0.PauseTotalNs, time.Since(start))
+	if ms1.NumGC-ms0.NumGC < 1 {
+		t.Fatal("no GC cycle completed during the run window — the probe proved nothing (collision not forced)")
+	}
+	if ms1.PauseTotalNs <= ms0.PauseTotalNs {
+		t.Fatal("no STW pause recorded during the run window — the probe proved nothing (collision not forced)")
+	}
+	se, ok := err.(*ScriptError)
+	if !ok {
+		t.Fatalf("want ScriptError, got %T %v", err, err)
+	}
+	if !strings.Contains(se.Error(), "context deadline exceeded") {
+		t.Fatalf("deadline text: %q", se.Error())
+	}
+	// post-run liveness: a fresh goroutine must round-trip — a pending
+	// STW that never drained would freeze it (and this test's own timer)
+	// with it
+	live := make(chan struct{})
+	go func() { close(live) }()
+	select {
+	case <-live:
+	case <-time.After(2 * time.Second):
+		t.Fatal("scheduler did not recover after the kill — pending STW never drained")
 	}
 }
 

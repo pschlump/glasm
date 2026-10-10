@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 )
 
 // ValueError lets a HostFunc raise a non-string Lua error value — e.g. a
@@ -74,6 +75,27 @@ func (vm *VM) runCtx() context.Context {
 		return vm.curCtx
 	}
 	return context.Background()
+}
+
+// hostDeadlinePoll is the row-100 STW-proof backstop: the guest's periodic
+// "has this run expired?" call, emitted at every deadlinePollInterval-th
+// dispatch back-edge (luawasm emitDeadlinePoll). Under row 99's wedge — a
+// GC mark-STW waiting on the unpreemptible spinning guest — the timer that
+// writes the deadline flag is frozen with the scheduler, but the guest
+// itself is still executing; this answer rides it. 1 = expired: either the
+// deadline has passed or ctx is cancelled (the cancel leg takes the same
+// rt_deadline raise as arm()'s flag write — both are clean kills); 0 = keep
+// running. Runs on the Run goroutine (imports are same-goroutine calls),
+// so the reads race nothing: deadlineAt is stored before lua_main and
+// curCtx before that.
+func (vm *VM) hostDeadlinePoll() int32 {
+	if d := vm.deadlineAt.Load(); d != 0 && time.Now().UnixNano() >= d {
+		return 1
+	}
+	if ctx := vm.runCtx(); ctx.Err() != nil {
+		return 1
+	}
+	return 0
 }
 
 // hostCall is the Lua→Go function seam (M7a): decode the argument frame,
