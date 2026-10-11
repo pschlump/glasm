@@ -33,7 +33,7 @@ import (
 //go:embed lua55_prod.wasm
 var prodBlob []byte
 
-const prodBlobSHA256 = "6f174d0e70859b75939a49e371fc6d8fc4677561c301a29544d7a9af427fc708"
+const prodBlobSHA256 = "2ba73262ae8634d642880ca167f0db307ba830cf6dac19f5cde13817ce17a8e6"
 
 // hostImports is the frozen import surface the blob expects this package
 // to provide (mirrored by testdiff/m6c_test.go's artifact gate).

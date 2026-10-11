@@ -496,10 +496,16 @@ static int ar_op;
 
 static void arith_body(void) {
   TValue *dst = ar_dst; /* reentrancy: a metamethod may re-enter the ABI */
+  ptrdiff_t resr; /* row 31: a metamethod (or string coercion) below may
+                     grow — and move — the Lua stack; a raw StkId dangles
+                     across that (the U7d soak's c0027655/c0076725/
+                     c0080533 family, row 102) */
   StkId res = curL->top.p; /* scratch result slot (below the TM window) */
   luaD_checkstack(curL, 1);
   curL->top.p++;
+  resr = savestack(curL, res);
   luaO_arith(curL, ar_op, &ar_l, &ar_r, res);
+  res = restorestack(curL, resr);
   *dst = *s2v(res);
   curL->top.p--;
 }
@@ -519,10 +525,14 @@ static TValue len_v, *len_dst;
 
 static void len_body(void) {
   TValue *dst = len_dst; /* reentrancy (metamethod) */
+  ptrdiff_t resr; /* row 31/102: a __len metamethod may grow — and move —
+                     the stack; rebase the scratch slot like arith_body */
   StkId res = curL->top.p;
   luaD_checkstack(curL, 1);
   curL->top.p++;
+  resr = savestack(curL, res);
   luaV_objlen(curL, res, &len_v);
+  res = restorestack(curL, resr);
   *dst = *s2v(res);
   curL->top.p--;
 }
