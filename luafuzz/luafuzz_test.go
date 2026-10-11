@@ -55,6 +55,83 @@ func TestGenerateDistinct(t *testing.T) {
 	}
 }
 
+// TestGenerateValiditySweep (U7b): the plan's ≥10-master-seed gate —
+// every case parses through the repo frontend AND completes on the
+// interp within the case deadline (self-diff form: interp×interp must
+// classify PASS — covers parse, run-to-completion, no panic, no
+// deadline expiry).
+func TestGenerateValiditySweep(t *testing.T) {
+	if testing.Short() {
+		t.Skip("heavy: 10 seeds × 60 cases interp runs (CI -short skips)")
+	}
+	a := testdiff.NewInterp("sweep-a")
+	a.Deadline = 2 * time.Second
+	b := testdiff.NewInterp("sweep-b")
+	b.Deadline = 2 * time.Second
+	engines := []testdiff.Engine{a, b}
+	dir := t.TempDir()
+	for seed := int64(20261010); seed < 20261010+10; seed++ {
+		for idx := 0; idx < 60; idx++ {
+			src := Generate(seed, idx)
+			out := RunCase(engines, dir, idx, src)
+			if out.Class != ClassPass {
+				t.Errorf("seed %d case %d: class %s (%s)\n%s", seed, idx, out.Class, out.Detail, src)
+			}
+		}
+	}
+}
+
+// TestGenerateConstructCoverage (U7b): the construct-coverage gate —
+// over a fixed-seed slice, every 5.5 construct the U7b extension adds
+// must APPEAR in the dump (grep-the-dump discipline from the plan; the
+// counts are deterministic for the fixed seed, thresholds are floors).
+func TestGenerateConstructCoverage(t *testing.T) {
+	const seed = int64(424242)
+	const n = 1200
+	counts := map[string]int{}
+	for idx := 0; idx < n; idx++ {
+		s := string(Generate(seed, idx))
+		for _, c := range []struct{ marker, name string }{
+			{" // ", "floor-div"},
+			{" % ", "modulo"},
+			{" & ", "bitand"},
+			{" | ", "bitor"},
+			{" ~ ", "bitxor"},
+			{"<<", "shift-left"},
+			{">>", "shift-right"},
+			{"(~", "bitnot"},
+			{"math.type", "math.type"},
+			{"0x", "hex-int"},
+			{"math.maxinteger", "maxinteger"},
+			{"math.mininteger", "mininteger"},
+			{"<close>", "tbc"},
+			{"<const>", "const-attrib"},
+			{"global ", "global-decl"},
+			{"global *", "global-collective"},
+			{"_ENV", "env-shadow"},
+			{"...nv", "named-vararg"},
+			{"math.floor", "floor-int"},
+		} {
+			if strings.Contains(s, c.marker) {
+				counts[c.name]++
+			}
+		}
+	}
+	minima := map[string]int{
+		"floor-div": 20, "modulo": 15, "bitand": 15, "bitor": 10,
+		"bitxor": 10, "shift-left": 15, "shift-right": 10, "bitnot": 10,
+		"math.type": 30, "hex-int": 60, "maxinteger": 10, "mininteger": 10,
+		"tbc": 30, "const-attrib": 15, "global-decl": 20,
+		"global-collective": 15, "env-shadow": 10, "named-vararg": 15,
+		"floor-int": 10,
+	}
+	for name, min := range minima {
+		if counts[name] < min {
+			t.Errorf("construct %q appeared in %d/%d cases (min %d) — a generator arm lost its mass", name, counts[name], n, min)
+		}
+	}
+}
+
 // ---- classifier ----
 
 type stubEngine struct {
@@ -325,6 +402,74 @@ func TestMinimize(t *testing.T) {
 	}
 	if runs > 200 {
 		t.Fatalf("runs = %d over cap", runs)
+	}
+}
+
+// TestMinimizeNewSyntax (U7b): the reducer must tolerate the 5.5
+// surface — removals that strand a <close> block's `end`, a named
+// vararg's body, or a global-decl window are rejected by the
+// ValidSource gate inside the shrink predicate; the surviving line set
+// still shrinks to the divergence.
+func TestMinimizeNewSyntax(t *testing.T) {
+	cases := []struct {
+		name  string
+		lines []string
+	}{
+		{"tbc", []string{
+			`print("noise")`,
+			`local c1 <close> = setmetatable({}, {__close = function() print("MARK") end})`,
+			`do`,
+			`  print("noise")`,
+			`end`,
+			`print("noise")`,
+		}},
+		{"named-vararg", []string{
+			`print("noise")`,
+			`local function f(a, ...t)`,
+			`  print(t.n, t[1])`,
+			`  print("MARK")`,
+			`end`,
+			`f(1, 2, 3)`,
+			`print("noise")`,
+		}},
+		{"bitwise", []string{
+			`print("noise")`,
+			`local v = (0xF0 & 0x0F)`,
+			`print("MARK", v)`,
+			`print(1 << 3, 255 >> 4, ~5)`,
+			`print("noise")`,
+		}},
+		{"globals", []string{
+			`print("noise")`,
+			`global gg1`,
+			`global *`,
+			`gg1 = (7 // 2)`,
+			`print("MARK", gg1)`,
+			`print("noise")`,
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			src := []byte(strings.Join(tc.lines, "\n") + "\n")
+			if err := ValidSource(src, "mk.lua"); err != nil {
+				t.Fatalf("fixture does not parse: %v\n%s", err, src)
+			}
+			engines := []testdiff.Engine{&markEngine{"a", "a"}, &markEngine{"b", "c"}}
+			min, ok, runs := Minimize(src, engines, t.TempDir(), 1, 200)
+			if !ok {
+				t.Fatal("finding did not reproduce")
+			}
+			got := string(min)
+			if !strings.Contains(got, "MARK") {
+				t.Fatalf("MARK minimized away:\n%s", got)
+			}
+			if strings.Count(got, "noise") != 0 {
+				t.Fatalf("noise survived:\n%s", got)
+			}
+			if runs > 200 {
+				t.Fatalf("runs = %d over cap", runs)
+			}
+		})
 	}
 }
 

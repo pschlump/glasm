@@ -7,7 +7,7 @@
 // therefore never needs to store generated programs; resuming is
 // "continue at the next index".
 //
-// Programs are valid Lua 5.1 by construction (one statement per line,
+// Programs are valid Lua 5.5 by construction (one statement per line,
 // block keywords balanced) and are additionally gated through the
 // repo's own parser before reaching any engine; a parse failure is a
 // GENBUG finding (generator bug), never an engine result.
@@ -38,6 +38,46 @@
 //	        the "coerced-type" error-text corner is an open dialect gap
 //	§8.2:   # only over dense sequences (border semantics unspecified
 //	        with holes/trailing nils)
+//
+// U7b (2026-10-10) — the 5.5 construct surface is IN (integer duality,
+// bitwise, <close>/<const>, global decls, named varargs); every engine
+// in the soak set speaks 5.5 natively now (interp + lua55_rt/prod), so
+// the new corners are stock semantics on all legs. Additional pins:
+//
+//	- %d format args stay < 2^31 (row 25): the 64-bit edges live in
+//	  intLitPool, which never feeds string.format — print renders
+//	  int64 exactly on every engine (row 49's lesson: integers are the
+//	  SAFE subtype; floats are the hazard safeNumStrPool guards).
+//	- math.huge stays out (row 38 value divergence) and so does any
+//	  float ÷-0-literal shape: computed ±inf from runtime operands
+//	  renders engine-identically (row 49 + numRepr), but a literal
+//	  `x / 0` mid-case is needlessly close to the row-38 family —
+//	  div/mod-by-zero coverage is the INTEGER raise corner via
+//	  riskyExpr (`1 // 0`, `1 % 0` — "attempt to perform 'n//0'",
+//	  byte-identical on the 5.5 set).
+//	- `//` and `%` in num()-shaped expressions take a nonzero literal
+//	  RHS only (the old 5.1-rt modulo ruling, kept as budget/raise
+//	  discipline now that the rt is 5.5).
+//	- the named-vararg table is READ-only in generation (t.n, t[k],
+//	  t["n"]): writes are legal (table model, var02) but the t.n raise
+//	  family ("vararg table has no proper 'n'") is a dedicated corner,
+//	  not random surface; #t stays out (§8.2 border semantics over the
+//	  synthesized table).
+//	- global <close> is a semantic error (U5a) and never emitted;
+//	  writes to <const> names (locals or globals) are compile errors —
+//	  const decls are read-only pools.
+//	- no uncaught error()/error(nil) (row 60 seam residual, the
+//	  e006/e007 family): nil error objects render "<no error object>"
+//	  + the rt prefix on wasm vs the interp's form. Found live by the
+//	  U7b shakeout (seed 424242, 6 of the first 120 cases) — the
+//	  2026-09-19 soak died before U5e made varinfo/error texts compare
+//	  raw, so the residual had never been fuzz-exercised.
+//	- no kind-"" calls of non-function values (`(5)()`, `("s")()`):
+//	  row 85(c)'s residual — the interp's register VALUE scan at the
+//	  raise names any local holding the callee ("(local 'v0')"),
+//	  coincidence-dependent and unprecomputable on wasm (first live
+//	  instance: seed 424242 case 54). Method-call shapes
+//	  (t.missing_method_q()) keep their precomputed field-name hints.
 //
 // Rows 41/42 (condition-chain mislowering; -0.0 sign loss) are FIXED —
 // their shapes (const and/or conditions) are back in the fuzz surface
@@ -90,7 +130,7 @@ func Generate(masterSeed int64, idx int) []byte {
 		budget:  18 + caseRNG(masterSeed, idx^0x51).Intn(20), // 18–37 statements
 		maxLine: 120,
 	}
-	g.linef("-- luafuzz case=%d seed=%d (valid Lua 5.1 by construction)", idx, masterSeed)
+	g.linef("-- luafuzz case=%d seed=%d (valid Lua 5.5 by construction)", idx, masterSeed)
 	g.linef("-- repro: luafuzz -replay -seed %d -from %d -to %d", masterSeed, idx, idx)
 	g.defs()
 	for g.budget > 0 {
@@ -164,6 +204,14 @@ type gen struct {
 	// found by the fuzzer, minimized from soak case 59). Key-assignment
 	// to these tables is suppressed while the loop is open.
 	iterTables []string
+
+	// U7b: 5.5-surface registries.
+	nTBC     int    // closeable decl counter (names cx%d)
+	tbcOpen  int    // live <close> decls at the current point (≤3, row 44)
+	nGlobal  int    // global decl counter (gg%d / gk%d)
+	nVarName int    // named-vararg table counter (nv%d)
+	nConst   int    // <const> local counter (names kc%d)
+	consts   []string // <const> local names — read-only pool (a write is a compile error)
 }
 
 // effLoopDepth: the depth loop bounds are selected for — one deeper
@@ -239,16 +287,18 @@ func (g *gen) pop()  { g.ind = g.ind[:len(g.ind)-2] }
 // Blocks snapshot the registries and truncate on exit; names are
 // globally unique counters, so truncation is exact restoration.
 
-type scopeMark struct{ ns, nt, nf int }
+type scopeMark struct{ ns, nt, nf, nc, tbc int }
 
 func (g *gen) mark() scopeMark {
-	return scopeMark{len(g.scalars), len(g.tables), len(g.funcs)}
+	return scopeMark{len(g.scalars), len(g.tables), len(g.funcs), len(g.consts), g.tbcOpen}
 }
 
 func (g *gen) restore(m scopeMark) {
 	g.scalars = g.scalars[:m.ns]
 	g.tables = g.tables[:m.nt]
 	g.funcs = g.funcs[:m.nf]
+	g.consts = g.consts[:m.nc]
+	g.tbcOpen = m.tbc
 }
 
 // ---- pools (slices only — iteration order feeds output; never maps) ----
@@ -261,12 +311,53 @@ var numPool = []string{
 	// fixed its rendering (tostring/print of -0.0 is "0" on both
 	// engines — gnumfmt.c). Corpus pins: nz00/01 (row 42), gnf01
 	// (row 49).
+	// U7b: hex int literals + integral-float literals (subtype corners;
+	// num() consumers are subtype-agnostic — 0xff + 1 is integer 256,
+	// 3.0 + 1 is float 4.0, both render engine-exactly).
+	"0x10", "0xff", "3.0", "7.0", "9007199254740992",
 }
+
+// intLitPool (U7b): integer-subtype literals for int-valued expression
+// positions — the 64-bit edges (maxint/minint via the math.* constants:
+// the minint DECIMAL/HEX literal form is float-shaped in 5.5, 2^63 does
+// not fit lua_Integer), the 2^53/2^53+1 float-representability edge, hex
+// ints. NEVER feeds string.format %d (row 25 keeps %d args < 2^31 —
+// that stays intPool); print/tostring render int64 exactly everywhere
+// (row 49: integers are the exactly-representable subtype).
+var intLitPool = []string{
+	"0x0", "0x1", "0x10", "0xff", "0Xf0", "0x7fff",
+	"7", "-7", "100", "2147483647", "-2147483648", "4294967296",
+	"4611686018427387904", "9007199254740992", "9007199254740993",
+	"9223372036854775807", "-9223372036854775807",
+	"math.maxinteger", "math.mininteger",
+}
+
+// integralFloatPool (U7b): floats whose value is an in-range integer —
+// bitwise/`//` operands coerce through tointegerns ("3.0 & 1" is 1;
+// "2.5 & 1" would raise, which is riskyExpr's job). 1e15 < 2^53 fits.
+var integralFloatPool = []string{"1.0", "2.0", "3.0", "7.0", "-1.0", "1e15", "255.0"}
+
+// intCoerceStrPool (U7b): strings that convert to in-range integers —
+// the 5.2+ string-coercion corner ("0x10" + 1 = 17 integer; bitwise on
+// coercible strings is bwcoercion.lua's corner).
+var intCoerceStrPool = []string{`"10"`, `"0x10"`, `"-3"`, `"3.0"`, `"0x1f"`}
+
+// shiftPool (U7b): shift displacements — negative shifts go the other
+// way and ≥64 (well, ≥64 for int64) shifts yield 0 (5.5 manual);
+// 1<<63 is the sign bit (defined, not UB); >> on negatives is
+// arithmetic (sign-filling). All pinned by the U2f grids.
+var shiftPool = []string{"0", "1", "3", "7", "31", "62", "63", "64", "100", "-1", "-2", "-63"}
+
+// floorArgPool (U7b): math.floor/ceil arguments — in 5.3+ they return
+// the INTEGER subtype, so they are intOperand suppliers; the args must
+// floor/ceil into int64 range (1e308's floor does not — "number has no
+// integer representation" is a raise, kept out of operand position).
+var floorArgPool = []string{"-3.5", "2.9", "0.5", "7.0", "255.9", "1e15", "-0.0"}
 
 // intPool: %d-format-safe integers (< 2^31, row 25) and loop bounds.
 var intPool = []string{"0", "1", "2", "3", "4", "5", "7", "10", "12", "20", "42", "99", "255"}
 
-var numStrPool = []string{`"10"`, `"2"`, `"100"`, `"-3"`, `"3.5"`} // arith-coercible strings
+var numStrPool = []string{`"10"`, `"2"`, `"100"`, `"-3"`, `"3.5"`, `"0x10"`} // arith-coercible strings
 
 var strPool = []string{`"abc"`, `"x"`, `""`, `"hello"`, `"A"`, `"hello world"`, `"10"`, `"lua"`}
 
@@ -341,6 +432,12 @@ func (g *gen) num(d int) string {
 			return g.pick(numPool)
 		}
 	}
+	// U7b: the integer-subtype surface — int64-wrap arith, //, bitwise,
+	// shifts (math.type/print render ints exactly; row 49). One pick in
+	// five routes here so float-shaped arithmetic keeps its mass.
+	if g.rnd.Intn(5) == 0 {
+		return g.intExpr(d)
+	}
 	switch r := g.rnd.Intn(20); {
 	case r < 6:
 		// no "^": Go's math.Pow (interp) and musl's correctly-rounded pow
@@ -348,11 +445,14 @@ func (g *gen) num(d int) string {
 		// 0.1^2 (repeated squaring vs correct rounding). Ledgered libm
 		// ruling (row 48); the durable fix is porting Go's
 		// exp/log/pow into the runtime for byte-parity.
-		// no general "%": interp errors on integer n%0 (5.5, ledger row
-		// 56) while the 5.1 rt computes nan — ruled until the ABI v4
-		// port, so modulo always takes a nonzero literal RHS.
-		if g.rnd.Intn(5) == 0 {
+		// "//" and "%": nonzero literal RHS only — a zero RHS on an
+		// integer operand raises (the riskyExpr corner) and on a float
+		// operand goes ±inf (row-38 adjacent); a nonzero literal keeps
+		// num()-shaped expressions evaluation-safe by construction.
+		if r := g.rnd.Intn(5); r == 0 {
 			return fmt.Sprintf("(%s %% %s)", g.arithOperand(), g.pick([]string{"1", "2", "3", "7", "0.5", "1.5"}))
+		} else if r == 1 {
+			return fmt.Sprintf("(%s // %s)", g.arithOperand(), g.pick([]string{"1", "2", "3", "7", "0.5", "1.5"}))
 		}
 		op := g.pick([]string{"+", "-", "*", "/"})
 		return fmt.Sprintf("(%s %s %s)", g.arithOperand(), op, g.arithOperand())
@@ -382,7 +482,7 @@ func (g *gen) num(d int) string {
 	case r < 17:
 		return fmt.Sprintf("math.random(%s)", g.pick(posIntPool))
 	case r < 18:
-		return fmt.Sprintf("tonumber(%s)", g.pick([]string{`"10"`, `"-3"`, `"abc"`, `""`}))
+		return fmt.Sprintf("tonumber(%s)", g.pick([]string{`"10"`, `"-3"`, `"abc"`, `""`, `"0x10"`}))
 	default:
 		return g.pick(numPool)
 	}
@@ -409,6 +509,61 @@ func (g *gen) arithOperand() string {
 		return fmt.Sprintf("math.random(%s)", g.pick(posIntPool))
 	default:
 		return g.pick(numPool)
+	}
+}
+
+// intOperand: an operand guaranteed to hold (or coerce to) an in-range
+// integer — literals, the math.*integer constants, integral-float and
+// coercible-string literals, and the always-integer 5.3+ lib calls
+// (floor/ceil/fmod-int/max/min over int args). The row-40 discipline
+// (no scalar locals / t[k] / arbitrary calls) applies: an operand that
+// could hold a non-integral float or a table would turn the wrap/shift
+// corners into raise corners mid-case.
+func (g *gen) intOperand() string {
+	switch r := g.rnd.Intn(14); {
+	case r < 2: // integral floats coerce (tointegerns)
+		return g.pick(integralFloatPool)
+	case r < 3: // coercible strings (bwcoercion.lua corner)
+		return g.pick(intCoerceStrPool)
+	case r < 5:
+		return fmt.Sprintf("math.%s(%s)", g.pick([]string{"floor", "ceil"}), g.pick(floorArgPool))
+	case r < 6:
+		return fmt.Sprintf("math.fmod(%s, %s)", g.pick(intLitPool), g.pick([]string{"2", "3", "7"}))
+	case r < 7:
+		return fmt.Sprintf("math.%s(%s, %s)", g.pick([]string{"max", "min"}),
+			g.pick(intLitPool), g.pick(intLitPool))
+	case r < 8:
+		return fmt.Sprintf("math.abs(%s)", g.pick([]string{"-7", "-100", "math.mininteger"}))
+	default:
+		return g.pick(intLitPool)
+	}
+}
+
+// intExpr (U7b): an integer-valued expression — int64 arith (overflow
+// WRAPS in 5.5, defined and engine-pinned by the U2f grids: maxint+1 is
+// minint), floor division/modulo with nonzero literal RHS, bitwise
+// and/or/xor, shifts (negative = other direction, ≥64 → 0, <<63 = sign
+// bit, >> is arithmetic on negatives), unary bnot (~x == -x-1).
+func (g *gen) intExpr(d int) string {
+	if d <= 0 {
+		return g.intOperand()
+	}
+	switch r := g.rnd.Intn(16); {
+	case r < 4:
+		op := g.pick([]string{"+", "-", "*"})
+		return fmt.Sprintf("(%s %s %s)", g.intOperand(), op, g.intOperand())
+	case r < 6:
+		return fmt.Sprintf("(%s // %s)", g.intOperand(), g.pick([]string{"1", "2", "3", "7"}))
+	case r < 8:
+		return fmt.Sprintf("(%s %% %s)", g.intOperand(), g.pick([]string{"1", "2", "3", "7"}))
+	case r < 11:
+		op := g.pick([]string{"&", "|", "~"})
+		return fmt.Sprintf("(%s %s %s)", g.intOperand(), op, g.intOperand())
+	case r < 13:
+		op := g.pick([]string{"<<", ">>"})
+		return fmt.Sprintf("(%s %s %s)", g.intOperand(), op, g.pick(shiftPool))
+	default:
+		return fmt.Sprintf("(~%s)", g.intOperand())
 	}
 }
 
@@ -444,6 +599,10 @@ func (g *gen) str(d int) string {
 	case r < 10:
 		return fmt.Sprintf("tostring(%s)", g.pick(safeNumStrPool))
 	case r < 11:
+		// U7b: subtype interrogation — "integer"/"float"/nil render
+		// engine-identically (numPool mixes both subtypes now).
+		return fmt.Sprintf("math.type(%s)", g.pick(numPool))
+	case r < 12:
 		return fmt.Sprintf("string.char(%s, %s)", g.pick(smallInts), g.pick(smallInts))
 	default:
 		return g.pick(strPool)
@@ -477,9 +636,16 @@ func (g *gen) boolExpr(d int) string {
 		}
 	}
 	switch r := g.rnd.Intn(10); {
-	case r < 4:
+	case r < 3:
 		op := g.pick([]string{"==", "~=", "<", "<=", ">", ">="})
 		return fmt.Sprintf("(%s %s %s)", g.num(d-1), op, g.num(d-1))
+	case r < 4:
+		// U7b mixed int/float compare edge: the int64 converts to
+		// double first (9007199254740993 == 9007199254740993.0 is
+		// false — 2^53+1 rounds; 1 == 1.0 is true). IEEE-exact on
+		// every engine.
+		op := g.pick([]string{"==", "~=", "<", "<=", ">", ">="})
+		return fmt.Sprintf("(%s %s %s)", g.pick(intLitPool), op, g.pick([]string{"1.0", "2.0", "3.5", "0.5", "-1.0", "1e15", "9007199254740993.0"}))
 	case r < 5:
 		op := g.pick([]string{"==", "~=", "<", "<=", ">", ">="})
 		return fmt.Sprintf("(%s %s %s)", g.str(d-1), op, g.str(d-1))
@@ -494,6 +660,11 @@ func (g *gen) boolExpr(d int) string {
 
 // anyScalar: number/string/bool/nil-ish scalar expression.
 func (g *gen) anyScalar(d int) string {
+	// U7b: <const> locals join the readable pool (writes never target
+	// them — stmtAssign only writes g.scalars).
+	if len(g.consts) > 0 && g.rnd.Intn(10) == 0 {
+		return g.pick(g.consts)
+	}
 	switch r := g.rnd.Intn(10); {
 	case r < 4:
 		return g.num(d)
@@ -521,7 +692,8 @@ func (g *gen) pickF() *fnInfo {
 
 // call renders a well-formed call of fn (arity- and spread-aware).
 // A vararg fn's arity counts the "..." pseudo-param: fixed args are
-// arity-1, plus a spread beyond them.
+// arity-1, plus a spread beyond them. One call in four drops the
+// spread — the empty-extras corner (t.n == 0, t[1] == nil; var01).
 func (g *gen) call(fn *fnInfo) string {
 	nfixed := fn.arity
 	if fn.vararg {
@@ -531,7 +703,7 @@ func (g *gen) call(fn *fnInfo) string {
 	for i := 0; i < nfixed; i++ {
 		args = append(args, g.anyScalar(1))
 	}
-	if fn.vararg {
+	if fn.vararg && g.rnd.Intn(4) != 0 {
 		args = append(args, "1", `"s"`) // extra spread beyond fixed arity
 	}
 	return fmt.Sprintf("%s(%s)", fn.name, strings.Join(args, ", "))
@@ -557,8 +729,9 @@ func (g *gen) spend(n int) {
 }
 
 // stmt emits one statement; top=true at chunk body level (bare risky
-// statements are chunk-level only — uncaught raises inside function
-// bodies would truncate every callsite; bodies use pcall wraps).
+// statements and global decls are chunk-level only — uncaught raises
+// inside function bodies would truncate every callsite; bodies use
+// pcall wraps; `global` stays top-level per the U7b plan).
 func (g *gen) stmt(top bool) {
 	if len(g.out) >= g.maxLine-12 {
 		g.spend(g.budget)
@@ -566,32 +739,40 @@ func (g *gen) stmt(top bool) {
 	}
 	r := g.rnd.Intn(100)
 	switch {
-	case r < 13:
+	case r < 11:
 		g.stmtLocalDecl()
-	case r < 26:
+	case r < 22:
 		g.stmtPrint()
-	case r < 34:
+	case r < 30:
 		g.stmtAssign()
-	case r < 42:
+	case r < 38:
 		g.stmtIf()
-	case r < 51:
+	case r < 46:
 		g.stmtNumFor()
-	case r < 58:
+	case r < 53:
 		g.stmtGenFor()
-	case r < 64:
+	case r < 58:
 		g.stmtWhile()
-	case r < 68:
+	case r < 62:
 		g.stmtRepeat()
-	case r < 75:
+	case r < 69:
 		g.stmtPcall()
-	case r < 81:
+	case r < 75:
 		g.stmtFuncDef()
-	case r < 86:
+	case r < 80:
 		g.stmtTableDef()
-	case r < 91:
+	case r < 84:
 		g.stmtMetatable()
-	case r < 96:
+	case r < 88:
 		g.stmtLib()
+	case r < 91:
+		g.stmtTBC()
+	case r < 93:
+		if top {
+			g.stmtGlobal()
+		} else {
+			g.stmtPrint()
+		}
 	default:
 		if top {
 			g.bareRisk()
@@ -617,6 +798,16 @@ func (g *gen) defs() {
 
 func (g *gen) stmtLocalDecl() {
 	g.spend(1)
+	// U7b: <const> local (U4a attribs). Name goes to the read-only
+	// consts pool — a write target must never pick it (compile error);
+	// consts are block-scoped via scopeMark's nc truncation.
+	if g.rnd.Intn(8) == 0 {
+		g.nConst++
+		name := fmt.Sprintf("kc%d", g.nConst-1)
+		g.consts = append(g.consts, name)
+		g.linef("local %s <const> = %s", name, g.anyScalar(1))
+		return
+	}
 	// RHS evaluated against the OUTER scope, names registered after —
 	// `local v0 = f(v0)` must read the outer v0, not itself
 	if g.rnd.Intn(5) == 0 {
@@ -677,6 +868,141 @@ func (g *gen) stmtAssign() {
 		}
 	default:
 		g.linef("gx%d = %s", g.nScalar, g.anyScalar(1))
+	}
+}
+
+// stmtTBC (U7b): to-be-closed variables. Bounded per row 44's
+// semantics: at most 3 live TBCs per emission, close bodies are tiny
+// marker prints, and the shapes never contain blockBody() — so TBC
+// emissions cannot nest and max simultaneously-live stays ≤3. Covers:
+// the reverse-order close of multiple TBCs, nil/false TBCs (no __close
+// runs), the error-path close (pcall catch — the close ran first),
+// __close itself raising at scope exit (single fault — the double
+// fault's "error in error handling" is row-78e territory, not random
+// surface), and the non-closable decl raise.
+func (g *gen) stmtTBC() {
+	g.spend(2)
+	if g.tbcOpen >= 3 {
+		g.stmtPrint() // row 44 bound — never more than 3 live
+		return
+	}
+	n := 1 + g.rnd.Intn(3) // 1–3 TBCs in this block (reverse-close corner)
+	switch g.rnd.Intn(6) {
+	case 0: // nil/false TBC: legal, no __close call
+		g.linef("do")
+		g.push()
+		g.tbcOpen++
+		g.linef("local cx%d <close> = %s", g.nTBC, g.pick([]string{"nil", "false"}))
+		g.linef("print(\"tbc-nil-ok\")")
+		g.tbcOpen--
+		g.pop()
+		g.linef("end")
+	case 1, 2: // closables; 2+ shows reverse-order closing
+		g.linef("do")
+		g.push()
+		m := g.mark()
+		for i := 0; i < n; i++ {
+			g.tbcOpen++
+			g.linef("local cx%d <close> = setmetatable({}, {__close = function() print(\"cl%d\") end})",
+				g.nTBC, g.nTBC)
+			g.nTBC++
+		}
+		g.linef("print(\"in-tbc-block\")")
+		g.restore(m)
+		g.pop()
+		g.linef("end")
+	case 3: // error-path close: the catch proves the close ran
+		g.linef("do")
+		g.push()
+		m := g.mark()
+		g.linef("local ok, e = pcall(function()")
+		g.push()
+		g.tbcOpen++
+		g.linef("local cx%d <close> = setmetatable({}, {__close = function(o, err) print(\"clerr\", tostring(err)) end})",
+			g.nTBC)
+		g.nTBC++
+		g.linef("return %s", g.riskyExpr())
+		g.pop()
+		g.tbcOpen--
+		g.linef("end)")
+		g.linef("print(ok, tostring(e))")
+		g.restore(m)
+		g.pop()
+		g.linef("end")
+	case 4: // __close raising at clean scope exit (single fault)
+		g.linef("do")
+		g.push()
+		m := g.mark()
+		g.linef("local ok, e = pcall(function()")
+		g.push()
+		g.tbcOpen++
+		g.linef("local cx%d <close> = setmetatable({}, {__close = function() error(\"inclose\") end})",
+			g.nTBC)
+		g.nTBC++
+		g.pop()
+		g.tbcOpen--
+		g.linef("end)")
+		g.linef("print(ok, tostring(e))")
+		g.restore(m)
+		g.pop()
+		g.linef("end")
+	default: // non-closable value: "variable 'cxN' got a non-closable value"
+		g.linef("do")
+		g.push()
+		m := g.mark()
+		g.linef("local ok, e = pcall(function() local cx%d <close> = %s end)",
+			g.nTBC, g.pick([]string{"42", `"s"`, "true"}))
+		g.nTBC++
+		g.linef("print(ok, tostring(e))")
+		g.restore(m)
+		g.pop()
+		g.linef("end")
+	}
+}
+
+// stmtGlobal (U7b): the 5.5 `global` declaration system (U5a,
+// contextual keyword). Top-level only (see stmt). Two discipline rules
+// from glob01's ruled semantics: a NAMED declaration voids the
+// implicit preamble for the rest of the chunk — reads too, so even
+// `print`/`math` would be not-declared compile errors — and `global *`
+// re-opens it (decls persist). Every window therefore closes with
+// `global *` before anything else is emitted, and a window's interior
+// holds only literals (the <const> initializer sits inside it).
+// `global <close>` is a semantic error and never emitted; writes to
+// <const> names are compile errors — they never enter a writable pool.
+// The _ENV leg exercises the local-shadow lowering (GETFIELD/SETFIELD
+// on the local, vs the chunk-level GETTABUP/SETTABUP path) — names
+// under a local _ENV are field reads, legal under any preamble state.
+func (g *gen) stmtGlobal() {
+	g.spend(1)
+	plain := func() {
+		n := g.nGlobal
+		g.nGlobal++
+		g.linef("global gg%d", n)
+		g.linef("global *")
+		g.linef("gg%d = %s", n, g.anyScalar(1))
+		g.linef("print(gg%d)", n)
+	}
+	switch g.rnd.Intn(4) {
+	case 0, 1: // plain global: declare, re-open, assign, read
+		plain()
+	case 2: // const global: literal initializer (inside the window),
+		// reads only after the re-open
+		n := g.nGlobal
+		g.nGlobal++
+		g.linef("global <const> gk%d = %s", n, g.lit())
+		g.linef("global *")
+		g.linef("print(gk%d, math.type(gk%d))", n, n)
+	default: // read through a local _ENV shadow
+		// No named-decl dependency (a fresh case's first window must be
+		// able to take this arm — the stmtGlobal rate is low enough that
+		// second windows are rare): with no decls yet, read a stock
+		// global through the shadow; otherwise a declared gg/gk.
+		if g.nGlobal > 0 {
+			g.linef("do local _ENV = _G print(gg%d, gk%d) end", g.rnd.Intn(g.nGlobal), g.rnd.Intn(g.nGlobal))
+		} else {
+			g.linef("do local _ENV = _G print(math.type(7)) end")
+		}
 	}
 }
 
@@ -883,7 +1209,7 @@ func (g *gen) stmtPcall() {
 
 // riskyExpr: expressions that raise core errors (row 9 families).
 func (g *gen) riskyExpr() string {
-	switch g.rnd.Intn(10) {
+	switch g.rnd.Intn(14) {
 	case 0:
 		return `(nil).x`
 	case 1:
@@ -895,7 +1221,12 @@ func (g *gen) riskyExpr() string {
 	case 4:
 		return `{} .. "s"`
 	case 5:
-		return `(5)()`
+		// no kind-"" calls of non-function VALUES (`(5)()`): the interp
+		// runs a register VALUE scan at the raise and names any local
+		// holding the callee ("(local 'v0')") — coincidence-dependent,
+		// unprecomputable on wasm (row 85(c) residual; first live
+		// instances found by the U7b shakeout, cases 54 of seed 424242)
+		return `error("boom")`
 	case 6:
 		return `#missing_global_q`
 	case 7:
@@ -905,26 +1236,36 @@ func (g *gen) riskyExpr() string {
 			t := g.pickT()
 			return fmt.Sprintf("%s.missing_method_q()", t.name)
 		}
-		return `(5)()`
+		return `error("boom")`
+	case 9: // U7b: integer div/mod by zero — "attempt to perform
+		// 'n//0'" / "'n%%0'", byte-identical on the all-5.5 set
+		return g.pick([]string{`(1 // 0)`, `(0x10 % 0)`, `(math.maxinteger // 0)`})
+	case 10: // U7b: bitwise on a non-integer — the BITERR family
+		return g.pick([]string{`{} & 1`, `~{}`, `("q") | 1`, `("q") ~ 1`})
+	case 11: // U7b: float with no integer representation
+		return g.pick([]string{`(2.5 & 1)`, `(1e308 // 1) & 1`})
 	default:
 		return `error("boom")`
 	}
 }
 
 // bareRisk: an unwrapped raise at chunk level — the uncaught ERROR
-// event ends the log deterministically on every engine.
+// event ends the log deterministically on every engine. No error()/
+// error(nil) arm: nil error objects render "<no error object>" + the
+// rt prefix on wasm vs the interp's form — the row-60 seam residual
+// ruled for e006/e007 (the dead 2026-09-19 soak never saw it; hints
+// compare raw since U5e, and the U7b shakeout's first 120 cases found
+// six). Number/string error objects are row-21 deterministic.
 func (g *gen) bareRisk() {
 	g.spend(1)
-	switch g.rnd.Intn(6) {
+	switch g.rnd.Intn(5) {
 	case 0:
 		g.linef("error(%q)", strings.Trim(g.pick(strPool), `"`))
 	case 1:
 		g.linef("error(%s)", g.pick(intPool))
 	case 2:
-		g.linef("error()")
-	case 3:
 		g.linef("print(%s)", g.riskyExpr())
-	case 4:
+	case 3:
 		g.linef("assert(false)")
 	default:
 		g.linef("assert(nil, %q)", strings.Trim(g.pick(strPool), `"`))
@@ -938,6 +1279,15 @@ func (g *gen) stmtFuncDef() {
 	vararg := g.rnd.Intn(4) == 0
 	rec := g.rnd.Intn(6) == 0 // guarded recursion (row 20: depth ≤ 50)
 
+	// U7b: named vararg parameter — `...t` (U5b model; GETVARG reads,
+	// the table never enters g.tables: no writes, no pairs/# — see the
+	// avoidance notes in the package doc).
+	var varName string
+	if vararg && !rec && g.rnd.Intn(3) == 0 {
+		varName = fmt.Sprintf("nv%d", g.nVarName)
+		g.nVarName++
+	}
+
 	var params []string
 	if rec {
 		params = []string{"n"}
@@ -945,7 +1295,11 @@ func (g *gen) stmtFuncDef() {
 		pnames := []string{"a", "b", "c"}
 		params = append([]string{}, pnames[:arity]...)
 		if vararg {
-			params = append(params, "...")
+			if varName != "" {
+				params = append(params, "..."+varName)
+			} else {
+				params = append(params, "...")
+			}
 		}
 	}
 	// vararg fns always return a passthrough/multi shape — set before
@@ -964,7 +1318,7 @@ func (g *gen) stmtFuncDef() {
 	g.push()
 	if !rec { // params (a, b, c / ...) are body-locals
 		for _, p := range params {
-			if p != "..." {
+			if !strings.HasPrefix(p, "...") { // named vararg tables are read-only (U7b)
 				g.scalars = append(g.scalars, p)
 			}
 		}
@@ -978,16 +1332,37 @@ func (g *gen) stmtFuncDef() {
 		}
 	} else {
 		g.funcDepth++
+		if varName != "" {
+			// read-only vararg-table corners (var01 shapes): the count
+			// (integer subtype), indexed reads incl. out-of-range and
+			// exact-float keys, the "n" string key, other keys → nil
+			switch g.rnd.Intn(4) {
+			case 0:
+				g.linef("print(%s.n, math.type(%s.n), %s[1], %s[2])", varName, varName, varName, varName)
+			case 1:
+				g.linef("print(%s[\"n\"], %s[2.0], %s[0], %s[4], %s[\"x\"])", varName, varName, varName, varName, varName)
+			case 2:
+				g.linef("print(select('#', ...), %s.n)", varName)
+			default:
+				g.linef("print(%s.n, %s[%s])", varName, varName, g.pick(intPool))
+			}
+		}
 		g.blockBody(1 + g.rnd.Intn(2))
 		g.funcDepth--
 		if vararg {
-			switch g.rnd.Intn(3) {
+			switch g.rnd.Intn(4) {
 			case 0:
 				g.linef("return select('#', ...), ...")
 			case 1:
 				g.linef("return %s, ...", g.anyScalar(0))
-			default:
+			case 2:
 				g.linef("return select(%s, ...)", g.pick([]string{"1", "2", "3"}))
+			default:
+				if varName != "" {
+					g.linef("return %s.n, %s[1]", varName, varName)
+				} else {
+					g.linef("return select(%s, ...)", g.pick([]string{"1", "2", "3"}))
+				}
 			}
 		} else if fi.multi {
 			g.linef("return %s, %s", g.anyScalar(0), g.anyScalar(0))
@@ -1154,7 +1529,15 @@ func (g *gen) stmtMetatable() {
 // stmtLib: valid-by-construction library exercise (row 25 rules).
 func (g *gen) stmtLib() {
 	g.spend(1)
-	switch g.rnd.Intn(6) {
+	switch g.rnd.Intn(8) {
+	case 6: // U7b: subtype duality — math.type over both subtypes +
+		// string coercion (hex strings convert to integers)
+		g.linef("print(math.type(%s), math.type(%s), math.type(%s))",
+			g.pick(intLitPool), g.pick([]string{"1.0", "2.5", "1e15", "-0.0"}), g.pick(strPool))
+	case 7: // U7b: string→number coercion by subtype ("0x10" + 1 is
+		// integer 17; "3.5" * 2 is float 7.0)
+		g.linef("print((%s) + 1, (%s) * 2, math.type((%s) + 1))",
+			g.pick(intCoerceStrPool), g.pick(numStrPool), g.pick(intCoerceStrPool))
 	case 0:
 		g.linef("print(string.format(\"%%d %%s %%5.2f %%q\", %s, %s, %s, %s))",
 			g.pick(intPool), g.pick(strPool),
