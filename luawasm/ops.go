@@ -256,11 +256,15 @@ func (fe *funcEmitter) emitArithI(A, B, C, pc int) {
 // emitArithK: the ADDK..BXORK family — R[A] := R[B] op K[C]. The K
 // cell's type is known at compile time (the pool was staged here), so
 // int constants join the int fast path and float constants the float
-// one; every miss falls to the MMBINK slot.
+// one; a mixed register (int reg × float K, float reg × int K —
+// ADDK/SUBK/MULK only) promotes the register inline exactly as
+// luaO_arith would (i64→f64 convert, then the f64 op), so the common
+// `x * 0.5` / `f + 1` shapes never pay the rt_arith import. Every miss
+// falls to the MMBINK slot.
 func (fe *funcEmitter) emitArithK(op, A, B, C, pc int) {
 	f := fe.f
 	kv := fe.proto.Constants[C]
-	switch kv.(type) {
+	switch kv := kv.(type) {
 	case lua.LInteger:
 		switch op {
 		case lua.OP_ADDK, lua.OP_SUBK, lua.OP_MULK, lua.OP_BANDK, lua.OP_BORK, lua.OP_BXORK:
@@ -274,7 +278,30 @@ func (fe *funcEmitter) emitArithK(op, A, B, C, pc int) {
 			f.I32Const(rtTagInt).I32Store(8)
 			fe.bumpTop(A + 1)
 			f.Else()
-			fe.mmbinFallback(A, pc)
+			if op == lua.OP_ADDK || op == lua.OP_SUBK || op == lua.OP_MULK {
+				// float register × int K: promote the constant, run f64
+				fe.tagIs(B, rtTagFloat).If(wasm.Void)
+				fe.cellAddr(A)
+				fe.cellAddr(B).F64Load(0)
+				f.F64Const(float64(int64(kv)))
+				switch op {
+				case lua.OP_ADDK:
+					f.F64Add()
+				case lua.OP_SUBK:
+					f.F64Sub()
+				case lua.OP_MULK:
+					f.F64Mul()
+				}
+				f.F64Store(0)
+				fe.cellAddr(A)
+				f.I32Const(rtTagFloat).I32Store(8)
+				fe.bumpTop(A + 1)
+				f.Else()
+				fe.mmbinFallback(A, pc)
+				f.End()
+			} else {
+				fe.mmbinFallback(A, pc)
+			}
 			f.End()
 			return
 		}
@@ -298,7 +325,26 @@ func (fe *funcEmitter) emitArithK(op, A, B, C, pc int) {
 			f.I32Const(rtTagFloat).I32Store(8)
 			fe.bumpTop(A + 1)
 			f.Else()
+			// int register × float K: promote the register (i64→f64), run f64
+			fe.tagIs(B, rtTagInt).If(wasm.Void)
+			fe.cellAddr(A)
+			fe.cellAddr(B).I64Load(0).F64ConvertI64S()
+			fe.kcell(C).F64Load(0)
+			switch op {
+			case lua.OP_ADDK:
+				f.F64Add()
+			case lua.OP_SUBK:
+				f.F64Sub()
+			case lua.OP_MULK:
+				f.F64Mul()
+			}
+			f.F64Store(0)
+			fe.cellAddr(A)
+			f.I32Const(rtTagFloat).I32Store(8)
+			fe.bumpTop(A + 1)
+			f.Else()
 			fe.mmbinFallback(A, pc)
+			f.End()
 			f.End()
 			return
 		}
