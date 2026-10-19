@@ -99,7 +99,8 @@ The external consumer (the pure-Go Redis-clone daemon) takes a breaking release 
 the nret convention (`>=0` / `-1` error / `-2` tailcall / `-3` host-refused), the reentrancy
 law, the rt-owned upvalue registry, the 16-byte TValue cell layout (stock 5.5 `TValue` is
 still 16 bytes on wasm32 — re-assert in `build.sh`), the testdiff event model
-(`PRINT`/`ERROR`/`STDOUT`/`GLOBALS` + `normalize.go`), and the `make build` go-inline flow.
+(`PRINT`/`ERROR`/`RESULTS`/`STDOUT`/`GLOBALS` + `normalize.go` — RESULTS, the
+chunk-return event, added at U9a2), and the `make build` go-inline flow.
 
 ---
 

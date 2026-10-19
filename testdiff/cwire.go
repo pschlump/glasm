@@ -220,6 +220,64 @@ func onEvent(raw []byte, kind int32, emit func(string, string)) {
 	}
 }
 
+// FormatResults renders the one canonical RESULTS payload (U9a2): the
+// explicit value count, then the tab-joined rendered values — the count
+// is its own field so trailing-nil and truncation drift diffs even when
+// the rendered values happen to agree. Tabs are prefixes (Join would
+// leave a trailing tab on the zero-return line).
+func FormatResults(n int, parts []string) string {
+	out := strconv.Itoa(n)
+	for _, p := range parts {
+		out += "\t" + p
+	}
+	return out
+}
+
+// decodeResultsWire decodes the U9a2 results wire — [u32 count]
+// followed by count enc_value(expand=1) frames — the exact shape
+// lresults emits on the driver legs (the clua55 engines) and the
+// script-module legs compose per result cell via rt_encode_value. The
+// values render through sortedRepr (the GLOBALS renderer family), so
+// returned tables compare by contents under the same sorted-key parity
+// the globals snapshots already prove.
+func decodeResultsWire(raw []byte) (string, error) {
+	p := &cparser{b: raw}
+	n := p.u32()
+	parts := make([]string, 0, int(n))
+	for i := uint32(0); i < n; i++ {
+		v, err := p.value(true)
+		if err != nil {
+			return "", err
+		}
+		parts = append(parts, sortedRepr(v))
+	}
+	return FormatResults(int(n), parts), nil
+}
+
+// resultsLineFromCells builds the RESULTS line for the script-module
+// legs (wasm/wazero/wazero-prod): their chunk results are staged as
+// TValue cells at entryFrame+16*i, so the wire is composed by pulling
+// each cell through the blob's rt_encode_value export (row 96 — the
+// same expand=1 encoder lresults uses). pull returns cell i's encoded
+// bytes; a pull failure degrades to an explicit marker line, never a
+// silently-missing event.
+func resultsLineFromCells(n int, pull func(i int) []byte) string {
+	wire := make([]byte, 4, 4+16*n)
+	binary.LittleEndian.PutUint32(wire, uint32(n))
+	for i := 0; i < n; i++ {
+		b := pull(i)
+		if b == nil {
+			return "<encode failed>"
+		}
+		wire = append(wire, b...)
+	}
+	payload, err := decodeResultsWire(wire)
+	if err != nil {
+		return "<decode error: " + err.Error() + ">"
+	}
+	return payload
+}
+
 // sortedRepr sorts table entries at every level to match
 // serializeTable's deterministic output.
 func sortedRepr(v cval) string {

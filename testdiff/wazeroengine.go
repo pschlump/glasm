@@ -406,6 +406,33 @@ func (e *WazeroEngine) Run(c Case) (log []string) {
 			}
 		}
 	}
+	if nres := int32(status[0]); nres >= 0 {
+		// U9a2: chunk returns enter the differential surface — results are
+		// TValue cells at frame+16*i (the U9a entry-frame staging), each
+		// pulled through rt_encode_value (row 96) into linbuf.
+		inA := uint32(0)
+		if v, err := call(rtInst, "linbuf"); err == nil {
+			inA = uint32(int32(v[0]))
+		}
+		emit("RESULTS", resultsLineFromCells(int(nres), func(i int) []byte {
+			if inA == 0 {
+				return nil
+			}
+			res, err := call(rtInst, "rt_encode_value",
+				u32(int32(frame[0])+int32(16*i)), u32(int32(inA)), 1<<20)
+			if err != nil {
+				return nil
+			}
+			n := int32(res[0])
+			if n <= 0 {
+				return nil
+			}
+			if raw, ok := mem.Read(inA, uint32(n)); ok {
+				return raw
+			}
+			return nil
+		}))
+	}
 	if _, err := call(rtInst, "lglobals"); err != nil {
 		emit("GLOBALS", "<lglobals failed: "+err.Error()+">")
 	}

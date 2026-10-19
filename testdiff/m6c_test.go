@@ -24,11 +24,12 @@ import (
 
 // lua55ProdSHA256 pins the embedded 5.5 prod blob (U6d, row 95;
 // re-bumped at U6e: the hostfn seam — host.host_call import +
-// rt_hostfn/rt_encode_value exports, and the PT_INTEGER wire tag).
+// rt_hostfn/rt_encode_value exports, and the PT_INTEGER wire tag;
+// re-bumped at U9a2: the lresults driver export).
 // Rebuild runtime/build55.sh → update this constant (the artifact test
 // is the self-check that forces the bump). Brittle by design (A8:
 // checksummed artifact).
-const lua55ProdSHA256 = "2ba73262ae8634d642880ca167f0db307ba830cf6dac19f5cde13817ce17a8e6"
+const lua55ProdSHA256 = "f1269ca18a8d962106eae0078ab1157b7e8fdca572427a2baeedb71ca2dbfd5f"
 
 // TestM6cProdBlobArtifact (U6d edition, ledger row 95): lua55_prod.wasm
 // — the 5.5 production flavor of the rt blob. The build's output is
@@ -71,7 +72,7 @@ func TestM6cProdBlobArtifact(t *testing.T) {
 	for _, name := range []string{
 		// driver surface
 		"lnewstate", "lclose", "ldostring", "lglobals", "linbuf", "lnamebuf",
-		"lerrlen", "lerrcopy",
+		"lerrlen", "lerrcopy", "lresults",
 		// ABI v4 core
 		"rt_abi_version", "rt_set_state", "rt_frame_alloc", "rt_settable",
 		"rt_gettable", "rt_arith", "rt_concat", "rt_call_addr", "rt_forprep",

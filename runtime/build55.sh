@@ -43,7 +43,8 @@ SRC=$(ls lua55/src/*.c)
 # it): exactly the eight functions the Go oracle hosts call.
 EXPORTS="-Wl,--export=lnewstate -Wl,--export=lclose -Wl,--export=ldostring \
   -Wl,--export=lerrlen -Wl,--export=lerrcopy \
-  -Wl,--export=linbuf -Wl,--export=lnamebuf -Wl,--export=lglobals"
+  -Wl,--export=linbuf -Wl,--export=lnamebuf -Wl,--export=lglobals \
+  -Wl,--export=lresults"
 
 # A static (max-bounded) linear memory never moves its base — and is the
 # coarse OOM backstop (a memory.grow failure makes dlmalloc return NULL →

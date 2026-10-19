@@ -90,11 +90,24 @@ func (e *Interp) Run(c Case) []string {
 		emit("GLOBALS", serializeGlobals(L))
 		return log
 	}
+	resBase := L.GetTop()
 	L.Push(fn)
 	if err := L.PCall(0, lua.MultRet, nil); err != nil {
 		// The uncaught error value: PCall returns it as a Go error whose
 		// message is the Lua error's string form (with position prefix).
 		emit("ERROR", ValueRepr(lua.LString(err.Error()), 0, map[*lua.LTable]bool{}))
+	} else {
+		// U9a2: chunk returns enter the differential surface. The interp
+		// renders directly — ValueRepr is the sorted recursive form the
+		// wire legs produce through sortedRepr (the globals parity);
+		// each value gets its own cycle map, matching the C encoder's
+		// per-value ancestor arrays.
+		n := L.GetTop() - resBase
+		parts := make([]string, 0, n)
+		for i := 1; i <= n; i++ {
+			parts = append(parts, ValueRepr(L.Get(resBase+i), 0, map[*lua.LTable]bool{}))
+		}
+		emit("RESULTS", FormatResults(n, parts))
 	}
 	emit("GLOBALS", serializeGlobals(L))
 	return log

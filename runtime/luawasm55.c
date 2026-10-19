@@ -646,6 +646,35 @@ void lglobals(void) {
   if (g_state != NULL) emit_globals(g_state);
 }
 
+/* U9a2: chunk RESULTS for the differential surface. dostring_body arms
+   g_res_base at the pcall; the engine PULLS the wire after a successful
+   ldostring (a pull export like lglobals/lerrcopy — deliberately NOT a
+   host_event, so the seeding ldostrings can never emit spurious results
+   lines). Same encoder posture as globals (expand=1, cycle/depth
+   capped); the [u32 count][values...] frame matches g_print's header so
+   one Go decoder shape serves both. Returns the FULL encoded length
+   (truncation detectable by the caller), -1 when no results frame is
+   armed. */
+static int g_res_base; /* stack index of the last run chunk's pcall */
+
+int32_t lresults(int32_t dst, int32_t cap) {
+  lua_State *L = g_state;
+  if (L == NULL || g_res_base <= 0) return -1;
+  /* after pcall(0, MULTRET) the results occupy func..func+nres-1 —
+     luaD_poscall moves them down onto the function's own slot — so the
+     count runs from the top and the values run from g_res_base itself */
+  int n = lua_gettop(L) - g_res_base + 1;
+  if (n < 0) n = 0;
+  const void *anc[ENC_MAX_DEPTH + 1];
+  int off = enc_u32(0, (uint32_t)n);
+  for (int i = 0; off >= 0 && i < n; i++)
+    off = enc_value(L, g_res_base + i, off, 1, 0, anc, 0);
+  if (off < 0) return -1;
+  int32_t len = off < cap ? (int32_t)off : cap;
+  if (len > 0) memcpy((void *)(size_t)dst, evbuf, (size_t)len);
+  return (int32_t)off;
+}
+
 void lclose(int32_t p) {
   lua_State *L = (lua_State *)(size_t)p;
   if (L != NULL) {
@@ -677,6 +706,7 @@ struct dostring_args {
 
 static void dostring_body(void *ud) {
   struct dostring_args *a = ud;
+  g_res_base = 0; /* U9a2: armed below only when the load succeeds */
   const char *s = a->s;
   size_t len = a->len;
   /* skip a leading '#' line, like the standalone interpreter's loader
@@ -708,10 +738,12 @@ static void dostring_body(void *ud) {
     lua_rawseti(a->L, -2, 0);
     lua_setglobal(a->L, "arg");
   }
+  g_res_base = lua_gettop(a->L); /* U9a2: MULTRET results land at +1.. */
   a->status = lua_pcall(a->L, 0, LUA_MULTRET, 0);
   if (a->status != 0) {
     capture_error(a->L);
     lua_pop(a->L, 1);
+    g_res_base = 0; /* failed run: no results frame */
   }
 }
 

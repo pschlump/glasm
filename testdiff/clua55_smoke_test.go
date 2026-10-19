@@ -30,8 +30,13 @@ zz = 42
 	}
 	for _, e := range []Engine{NewCLua55("clua55-smoke"), NewCLua55Wazero("clua55-wazero-smoke")} {
 		log := e.Run(c)
-		if len(log) != 4 { // 3 prints + GLOBALS
-			t.Fatalf("%s: expected 3 PRINT + GLOBALS events, got %d: %q", e.Name(), len(log), log)
+		if len(log) != 5 { // 3 prints + RESULTS (U9a2) + GLOBALS
+			t.Fatalf("%s: expected 3 PRINT + RESULTS + GLOBALS events, got %d: %q", e.Name(), len(log), log)
+		}
+		// GLOBALS lands at index 3 (emitted DURING ldostring via
+		// want_globals=1) and RESULTS after the pull — index 4.
+		if log[4] != "RESULTS\t0" {
+			t.Errorf("%s: RESULTS mismatch: got %q", e.Name(), log[4])
 		}
 		for i, w := range want {
 			if log[i] != w {

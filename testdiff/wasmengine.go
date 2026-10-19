@@ -604,6 +604,31 @@ func (e *WasmEngine) Run(c Case) (log []string) {
 			}
 		}
 	}
+	if stv >= 0 {
+		// U9a2: chunk returns enter the differential surface. The results
+		// are TValue cells at frame+16*i (the U9a entry-frame staging);
+		// each cell is pulled through rt_encode_value (row 96 — the same
+		// expand=1 encoder lresults uses on the driver legs) into linbuf.
+		frameAddr, _ := frame.(int32)
+		inA := int32(0)
+		if v, err := call(rtInst, "linbuf"); err == nil {
+			inA, _ = v.(int32)
+		}
+		emit("RESULTS", resultsLineFromCells(int(stv), func(i int) []byte {
+			if inA == 0 {
+				return nil
+			}
+			res, err := call(rtInst, "rt_encode_value", int(frameAddr)+16*i, int(inA), 1<<20)
+			if err != nil {
+				return nil
+			}
+			n, ok := res.(int32)
+			if !ok || n <= 0 {
+				return nil
+			}
+			return memRead(inA, n)
+		}))
+	}
 	if _, err := call(rtInst, "lglobals"); err != nil {
 		emit("GLOBALS", "<lglobals failed: "+err.Error()+">")
 	}

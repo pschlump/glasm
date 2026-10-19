@@ -250,6 +250,13 @@ func (e *CLua55) Run(c Case) []string {
 			emit("ERROR", `""`)
 		}
 	}
+	if status == 0 {
+		// U9a2: chunk returns enter the differential surface.
+		pullResults55(emit,
+			func() (uint64, error) { return call("linbuf") },
+			func(dst, cap uint64) (uint64, error) { return call("lresults", dst, cap) },
+			memRead)
+	}
 	// Ledger row 29 (carried over): best-effort io.flush in the live state
 	// before lclose — lclose returns without libc exit(), so the atexit
 	// stdout flush never runs and io.write's buffered tail is lost.
@@ -267,6 +274,40 @@ func (e *CLua55) Run(c Case) []string {
 		}
 	}
 	return log
+}
+
+// pullResults55 emits the canonical RESULTS line for a successful run by
+// pulling the lresults wire into the driver's inbuf (U9a2). The three
+// closures paper over the two hosts' call conventions; a failure at any
+// step degrades to an explicit marker line — never a silently-missing
+// event, which would read as a clean diff.
+func pullResults55(emit func(string, string),
+	linbuf func() (uint64, error),
+	lresults func(dst, cap uint64) (uint64, error),
+	read func(ptr, n int32) []byte) {
+	inAddr, err := linbuf()
+	if err != nil {
+		emit("RESULTS", "<linbuf failed: "+err.Error()+">")
+		return
+	}
+	n, err := lresults(inAddr, uint64(1<<20))
+	if err != nil {
+		emit("RESULTS", "<lresults failed: "+err.Error()+">")
+		return
+	}
+	// lresults returns int32_t; both hosts hand it back zero-extended, so
+	// the -1 not-armed marker must be read through int32, not int64.
+	sn := int32(n)
+	if sn < 0 {
+		emit("RESULTS", "<lresults: not armed>")
+		return
+	}
+	payload, derr := decodeResultsWire(read(int32(inAddr), int32(sn)))
+	if derr != nil {
+		emit("RESULTS", "<decode error: "+derr.Error()+">")
+		return
+	}
+	emit("RESULTS", payload)
 }
 
 // ldostring55 stages src+chunkname and runs ldostring on state L — shared
@@ -415,6 +456,18 @@ func (e *CLua55Wazero) Run(c Case) (log []string) {
 		} else {
 			emit("ERROR", `""`)
 		}
+	}
+	if status == 0 {
+		// U9a2: chunk returns enter the differential surface.
+		pullResults55(emit,
+			func() (uint64, error) { return call("linbuf") },
+			func(dst, cap uint64) (uint64, error) { return call("lresults", dst, cap) },
+			func(ptr, n int32) []byte {
+				if raw, ok := mem.Read(uint32(ptr), uint32(n)); ok {
+					return raw
+				}
+				return nil
+			})
 	}
 	// Ledger row 29 (carried over): drain io.write's buffered tail.
 	_, _ = ldostring("io.flush()", "=flush", 0)
