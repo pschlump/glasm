@@ -26,6 +26,7 @@ func main() {
 	flag.Parse()
 
 	var engines []testdiff.Engine
+	prodLeg := false
 	for i, name := range strings.Split(*enginesFlag, ",") {
 		switch name {
 		case "clua":
@@ -46,6 +47,7 @@ func main() {
 			e := testdiff.NewWazeroEngine(fmt.Sprintf("wazero-prod-%c", 'a'+i))
 			e.SkipUnsupported = true
 			e.UseProdBlob()
+			prodLeg = true
 			engines = append(engines, e)
 		default:
 			fmt.Fprintf(os.Stderr, "unknown engine %q (known: interp, clua, clua55, wasm, wazero, wazero-prod)\n", name)
@@ -62,7 +64,24 @@ func main() {
 	// and the go-test gates can never disagree about what is excluded
 	// (row-71 seam skips retired at U5e — the seam engines now raise
 	// with the full varinfo hints, so there are no wasm-leg-only skips)
-	cases, skippedList := testdiff.FilterSkips(cases, testdiff.CorpusSkips(*corpus))
+	// A prod leg layers the row-95 prodBlobSkips over the corpus map —
+	// the same merge the go-test exit gate's prod pass (exitGateEngines)
+	// does — so the compiled-out surface (io/os/debug/package/require/
+	// load nil on lua55_prod.wasm) is excluded identically here (U8
+	// audit: this leg silently missed the layer and failed on the
+	// row-95-ruled slu00/base/os cases).
+	skips := testdiff.CorpusSkips(*corpus)
+	if prodLeg {
+		layer := map[string]string{}
+		for k, v := range skips {
+			layer[k] = v
+		}
+		for k, v := range testdiff.ProdBlobSkips() {
+			layer[k] = v
+		}
+		skips = layer
+	}
+	cases, skippedList := testdiff.FilterSkips(cases, skips)
 	results := testdiff.RunCorpus(cases, engines)
 
 	diffs := 0

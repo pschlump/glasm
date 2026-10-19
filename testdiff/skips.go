@@ -62,6 +62,13 @@ var u5WasmSkips = map[string]string{
 	// vgap01/limits01 run on the wasm legs now.
 }
 
+// ProdBlobSkips (U6f row 98, exported at U8): the row-95 prod-flavor
+// skips — the compiled-out surface of lua55_prod.wasm — layered over the
+// corpus map by BOTH the go-test exit gate's prod pass (exitGateEngines)
+// and cmd/testdiff's prod legs, so the two can never disagree about what
+// is excluded (the skips.go single-source rule).
+func ProdBlobSkips() map[string]string { return prodBlobSkips }
+
 // CorpusSkipsFor was retired with the row-71 seam strip (U5e): the seam
 // engines now raise with the same varinfo hints as the oracles, so there
 // are no wasm-leg-only skips — callers use CorpusSkips directly.
@@ -69,16 +76,25 @@ var u5WasmSkips = map[string]string{
 // gluaWasmSkips: _glua-tests cases with a ruled divergence (each cites
 // its row in docs/Lua-Wasm-Divergence-Ledger.md).
 var gluaWasmSkips = map[string]string{
-	"coroutine.lua": "coroutines out of scope for the Redis subset — row 22",
-	"issues.lua":    "yield across C boundary (coroutines) — row 22",
-	"db.lua":        "debug.getinfo introspection over wasm frames — row 23",
-	"goto.lua":      "loadstring-mixed C-interpreted chunks — row 24",
-	"vm.lua":        "loadstring + gopher parser-error wording (register overflow) — row 24",
+	"issues.lua": "yield through coroutine.resume from a compiled body raises stock's mainthread text (interp suspends) — row 97",
+	"db.lua":     "debug.getinfo introspection over wasm frames — row 23",
+	// U8 audit: coroutine.lua/goto.lua/vm.lua un-skipped — all three run
+	// byte-exact on the wasm, wazero, AND clua55 legs (probed; coroutine.lua
+	// was re-pinned to wrap/resume shapes; row 87 re-pinned load parity and
+	// the parser-limit texts). Rows 22/24 close; issues.lua re-cites row 97
+	// (the yield posture), goto/vm move to prodBlobSkips (load is nil on
+	// the prod flavor — row 95, same as _u5's gotostar01/var06/var08).
 	// U3b: math.lua un-skipped — re-pinned to the 5.5 surface (pow
 	// removed, stock arity text); row 25's math clause closes.
 	// U3d: table.lua un-skipped — the table lib is on the stock surface
 	// and the corpus case was re-pinned with it (no maxn/getn).
-	"strings.lua": "library-error wording/behavior (string.dump unsupported in the fork) — row 25",
+	// U8 audit: strings.lua re-cited off the stale row 25 (string.dump
+	// landed U5f-1, row 87). The live divergence is the seam's argerror
+	// NAME arm — row 60(5): stock names a raising C function via its
+	// caller, a compiled caller is a CClosure, so stock's C-caller
+	// fallback yields the qualified 'string.dump' where interp+clua55
+	// say 'dump' (the case dies at strings.lua:5).
+	"strings.lua": "argerror names the function through the compiled caller ('string.dump' vs 'dump') — row 60(5)",
 }
 
 // wasmTestsSkips: _wasm-tests cases with a ruled divergence (each cites
@@ -96,11 +112,14 @@ var wasmTestsSkips = map[string]string{
 	// U3i (row 70d): gnf00/gnf01 un-skipped — the interp's number
 	// tostring is numberToStringStock (the stock %.14g-with-".0"
 	// spelling), matching the v4 blob; row 60(4)'s clause closes.
-	// row 10 — table.sort + deep __call/tailcall chains corrupt the
-	// return path (pre-existing M5d/M6 bucket)
-	"tsort01.lua": "sort comparator + __call chains corrupt the return path — row 10",
 	// U3b: mod00 un-skipped — the D5 host-RNG shim retired; every engine
 	// runs stock xoshiro over the makeseed=0 pin.
+	//
+	// U8 audit: EMPTY. tsort01.lua — the last entry — was un-skipped:
+	// it runs byte-exact on the wasm, wazero, and clua55 legs (probed).
+	// The U6a frame-layout surgery (row 86) fixed the return-path
+	// corruption; row 10 closes and the un-skipped case is its covering
+	// test. Earlier families left only comments above.
 }
 
 // ledgeredErrSkips: _wasm-err-tests cases whose divergence has a ruling
@@ -139,6 +158,12 @@ var prodBlobSkips = map[string]string{
 	// _glua-tests
 	"base.lua": "dofile('notexist') — dofile is nil on the prod flavor — row 95",
 	"os.lua":   "the os library is compiled out of the prod flavor — row 95",
+	// U8 audit: goto.lua/vm.lua un-skipped off the stale row 24 (the
+	// dev-blob legs and the oracle column run them byte-exact — row 87's
+	// load/parser-text re-pins) and re-landed HERE: load() is nil on the
+	// prod flavor (vm.lua:84 pins it), the same ruling as _u5's cases.
+	"goto.lua": "load() — nil on the prod flavor — row 95",
+	"vm.lua":   "load() — nil on the prod flavor — row 95",
 	// _u5 (the corpus discipline strips semerrors through load())
 	"call01.lua":     "debug.getinfo — debug is nil on the prod flavor — row 95",
 	"gotostar01.lua": "load() — nil on the prod flavor — row 95",
