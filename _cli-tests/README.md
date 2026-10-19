@@ -1,14 +1,17 @@
 # _cli-tests — black-box CLI integration tests
 
-Standalone Lua programs run as real CLI invocations across **three
+Standalone Lua programs run as real CLI invocations across **two
 engines**, with stdout diffed byte-for-byte against golden files in
 `ref/`:
 
 | engine | invocation                                                      | what it is                                           |
 |--------|-----------------------------------------------------------------|------------------------------------------------------|
-| interp | `../cmd/glua/glua prog.lua args...`                             | the golua55 interpreter                              |
+| interp | `../cmd/glua/glua prog.lua args...`                             | the glasm interpreter                                |
 | wasm   | `glua -w tmp/p.wasm prog.lua` then `glua -W tmp/p.wasm args...` | the Lua→wasm backend (compile, then run precompiled) |
-| clua   | `tmp/clua-run prog.lua args...`                                 | stock C Lua 5.1 in wasm — the semantic authority     |
+
+(A third leg — clua, stock C Lua 5.1 in wasm via `tmp/clua-run` — ran
+from M4 until the U8 retirement of the 5.1 tree. The C-Lua oracle
+differential now lives in `testdiff/` as `clua55`, stock 5.5.1.)
 
 `make test` runs everything (~35 targets). `make refs` regenerates the
 golden files — from interp (the primary oracle) except the per-engine
@@ -22,12 +25,14 @@ production engine (`GLUA_WASM_ENGINE=wazero`, understood by `glua -W`
 and `luawasm-run`): same golden files, same diffs — the production
 engine is byte-for-byte with the oracle over the whole CLI surface.
 
-The three-engine shape is the point: interp and wasm share the
-frontend, so a frontend bug leaves their diff green — only the C Lua
-leg disagrees. Six real bugs were found this way on day one (ledger
-rows 27–31 plus the io.write flush and the upstream multi-assignment
-compiler bug); rows 27, 28 and 31 are fixed — the `xfailw` Makefile
-macro remains for pinning future open rows.
+The third engine earned its keep while it ran: interp and wasm share
+the frontend, so a frontend bug leaves their diff green — only the C
+Lua leg disagreed. Six real bugs were found that way on day one
+(ledger rows 27–31 plus the io.write flush and the upstream
+multi-assignment compiler bug); rows 27, 28 and 31 are fixed — the
+`xfailw` Makefile macro remains for pinning future open rows. The
+cross-implementation differential duty now belongs to the testdiff
+gates (interp × clua55 × wasm/wazero/wazero-prod).
 
 ## Programs
 
@@ -39,22 +44,21 @@ Unix-style tools: `cat` (-n), `grep` (-nvci, Lua patterns), `sortl`
 descent expression evaluator), `kvdb` (persistent key-value store,
 Redis-flavored). Error surfaces: `err1` (runtime errors, per-engine
 refs), `syntaxerr` (compile refusal). `concatstress` pins ledger row
-27. `lwc`/`lwc2` are the original wc clones (tests 000–002, two
-engines — they predate the clua leg).
+27. `lwc`/`lwc2` are the original wc clones (tests 000–002).
 
 Data files live in `data/` (poem, names, nums, brainfuck programs,
 a Life seed, calc expressions).
 
 ## Rules for cross-engine programs
 
-These constraints keep one golden file valid for all three engines.
+These constraints keep one golden file valid for both engines.
 Each exists because of a measured divergence (see the divergence
 ledger):
 
 - **Numbers:** format explicitly — `string.format("%d")`,
-  `"%.14g"`, `"%.Nf"`. Never bare `print(float)` or float `..` concat:
-  interp's default number formatting is Go-shortest, the wasm engines'
-  is C `%.14g` (row: default Number repr). Keep `%d` values < 2^31
+  `"%.14g"`, `"%.Nf"`. Both engines speak stock `%.14g` today (the
+  interp re-pinned at U3i, row 70d), but explicit formatting keeps the
+  refs stable against any future repr change. Keep `%d` values < 2^31
   (wasm32). Avoid inf/nan reaching output.
 - **One output channel per program:** `print` OR `io.write`, not both —
   the wasm engines buffer WASI stdout and emit it after the event log,
@@ -78,19 +82,11 @@ ledger):
 - **Iterate hash tables only in sorted key order** — `pairs` order is
   engine-specific.
 - **Error messages a program surfaces:** raise with `error(msg, 0)`
-  (no position prefix) and print via pcall — clua's arg prelude shifts
-  positions by one line and stock lib-error wording differs (row 25).
-  `err1.lua` is the deliberate exception: it pins each engine's raw
-  error surface against its own ref (interp and wasm now match
-  byte-for-byte, including pcall-caught position prefixes — row 28
-  fixed).
+  (no position prefix) and print via pcall — position prefixes still
+  differ on the level-0 seam residual (row 85 e001: the wasm leg gains
+  the rt prefix). `err1.lua` is the deliberate exception: it pins each
+  engine's raw error surface against its own ref (interp and wasm now
+  match byte-for-byte, including pcall-caught position prefixes — row
+  28 fixed).
 - **arg[0] differs** (`-W` passes the .wasm path) — print a fixed
   program name in usage messages instead.
-
-## clua-run
-
-`cmd/clua-run` (built into `tmp/clua-run`) wraps the testdiff C-Lua
-oracle for CLI use. The engine has no args seam, so args are baked
-into a one-line `arg={...}` prelude — shifting error positions by one
-line relative to the other engines (another reason programs strip
-position prefixes).

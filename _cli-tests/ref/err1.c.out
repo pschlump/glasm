@@ -1,5 +1,0 @@
-before the crash
-false	./err1.lua:14: attempt to index upvalue 't' (a nil value)
-false	./err1.lua:19: attempt to concatenate a nil value
-clua: ./err1.lua:23: deliberate uncaught error
-exit=1

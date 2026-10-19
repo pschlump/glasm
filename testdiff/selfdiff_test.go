@@ -13,18 +13,12 @@ import "testing"
 // each with a mandatory reason (§8.9: a skip without a reason is a bug).
 var gluaSkips = map[string]string{}
 
-// lua51Skips lists _lua5.1-tests cases excluded from the diff.
-var lua51Skips = map[string]string{}
+// The _lua5.1-tests self-diff leg (TestSelfDiffLua51Tests) was retired
+// with the corpus at U8 — the 5.1 oracle, its engine, and the vendored
+// tree went together (ledger row 55's executed retirement).
 
 func TestSelfDiffGluaTests(t *testing.T) {
 	runSelfDiff(t, "../_glua-tests", gluaSkips)
-}
-
-func TestSelfDiffLua51Tests(t *testing.T) {
-	if testing.Short() {
-		t.Skip("heavy corpus (~60s; verybig.lua compiles a 120k-line chunk per engine) — skipped in -short mode")
-	}
-	runSelfDiff(t, "../_lua5.1-tests", lua51Skips)
 }
 
 func runSelfDiff(t *testing.T, dir string, skips map[string]string) {

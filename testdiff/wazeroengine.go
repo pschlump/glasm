@@ -24,6 +24,7 @@ package testdiff
 import (
 	"bytes"
 	"context"
+	_ "embed"
 	"fmt"
 	"os"
 	"runtime/debug"
@@ -37,6 +38,15 @@ import (
 	"github.com/tetratelabs/wazero/experimental"
 	"github.com/tetratelabs/wazero/imports/wasi_snapshot_preview1"
 )
+
+// lua55_prod.wasm — the zero-wasi production flavor of the 5.5 runtime
+// (U6d, ledger row 95): base/coroutine/string/table/math/utf8 with the
+// loaders compiled out, rebuilt by runtime/build55.sh and byte-compared
+// against host/'s embedded copy (m6c_test.go — the embed-dance drift
+// lock). Lived in clua.go until the U8 retirement of the 5.1 tree.
+//
+//go:embed lua55_prod.wasm
+var lua55ProdWasm []byte
 
 func u32[T int32 | int | uint32](v T) uint64 { return uint64(uint32(v)) }
 
@@ -71,8 +81,9 @@ type WazeroEngine struct {
 	// SkipUnsupported: scripts using v1-unsupported opcodes produce a
 	// SKIP-UNSUPPORTED log instead of an engine error (corpus tests)
 	SkipUnsupported bool
-	// RtBin overrides the runtime blob (nil → embedded lua51_sjlj.wasm;
-	// the RTWASM env var still wins). The M6c gates pass lua51ProdWasm.
+	// RtBin overrides the runtime blob (nil → embedded lua55_rt.wasm;
+	// the RTWASM env var still wins). The prod legs pass lua55ProdWasm
+	// (UseProdBlob).
 	RtBin []byte
 	// Sandbox: call rt_sandbox(1) after rt_set_state — the M6c globals
 	// lockdown (ledger row 33; U6c re-pins the list on 5.5 — ledger row
@@ -169,7 +180,6 @@ func (e *WazeroEngine) Run(c Case) (log []string) {
 	}
 
 	var stdout bytes.Buffer // wasi fd_write capture (replaces the temp file)
-	decoder := &CLua{}
 
 	// host.wasm_dispatch: the M5a re-entrancy seam — the blob's precall
 	// adapter dispatches compiled protos through the host into the script
@@ -202,7 +212,7 @@ func (e *WazeroEngine) Run(c Case) (log []string) {
 	eventFn := func(kind, ptr, length int32) {
 		if m := r.Module("rt"); m != nil {
 			if raw, ok := m.Memory().Read(uint32(ptr), uint32(length)); ok {
-				decoder.onEvent(raw, kind, emit)
+				onEvent(raw, kind, emit)
 			}
 		}
 	}

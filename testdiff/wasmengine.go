@@ -5,9 +5,9 @@ package testdiff
 // runtime on wasmtime — the third differential engine. The harness shim
 // comes from the runtime module's install_shims (print→host event,
 // deterministic os.*, host RNG for math.random), matching the interp
-// and clua engines' contract. Since U2e the runtime blob is the ABI v4
+// and clua55 engines' contract. Since U2e the runtime blob is the ABI v4
 // rt flavor on the stock 5.5 tree (lua55_rt.wasm, embedded below —
-// rebuilt by runtime/build55.sh; the 5.1 blob stays the clua oracle's).
+// rebuilt by runtime/build55.sh).
 
 import (
 	"bytes"
@@ -216,8 +216,8 @@ type WasmEngine struct {
 	// SkipUnsupported: scripts using v1-unsupported opcodes produce a
 	// SKIP-UNSUPPORTED log instead of an engine error (corpus tests)
 	SkipUnsupported bool
-	// RtBin overrides the runtime blob (nil → embedded lua51_sjlj.wasm;
-	// the RTDBG env var still wins). M6c gates pass lua51ProdWasm.
+	// RtBin overrides the runtime blob (nil → embedded lua55_rt.wasm;
+	// the RTDBG env var still wins). The prod legs pass lua55ProdWasm.
 	RtBin []byte
 	// Sandbox: call rt_sandbox(1) after rt_set_state (M6c globals
 	// lockdown, ledger row 33; U6c re-pins the list on 5.5 — ledger row
@@ -338,10 +338,9 @@ func (e *WasmEngine) Run(c Case) (log []string) {
 		}
 	}
 
-	decoder := &CLua{}
 	eventFn := func(kind, ptr, length int32) {
 		if raw := memRead(ptr, length); raw != nil {
-			decoder.onEvent(raw, kind, emit)
+			onEvent(raw, kind, emit)
 		}
 	}
 	if e.NoopHosts {

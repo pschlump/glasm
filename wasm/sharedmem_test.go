@@ -19,7 +19,7 @@ import (
 func TestSharedMemoryBoundary(t *testing.T) {
 	rtBin, err := os.ReadFile("../runtime/memshare.wasm")
 	if err != nil {
-		t.Skip("memshare.wasm not built — run runtime/build.sh")
+		t.Skip("memshare.wasm not built — the recipe is in runtime/memshare.c's header")
 	}
 
 	ctx := context.Background()

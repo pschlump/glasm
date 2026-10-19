@@ -1,7 +1,7 @@
 package testdiff
 
 // M6c gates (design §8.6, ledger rows 33-34): the production blob flavor
-// (lua51_prod.wasm — zero wasi imports) and the sandbox globals lockdown
+// (lua55_prod.wasm — zero wasi imports) and the sandbox globals lockdown
 // (rt_sandbox(1)), plus the D5 determinism gates in m6cdet_test.go.
 //
 // The artifact test parses the embedded blob's own section bytes: the
@@ -105,9 +105,9 @@ func TestM6cProdBlobArtifact(t *testing.T) {
 		t.Error("host/lua55_prod.wasm differs from testdiff's copy — re-run runtime/build55.sh (the copies must move together)")
 	}
 
-	// dev-blob sanity: the parser reads the sjlj blob's wasi imports fine
-	// (17 today) — guards against a parser regression passing trivially.
-	if wasi, err := wasm.HasWASIImports(lua51SjljWasm); err != nil || !wasi {
+	// dev-blob sanity: the parser reads the 5.5 oracle blob's wasi imports
+	// fine — guards against a parser regression passing trivially.
+	if wasi, err := wasm.HasWASIImports(lua55SjljWasm); err != nil || !wasi {
 		t.Errorf("sjlj blob HasWASIImports = %v, %v; want true (parser sanity)", wasi, err)
 	}
 }

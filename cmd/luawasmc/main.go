@@ -1,11 +1,11 @@
-// Command luawasmc compiles a Lua 5.1 script to a WebAssembly module.
+// Command luawasmc compiles a Lua 5.5 script to a WebAssembly module.
 //
 //	luawasmc [-o out.wasm] [-name chunkname] script.lua
 //
-// The emitted module imports the rt_* runtime (runtime/lua51_sjlj.wasm):
-// pair it with cmd/luawasm-run to execute the saved artifact. Artifacts
-// are deterministic for a given source+chunkname — cacheable by SHA,
-// the Redis SCRIPT model.
+// The emitted module imports the rt_* runtime (runtime/lua55_rt.wasm,
+// ABI v4): pair it with cmd/luawasm-run to execute the saved artifact.
+// Artifacts are deterministic for a given source+chunkname — cacheable
+// by SHA, the Redis SCRIPT model.
 package main
 
 import (

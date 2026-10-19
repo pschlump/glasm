@@ -1,2 +1,0 @@
-clua: ./syntaxerr.lua:10: ')' expected (to close '(' at line 8) near '<eof>'
-exit=1

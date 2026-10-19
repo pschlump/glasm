@@ -26,22 +26,10 @@ var gluaTests []string = []string{
 	"goto.lua",
 }
 
-// luaTests: the official 5.1-suite files run on the interpreter. U1
-// re-triage (upgrade plan D8/D11): the files using 5.2-removed features —
-// module (attrib.lua), setfenv (closure.lua, events.lua), loadstring
-// (calls.lua, constructs.lua, literals.lua, locals.lua, math.lua),
-// unpack/arg (vararg.lua, pm.lua) — are dropped from the interp leg with
-// ledger rows; they stay attached to the frozen 5.1 engines (clua) until
-// U8. Portable cases are re-landed by the _u1 corpus (TestU1Gate) and the
-// version-neutral 5.5-suite subsets.
-//
-// U3d re-triage: sort.lua joins them — table.getn is gone (5.2 removal,
-// D8) and the file leans on it throughout; the sort surface is covered
-// by _u3's table slice and the official sort.lua at U5's full-suite leg.
-var luaTests []string = []string{
-	"strings.lua",
-	"files.lua",
-}
+// The _lua5.1-tests interp leg (TestLua, two files by the end) was
+// retired with the corpus at U8: the 5.1 oracle, its engine, and the
+// vendored tree went together (ledger row 55's executed retirement).
+// Portable substance lives on in _u1 (TestU1Gate) and _lua5.5-tests.
 
 func testScriptCompile(t *testing.T, script string) {
 	file, err := os.Open(script)
@@ -142,10 +130,6 @@ func TestLocalVarFree(t *testing.T) {
 
 func TestGlua(t *testing.T) {
 	testScriptDir(t, gluaTests, "_glua-tests")
-}
-
-func TestLua(t *testing.T) {
-	testScriptDir(t, luaTests, "_lua5.1-tests")
 }
 
 func TestMergingLoadNilBug2(t *testing.T) {

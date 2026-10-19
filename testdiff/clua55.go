@@ -3,13 +3,12 @@ package testdiff
 // The Lua 5.5.1 oracle engines (U0, docs/Upgrade-from-5.2-to-5.5-of-Lua.md;
 // decision D6): stock C Lua 5.5.1 compiled to lua55_sjlj.wasm
 // (runtime/build55.sh) and hosted on BOTH engine hosts — wasmtime (CLua55)
-// and wazero (CLua55Wazero). The blob is the same new-EH SJLJ dialect as
-// lua51_sjlj.wasm (ledger row 32's one-blob-two-hosts posture), so the U0
-// gate runs the official 5.5.1 suite on each host independently.
+// and wazero (CLua55Wazero). The blob runs on both hosts (ledger row 32's
+// one-blob-two-hosts posture, first proven on the retired 5.1 oracle), so
+// the U0 gate runs the official 5.5.1 suite on each host independently.
 //
-// The value protocol and event decoding are shared with the 5.1 CLua engine
-// (runtime/luawasm55.c emits the identical PT_* wire format), so onEvent /
-// cparser / sortedRepr are reused as-is.
+// The value protocol and event decoding live in cwire.go (the PT_* wire
+// runtime/luawasm55.c emits), shared with the wasm/wazero engines.
 //
 // Differences from the 5.1 CLua engine, all following from the 5.5 blob:
 //   - no host.random* imports — stock xoshiro256** runs in-process
@@ -153,7 +152,7 @@ func (e *CLua55) Run(c Case) []string {
 	if err := linker.DefineFunc(store, "host", "event",
 		func(kind, ptr, length int32) {
 			if raw := memRead(ptr, length); raw != nil && length > 0 {
-				(&CLua{}).onEvent(raw, kind, emit)
+				onEvent(raw, kind, emit)
 			}
 		}); err != nil {
 		return []string{"ENGINE-ERROR\thost event: " + err.Error()}
@@ -301,7 +300,7 @@ func ldostring55(call func(string, ...interface{}) (uint64, error),
 // engine) — the U0 gate's second host: wazero v1.12 implements the
 // standardized exception-handling proposal the SJLJ blob is built in
 // (experimental.CoreFeaturesExceptionHandling, as the wasm-backend engine
-// does for lua51_sjlj.wasm).
+// does for the rt blob).
 type CLua55Wazero struct {
 	name string
 	// SuiteFlags: run the _port/_soft/_nomsg prelude (conformance gate only)
@@ -345,7 +344,7 @@ func (e *CLua55Wazero) Run(c Case) (log []string) {
 		NewFunctionBuilder().WithFunc(func(kind, ptr, length int32) {
 		if m := r.Module("rt"); m != nil {
 			if raw, ok := m.Memory().Read(uint32(ptr), uint32(length)); ok && length > 0 {
-				(&CLua{}).onEvent(raw, kind, emit)
+				onEvent(raw, kind, emit)
 			}
 		}
 	}).Export("event").
