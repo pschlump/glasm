@@ -9,11 +9,22 @@ gopher-lua repo delivers today, specifies what must be built on both sides,
 sequences the work into independently-green sub-milestones, and defines the
 gates.
 
+> **Status (2026-10-19, U8): amended for the 5.5 era.** The 5.2→5.5 upgrade
+> (U0–U7, `docs/Upgrade-from-5.2-to-5.5-of-Lua.md`) moved the language core
+> to stock 5.5.1 and the runtime to the zero-patch `runtime/lua55/` tree
+> (ABI v4), and U8 deleted the 5.1 tree, blobs, and build flavors outright
+> (commit `01037c0`). The §1 inventory rows below name the current
+> artifacts; chapters deeper in (§4/§5, written against the M8-era host
+> package) still carry pre-v4 shapes — the daemon-repo breaking release
+> (D12) rewrites those. The repo/module was also renamed gopher-lua →
+> **glasm** (`github.com/pschlump/glasm`): update paths and import paths
+> accordingly.
+
 **Repos and paths** (both on the same machine, side by side):
 
 | Repo            | Path                                                  | Role                                                                              |
 |-----------------|-------------------------------------------------------|-----------------------------------------------------------------------------------|
-| gopher-lua fork | `~/go/src/github.com/pschlump/gopher-lua` (this repo) | Lua 5.1 frontend + Lua→wasm backend + the C `rt_*` runtime blob (build-time only) |
+| glasm (the gopher-lua fork) | `~/go/src/github.com/pschlump/glasm` (this repo) | Lua 5.5.1 frontend + Lua→wasm backend + the C `rt_*` runtime blob (build-time only) |
 | Ultima          | `../ultima`                                           | The pure-Go Redis clone (the daemon). Everything C-free by rule.                  |
 | pluto           | `../pluto`                                            | Ultima's data-structure library (not touched by this milestone)                   |
 
@@ -76,33 +87,41 @@ a correction** — that is the repo culture (probe, don't trust).
 
 | Piece | Where | Notes |
 |---|---|---|
-| Lua 5.1 frontend | `parse/`, `ast/`, `compile.go` | Untouched stock gopher-lua; produces `*lua.FunctionProto` (41 opcodes). |
+| Lua frontend | `parse/`, `ast/`, `compile.go` | 5.5.1 core (U1/U2c): `compile.go` emits the stock 5.5.1 encoding — 85 opcodes. |
 | Backend (proto → wasm) | `luawasm/backend.go` `Compile(main *lua.FunctionProto, chunkName string) ([]byte, error)` | Pure Go. Imports only the root `lua` package and `wasm/` — **no wasmtime anywhere in this chain.** |
 | Wasm emitter | `wasm/` | Sections, LEB128, encoders; also `wasm.Imports/Exports/HasWASIImports` helpers for blob self-checks. |
 | One-call compile | `testdiff.CompileSource(source []byte, name string) ([]byte, error)` (`testdiff/wasmengine.go:161`) | `parse.Parse` → `lua.Compile` → `luawasm.Compile`. **Do not import `testdiff` from Ultima** — the package also hosts the wasmtime oracle engines (cgo). Re-implement the 12-line wrapper (§4.1) instead. |
-| Production runtime blob | `testdiff/lua51_prod.wasm` (190 KB) | `-DLUAWASM_PROD` flavor: base/table/string/math only, **imports exactly five `host.*` functions, zero WASI imports**, SHA-256 `6dd4a8451655c810913a82b14ba439f9b4de4cb9c61d848224d0b0d09ebe513f` (pinned by `testdiff/m6c_test.go:26`). |
-| Dev runtime blob | `testdiff/lua51_sjlj.wasm` (230 KB) | WASI-enabled flavor for the differential corpora. **Never ship in the daemon** (it can open files). |
+| Production runtime blob | `testdiff/lua55_prod.wasm` (275 KB) | Zero-WASI prod flavor of the zero-patch 5.5.1 tree (U6d, ledger row 95): **imports exactly three `host.*` functions (`event`, `wasm_dispatch`, `host_call`), zero WASI imports**, SHA-256 `2ba73262ae8634d642880ca167f0db307ba830cf6dac19f5cde13817ce17a8e6` (pinned by `host/blob.go`'s `prodBlobSHA256`, imports + WASI self-checked at `NewEngine`, byte-compared against testdiff's copy by `testdiff/m6c_test.go`). |
+| Dev/oracle runtime blobs | `testdiff/lua55_rt.wasm` (313 KB, ABI v4) + `testdiff/lua55_sjlj.wasm` (288 KB, oracle) | WASI-enabled flavors for the differential engines (both rebuilt by `runtime/build55.sh`). **Never ship in the daemon** (they can open files). |
 | Reference host implementation | `testdiff/wazeroengine.go:118` (`WazeroEngine.Run`) | The complete, gate-green wazero embedding — instantiation order, host module, caps, watchdog, error readback. The host package (§4) is this code, productized. |
 | Compiler/runner CLIs | `cmd/luawasmc`, `cmd/luawasm-run` | For manual experiments: `go run ./cmd/luawasmc -o t.wasm t.lua && GLUA_WASM_ENGINE=wazero go run ./cmd/luawasm-run t.wasm` |
 | Engine version | wazero **v1.12.0** | Must instantiate with `api.CoreFeaturesV2 | experimental.CoreFeaturesExceptionHandling` — the blob is built in the standardized-EH/setjmp dialect (ledger row 32). |
 
-**The five `host.*` imports the prod blob expects** (you implement these in Go):
+**The `host.*` imports the prod blob expects** (you implement these in Go;
+`host/blob.go`'s `hostImports` is the frozen contract, mirrored by
+`testdiff/m6c_test.go`):
 
 | Import | Signature | Purpose |
 |---|---|---|
 | `host.event` | `(kind, ptr, len i32)` | `print`/library event stream out of the guest. Ultima maps `kind=PRINT` to nothing (or slog at debug), `ERROR` to the error path. |
-| `host.random01` | `() -> f64` | `math.random()` — host-supplied RNG (determinism D5). |
-| `host.randomint` | `(lo, hi i32) -> i32` | `math.random(lo,hi)`. |
-| `host.randomseed` | `(seed i64)` | `math.randomseed(n)` — swap the host RNG source. |
-| `host.wasm_dispatch` | `(idx, frame, cl, nargs, want i32) -> i32` | The M5a re-entrancy seam: the runtime's precall adapter dispatches a compiled proto through the host into the script module's `lua_dispatch`. **This same nested-`Call()`-on-one-goroutine mechanism is what makes `redis.call` possible.** |
+| `host.wasm_dispatch` | `(idx, frame, cl, nargs, want i32) -> i32` | The re-entrancy seam: the runtime's precall adapter dispatches a compiled proto through the host into the script module's `lua_dispatch`. **This same nested-`Call()`-on-one-goroutine mechanism is what makes `redis.call` possible.** |
+| `host.host_call` | `(fnidx, argsPtr, argsLen, retPtr, retCap i32) -> i32` | The hostfn seam (U6e, ledger row 96): `RegisterGlobal` installs Go host functions; arguments/results stage over the wire buffers, and error values re-raise position-less and verbatim (Redis command texts). |
 
-**Runtime exports the host calls** (full list: `runtime/build.sh:26-49`; the
-ones the host package uses):
+The RNG imports are gone — stock 5.5 xoshiro256\*\* runs in-process with
+determinism pinned at build time. The host module must additionally export
+`host.deadline_poll () -> i32` for the **script** modules it instantiates
+(U7a, ledger row 100 — an import contract for every instantiating host: the
+guest polls it every 2²⁰-th block transition so a Go GC mark-STW cannot
+wedge the deadline).
+
+**Runtime exports the host calls** (full list: `runtime/rt_abi55.h` + the
+driver `runtime/luawasm55.c`; the ones the host package uses, amended to
+ABI v4 at U8):
 
 ```
 lnewstate () -> L          ldostring (L, inAddr, len, nameAddr, nres)
-rt_set_state (L)           rt_abi_version () -> 3
-rt_sandbox (1)             rt_set_dialect (1)
+rt_set_state (L)           rt_abi_version () -> 4
+rt_sandbox (1)             # rt_set_dialect retired at U3
 rt_protect_globals (1)     rt_globals_readonly (on)   # M8d: Redis-classic globals lockdown + KEYS/ARGV staging window
 rt_set_memlimit (bytes)    rt_mem_used_bytes () -> i64
 rt_ctrl_addr () -> addr    rt_set_deadline / rt_deadline_flag / rt_deadline
@@ -110,6 +129,7 @@ rt_frame_alloc (nbytes) -> addr
 rt_intern (ptr, len) -> ref     rt_mknumber / rt_mkbool / rt_mknil
 rt_newtable / rt_gettable / rt_settable / rt_getglobal / rt_setglobal
 rt_err_stage_copy (buf, cap) -> n     rt_err_value_ptr () -> addr
+rt_hostfn (tbl, name, fnidx)    rt_encode_value (cell, dst, cap)   # U6e row 96
 lglobals ()                lclose (L)
 ```
 
@@ -160,11 +180,11 @@ lglobals ()                lclose (L)
                  │  gopher-lua host package (github.com/pschlump/gopher-lua/host)           │
                  │   Engine (wazero Runtime, blob, compile cache)                            │
                  │   VM     (script instance + rt instance + linear memory + sync.Mutex)    │
-                 │        │  host module: event/random01/randomint/randomseed/wasm_dispatch │
+                 │        │  host module: event/wasm_dispatch/host_call (+deadline_poll) │
                  │        │               + redis.call trampoline (Go)                      │
                  └────────┼─────────────────────────────────────────────────────────────────┘
                           ▼
-              wazero v1.12 (pure Go) ──► lua51_prod.wasm (rt_* ABI, sandboxed)
+              wazero v1.12 (pure Go) ──► lua55_prod.wasm (rt_* ABI v4, sandboxed)
                                       ──► script.wasm    (compiled from EVAL source)
                           ▲                                 │
                           └───── lua_dispatch (host.wasm_dispatch, same goroutine)
@@ -199,7 +219,7 @@ repos.
 
 | # | Decision | Rationale |
 |---|---|---|
-| S1 | **The daemon consumes exactly two artifacts from gopher-lua: the Go `host` package and the embedded, SHA-256-pinned `lua51_prod.wasm` blob.** No cgo, no C toolchain, no C sources in `../ultima` — ever. | Ultima design §1/§16 D12; gopher-lua design A8. Enforcement: `CGO_ENABLED=0 go build ./...` in Ultima CI (§4.6). |
+| S1 | **The daemon consumes exactly two artifacts from glasm: the Go `host` package and the embedded, SHA-256-pinned `lua55_prod.wasm` blob.** No cgo, no C toolchain, no C sources in `../ultima` — ever. | Ultima design §1/§16 D12; glasm design A8. Enforcement: `CGO_ENABLED=0 go build ./...` in Ultima CI (§4.6). |
 | S2 | **Effects-only replication.** `EVAL` is never written to the AOF; every write command executed via `redis.call` is captured individually through `capturePersist`, exactly as EXEC captures its inner commands. | Single node, no replica protocol; matches Redis 7 default (effects). Reuses a proven path (`lib/commands/aof.go:85`). |
 | S3 | **EVAL runs under `PauseAll`, mirroring `cmdExec`.** `cs.tok` is set for the duration; `redis.call` inner commands dispatch via the normal handlers. | The strict cross-shard atomic path already exists and is stress-tested (M3 WATCH gates). |
 | S4 | **Fresh VM per execution (v1 lifecycle), pooled wazero `Runtime` and compiled-module cache at the Engine level.** | gopher-lua M0 measured instantiation ≈ 7.4 µs — negligible vs a script run. Zero shared mutable guest state. A VM pool is a measured follow-up only if benchmarks justify it. |
@@ -229,7 +249,7 @@ host/
 ├── convert.go     Lua⇄Go value conversion (Tier-3: numbers, strings, bools,
 │                  nil, one-level tables; deep tables read back structurally)
 ├── hostfn.go      the Lua→Go function seam (§4.2)
-├── blob.go        //go:embed lua51_prod.wasm + SHA-256 pin + import self-check
+├── blob.go        //go:embed lua55_prod.wasm + SHA-256 pin + import self-check
 └── host_test.go   -race concurrency, caps, deadline, determinism gates
 examples/          eval, evalserver (pool + -race), sharedvm, bench (§6.3 of the design)
 ```
@@ -311,9 +331,10 @@ bin, err := luawasm.Compile(proto, name)        // luawasm, clean
 
 ### 4.2 Runtime additions (C, this repo, rebuilt into the blob) — **as built (M8a)**
 
-Additive to the frozen ABI v3 surface — new exports/imports plus one
+Additive to the ABI surface as it stood at M8a (v3; the tree is v4 since
+U2d) — new exports/imports plus one
 script-module entry contract, no changes to existing C contracts. Rebuild
-via `runtime/build.sh` (it copies the prod blob into `host/` too), bump
+via `runtime/build55.sh` (it copies the prod blob into `host/` too), bump
 the SHA pins (`host/blob.go`, `testdiff/m6c_test.go`), `go clean
 -testcache`, re-run the full gates (`make test`, the M6c matrix).
 
@@ -995,8 +1016,8 @@ piece; texts below are reminders, **not** authoritative:
 | File | Work |
 |---|---|
 | `host/host.go`, `host/vm.go`, `host/protocol.go`, `host/convert.go`, `host/hostfn.go`, `host/blob.go` | §4.1 package |
-| `runtime/rt_abi.c`, `runtime/build.sh` | `rt_hostfn` + `host.host_call` import; `rt_encode_value`; export list; rebuild both flavors (built in `runtime/luawasm.c`) |
-| `testdiff/lua51_prod.wasm`, `host/lua51_prod.wasm` | rebuilt blob copies + SHA pin bumps (`testdiff/m6c_test.go:26`, new pin in `host/blob.go`) |
+| `runtime/rt_abi55.c`, `runtime/build55.sh` | `rt_hostfn` + `host.host_call` import; `rt_encode_value`; export list; rebuild the rt + prod flavors (over the `runtime/luawasm55.c` drivers; U2d/U6d) |
+| `testdiff/lua55_prod.wasm`, `host/lua55_prod.wasm` | rebuilt blob copies + SHA pin bumps (byte-cmp in `testdiff/m6c_test.go`, pin in `host/blob.go`) |
 | `host/host_test.go`, `examples/{eval,evalserver,sharedvm,bench}` | §4.7 gates |
 
 **Ultima repo (M8b–M8e):**
@@ -1018,7 +1039,7 @@ piece; texts below are reminders, **not** authoritative:
 *Verification anchors used by this guide* (re-check before relying on a
 claim): `testdiff/wazeroengine.go:118-377` (run protocol),
 `testdiff/m6c_test.go:26-77` (blob contract), `testdiff/wasmengine.go:61,133,161`
-(luaQuote, TValue render, CompileSource), `runtime/build.sh:26-49`
+(luaQuote, TValue render, CompileSource), `runtime/rt_abi55.h`
 (exports), `docs/Lua-Wasm-Design-and-Test-Plan.md` §4–§6 + A8/A9,
 `docs/Lua-Wasm-Divergence-Ledger.md` rows 22–25, 32–34, 38, 40, 48;
 `../ultima/lib/commands/engine.go:130-479`, `tx.go:65-124`,

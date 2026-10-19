@@ -1,9 +1,9 @@
 # Lua→Wasm Compiler — Detailed Design & Test Plan
 
-**Date:** 2026-09-03
-**Status:** Design
+**Date:** 2026-09-03 · amended through 2026-10-19
+**Status:** Design — the M-era original text, amended in place by dated status notes. The **U0–U8 5.2→5.5 upgrade program** (`docs/Upgrade-from-5.2-to-5.5-of-Lua.md`) superseded the 5.1-era specifics: the language core is stock **Lua 5.5.1** (85-opcode encoding, `_ENV`), the runtime is the zero-patch 5.5 tree, and the 5.1 oracle/engine/corpus were retired at U8 (§5's U8 note).
 **Companion to:** `docs/Performance-Improvement-Plan.md` §7 (Option E)
-**Goal:** A production Lua 5.1 → WebAssembly compiler reusing this repo's frontend (`parse/`, `ast/`, `compile.go`), targeting wazero on linux/amd64 + linux/arm64, with a test regime strong enough to trust it inside a Redis-class network daemon running untrusted client scripts.
+**Goal:** A production Lua → WebAssembly compiler reusing this repo's frontend (`parse/`, `ast/`, `compile.go`), targeting wazero on linux/amd64 + linux/arm64, with a test regime strong enough to trust it inside a Redis-class network daemon running untrusted client scripts.
 
 **Integration target (updated 2026-09-14):** the daemon is a **pure-Go clone of Redis** — no C code is involved in the daemon: no cgo, no C toolchain, no C sources in the clone's repo. The clone consumes exactly two things from this project: a **Go host package** (the public API, §6) and **prebuilt, checksummed wasm blobs** embedded as data (`//go:embed`). The production engine is wazero precisely because it is pure Go; the wasmtime engines in `testdiff/` exist only as dev/CI differential-oracle hosts and their cgo dependency never ships. The C sources under `runtime/` are *this repo's* build-time concern only (§5): compiled once here into the runtime blob, never shipped as C.
 
@@ -60,7 +60,7 @@ Three code-producing pieces and one host piece:
 | AST | `ast/` | untouched |
 | AST→bytecode | `compile.go:1849` (`Compile → *FunctionProto`) | untouched; carries scoping, upvalue capture, vararg lowering, constant handling |
 | IR | `FunctionProto` (`function.go:25`) | 41 opcodes; `NumUsedRegisters`, `NumParameters`, `IsVarArg`, `NumUpvalues`, `Code`, `Constants`, `FunctionPrototypes[]`, `DbgSourcePositions[]` |
-| Oracles + corpora | `_lua5.1-tests`, `_glua-tests` | the interpreter in this repo is the primary differential oracle; C Lua 5.1 native is the semantic authority |
+| Oracles + corpora | `_glua-tests`, `_u1`, official `_lua5.5-tests` | the interpreter in this repo is the primary differential oracle; stock C Lua 5.5.1 in wasm (`clua55`) is the semantic authority — U8 retired the 5.1 oracle and the `_lua5.1-tests` corpus |
 
 Not reused on this path: `vm.go`/`_vm.go`, `state.go`, `table.go`, `alloc.go` (the interpreter keeps them; the wasm path replaces them).
 
@@ -197,7 +197,18 @@ sig: (param $L i32)         ;; thread/state pointer (current frame base etc.)
 
 ---
 
-## 5. Runtime module (C Lua 5.1 port)
+## 5. Runtime module (C Lua port)
+
+> **Status (2026-10-19, U8): the runtime is now the zero-patch stock Lua 5.5.1
+> tree** (`runtime/lua55/`, built by `runtime/build55.sh`): `lua55_sjlj.wasm`
+> (the oracle blob), `lua55_rt.wasm` (the ABI v4 dev blob the backend targets),
+> and `lua55_prod.wasm` (the zero-wasi production flavor — three `host.*`
+> imports, plus the hostfn seam). The 5.1.4-based port this section describes —
+> its v3 ABI, build flavors, and allocator design — was retired wholesale at U8
+> together with `runtime/lua51/`, `build.sh`, the `clua` engine, and the
+> `_lua5.1-tests` corpus; the bullets below record the M-era design. Current
+> truth: `docs/Upgrade-from-5.2-to-5.5-of-Lua.md` + the divergence ledger's U8
+> audit appendix.
 
 - **Source**: Lua 5.1.4 `ltable.c lstring.c lgc.c lmem.c lobject.c ltm.c lvm.c(arith/compare helpers only) lapi.c(subset) lfunc.c ldo.c(structure only) lauxlib(subset)` — everything except the bytecode interpreter loop; MIT license.
 - **Toolchain**: `clang --target=wasm32-unknown-unknown -nostdlib` (or wasi-sdk with a stub libc: `memcpy/memset/memmove/strlen` only). Built once per release, checksummed, embedded in the Go binary via `//go:embed`.
@@ -317,7 +328,7 @@ Test pyramid:
 
 ```
 L7  production soak (fuzz 24/7, Go Redis clone integration, perf gates incl. C-Lua comparison)
-L6  conformance suites   (_lua5.1-tests, _glua-tests, curated real-world Redis scripts)
+L6  conformance suites   (_lua5.5-tests official suite, _glua-tests, _u1; curated real-world Redis scripts)
 L5  differential fuzzing (random Lua programs, oracle comparison)
 L4  end-to-end scripts   (multi-feature programs, coroutines of features per file)
 L3  per-opcode semantic tests (41 opcodes × edge-case matrix)
@@ -381,7 +392,7 @@ Each snippet runs in **all three engines** (interpreter, C-Lua-wasm, backend-was
 
 ### 8.5 L6 — conformance
 
-- `_glua-tests` and `_lua5.1-tests` run through the differential harness (they already run against the interpreter; add the backend and C-Lua-wasm as columns). Explicit, maintained skip list (os/io-dependent, interpreter-known-bugs) — **every skip has a reason string**; CI fails on skips without one.
+- `_glua-tests`, `_u1`, and the official `_lua5.5-tests` run through the differential harness (columns: interp, the `clua55` oracle, and the wasm/wazero/wazero-prod backend legs — the U6f exit-gate engine set). Explicit, maintained skip list (os/io-dependent, interpreter-known-bugs) — **every skip has a reason string**; CI fails on skips without one.
 - **Curated real-world corpus**: collect public Redis Lua scripts (rate limiters, locks, token buckets, cjson/cmsgpack users from Redis docs and common libraries) — run through the full oracle matrix. This is the corpus that actually predicts production behavior for the Go Redis clone.
 
 ### 8.6 L7 — production hardening tests
@@ -487,6 +498,21 @@ The differential harness logs an opcode histogram per script (interpreter side).
 > `docs/How-To-Integrate-Gopher-Lua-with-Redis-Clone-Called-Ultima.md`)
 > is the remaining M7 work.
 | **M8** | Performance: v2 structured control flow (differential-tested against v1 per-function), inline caches at hot sites, instantiate-vs-reset measurement, benchmark harness vs C Lua (`examples/bench`) | Perf gate: ≥2× fork on numeric corpus; v1↔v2 differential zero diffs; no >5% regressions on any column incl. the C-Lua ratio; head-to-head **vs C Lua 5.1 native** measured, reported, and trended (§8.10) | 3–4 wk |
+
+> **Status (2026-10-19): U8 (closure) — the 5.1 era retired.** The 5.2→5.5
+> upgrade program (U0–U7 complete; `docs/Upgrade-from-5.2-to-5.5-of-Lua.md`)
+> moved the language core to stock 5.5.1 and the runtime to the zero-patch
+> `runtime/lua55/` tree (ABI v4: `lua55_rt.wasm` dev blob, `lua55_sjlj.wasm`
+> oracle, `lua55_prod.wasm` zero-wasi prod blob). U8's ledger migration audit
+> dispositioned all 102 divergence-ledger rows (keep/rebase/close, each with
+> covering tests — the appendix at the ledger's end), and the 5.1 surface was
+> then deleted wholesale: the `clua` engine and `lua51_*.wasm` blobs,
+> `runtime/lua51/` + the v3 ABI/glue + `build.sh`, the `_lua5.1-tests` corpus
+> with its gates, and `cmd/clua-run` (−29,974 lines). The C-Lua differential
+> oracle is `clua55` (stock 5.5.1); ABI/seam unit coverage is
+> `runtime/tests/rt_native55_test.c` (native, plain/ASan/UBSan) plus the
+> differential matrix. Remaining U8: the daemon host-package release (D12)
+> and the D8 5.5.x pin check.
 
 **Total: ~3.5–5.5 months** solo (consistent with the plan doc's estimate). M1 before M4 is deliberate: the differential harness existing *before* the backend is what makes every later milestone measurable. M2 before M3 is deliberate too: a whole-C-Lua-in-wasm oracle de-risks the runtime port with zero new compiler code.
 
