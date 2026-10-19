@@ -45,6 +45,12 @@ go run ./cmd/testdiff -corpus _glua-tests -engines interp,clua
 go run ./cmd/testdiff -corpus _wasm-tests -engines interp,wazero       # production-engine legs
 go run ./cmd/testdiff -corpus _wasm-tests -engines interp,wazero-prod  # prod-blob legs
 
+# Benchmarks (U7c) and the differential fuzz soak (U7b/U7d)
+go run ./cmd/luabench [-only substr] [-benchstat] [-cpuprofile dir]  # interp TOTAL / wasm cold+warm / wazero-prod × 7 scripts
+nohup bin/soak-7nights.sh > note/fuzz-counting.log 2>&1 &  # multi-night counting soak; window pinned in note/fuzz-window-end, note/fuzz-stop ends it
+bin/check-fuzz-status.sh        # = make fuzz-status; nightly totals in note/fuzz/soak.json
+go run ./cmd/luafuzz -replay -seed S -from N   # replay soak case N for triage
+
 # 5.5 oracle (U0 of the 5.2→5.5 upgrade, docs/Upgrade-from-5.2-to-5.5-of-Lua.md)
 go test ./testdiff/ -run TestCLua55Conformance -v   # official 5.5.1 suite on wasmtime + wazero
 go test ./testdiff/ -run TestU1Gate -v            # U1: 5.2 core, interp vs the 5.5 oracle
