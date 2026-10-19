@@ -1,0 +1,10 @@
+# luabench — go1.27.0 | host/ prod blob + wazero-prod engine | GOMAXPROCS=14 | 2026-10-19 15:25
+
+=== h_callret.lua  (466 bytes)  outputs: OK
+posture                        n        min     median       mean
+interp TOTAL (fork)           58    19.82ms    20.40ms    20.41ms
+wasm cold: fresh VM/run        3   458.27ms   458.65ms   458.55ms
+wasm warm: pooled VM rerun     4   378.49ms   382.13ms   381.13ms
+wazero-prod engine cold        3   452.59ms   454.50ms   454.03ms
+
+EXIT=0

@@ -189,22 +189,45 @@ func (e *WazeroEngine) Run(c Case) (log []string) {
 	// family): a stack-exhaustion trap maps to RTW_STACKTRAP instead —
 	// the blob stages its clean catchable "stack overflow".
 	var scriptInst api.Module
+	// U9b: depth-indexed pool of lua_dispatch handles + arg slices. Each
+	// ExportedFunction lookup builds a fresh wazevo callEngine (private
+	// execCtx + machine stack) — the old per-call lookup was the seam's
+	// dominant allocation — but a callEngine is single-flight, so nested
+	// dispatches on this goroutine must take DIFFERENT handles (one
+	// shared handle SIGBUSed mid-JIT). Level 0 serves the common
+	// non-nested case; sequential reuse of a handle is the documented
+	// CallWithStack pattern.
+	var dispatchFns []api.Function
+	var dispatchStacks [][]uint64
+	dispatchDepth := 0
 	dispatch := func(idx, frame, cl, nargs, want int32) int32 {
 		if scriptInst == nil {
 			return -3
 		}
-		fn := scriptInst.ExportedFunction("lua_dispatch")
-		if fn == nil {
-			return -3
+		d := dispatchDepth
+		if d == len(dispatchFns) {
+			fn := scriptInst.ExportedFunction("lua_dispatch")
+			if fn == nil {
+				return -3
+			}
+			dispatchFns = append(dispatchFns, fn)
+			dispatchStacks = append(dispatchStacks, make([]uint64, 5))
 		}
-		res, err := fn.Call(ctx, u32(idx), u32(frame), u32(cl), u32(nargs), u32(want))
-		if err != nil {
+		fn, st := dispatchFns[d], dispatchStacks[d]
+		dispatchDepth = d + 1
+		defer func() { dispatchDepth = d }()
+		st[0] = u32(idx)
+		st[1] = u32(frame)
+		st[2] = u32(cl)
+		st[3] = u32(nargs)
+		st[4] = u32(want)
+		if err := fn.CallWithStack(ctx, st); err != nil {
 			if strings.Contains(err.Error(), "call stack exhausted") {
 				return rtwStackTrap
 			}
 			return -3
 		}
-		return int32(res[0])
+		return int32(st[0])
 	}
 
 	// U3b: no host.random* imports — stock xoshiro math.random runs in

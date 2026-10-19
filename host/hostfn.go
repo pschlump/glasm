@@ -53,18 +53,34 @@ func (vm *VM) hostDispatch(idx, frame, cl, nargs, want int32) int32 {
 	if vm.scriptInst == nil {
 		return -3
 	}
-	fn := vm.scriptInst.ExportedFunction("lua_dispatch")
-	if fn == nil {
-		return -3
+	// U9b: take this nesting level's pooled handle + arg slice (the
+	// struct comment has the full story — a fresh callEngine per lookup
+	// was the seam's dominant cost, but one shared handle SIGBUSes under
+	// reentry, so the pool is depth-indexed).
+	d := vm.dispatchDepth
+	if d == len(vm.dispatchFns) {
+		fn := vm.scriptInst.ExportedFunction("lua_dispatch")
+		if fn == nil {
+			return -3
+		}
+		vm.dispatchFns = append(vm.dispatchFns, fn)
+		vm.dispatchStacks = append(vm.dispatchStacks, make([]uint64, 5))
 	}
-	res, err := fn.Call(vm.runCtx(), u32v(idx), u32v(frame), u32v(cl), u32v(nargs), u32v(want))
-	if err != nil {
+	fn, st := vm.dispatchFns[d], vm.dispatchStacks[d]
+	vm.dispatchDepth = d + 1
+	defer func() { vm.dispatchDepth = d }()
+	st[0] = u32v(idx)
+	st[1] = u32v(frame)
+	st[2] = u32v(cl)
+	st[3] = u32v(nargs)
+	st[4] = u32v(want)
+	if err := fn.CallWithStack(vm.runCtx(), st); err != nil {
 		if strings.Contains(err.Error(), "call stack exhausted") {
 			return -4
 		}
 		return -3
 	}
-	return int32(res[0])
+	return int32(st[0])
 }
 
 // runCtx is the in-flight Run's context (nested wasm calls ride it so a

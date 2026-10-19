@@ -356,11 +356,9 @@ func (e *WasmEngine) Run(c Case) (log []string) {
 	// for stub hosts) this refuses with -3, which the adapter re-raises
 	// as a Lua error.
 	var scriptInst *wt.Instance
+	var dispatchFn *wt.Func // U9b: cached at instantiate, not per call
 	dispatch := func(idx, frame, cl, nargs, want int32) int32 {
-		if scriptInst == nil {
-			return -3
-		}
-		fn := scriptInst.GetFunc(store, "lua_dispatch")
+		fn := dispatchFn
 		if fn == nil {
 			return -3
 		}
@@ -477,6 +475,9 @@ func (e *WasmEngine) Run(c Case) (log []string) {
 		return []string{"ENGINE-ERROR\tscript instantiate: " + err.Error()}
 	}
 	scriptInst = si
+	// U9b: resolve the dispatch handle once per run (was one GetFunc
+	// lookup per compiled call).
+	dispatchFn = scriptInst.GetFunc(store, "lua_dispatch")
 
 	L, err := call(rtInst, "lnewstate")
 	if err != nil {

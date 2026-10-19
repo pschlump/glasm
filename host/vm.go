@@ -107,6 +107,25 @@ type VM struct {
 
 	script     *Script         // bound at first Run (one-script law)
 	scriptInst api.Module      // nil until then
+	// U9b: the dispatch seam's per-call costs, hoisted into a
+	// DEPTH-INDEXED pool. In wazero v1.12 every ExportedFunction lookup
+	// builds a fresh callEngine — private execCtx AND a fresh machine
+	// stack (module_engine.go NewFunction → ce.init()) — and the old
+	// per-call lookup was the dispatch seam's dominant allocation. But
+	// one cached handle is NOT shareable across nesting levels: a
+	// callEngine is single-flight mutable state, and a dispatch
+	// reentering on this goroutine (guest → host.wasm_dispatch →
+	// lua_dispatch → C precall → host.wasm_dispatch → …) would clobber
+	// the suspended outer engine's execCtx mid-JIT — SIGBUS (found the
+	// hard way). So: pool handles + arg slices per nesting depth, reuse
+	// level 0 for the (overwhelmingly common) non-nested calls; grow on
+	// demand. Sequential reuse of one handle is the documented
+	// CallWithStack pattern; the arg slices stay per-level because
+	// wazevo keeps a raw pointer into the caller's slice live across the
+	// whole entrypoint execution.
+	dispatchFns     []api.Function
+	dispatchStacks  [][]uint64
+	dispatchDepth   int
 	frame      uint32          // the script's frame cells (gFrameCells)
 	inAddr     uint32          // cached linbuf staging address (1 MiB)
 	curCtx     context.Context // in-flight Run's ctx (nested dispatches)
