@@ -19,7 +19,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/pschlump/golua55/wasm"
+	"github.com/pschlump/glasm/wasm"
 )
 
 // lua55ProdSHA256 pins the embedded 5.5 prod blob (U6d, row 95;

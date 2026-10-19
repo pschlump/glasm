@@ -1,6 +1,6 @@
 package testdiff
 
-// The wasm-backend engine (M4): compiles Lua through the golua55
+// The wasm-backend engine (M4): compiles Lua through the glasm
 // frontend + luawasm backend and runs the emitted module against the C
 // runtime on wasmtime — the third differential engine. The harness shim
 // comes from the runtime module's install_shims (print→host event,
@@ -26,10 +26,10 @@ import (
 
 	wt "github.com/bytecodealliance/wasmtime-go/v48"
 
-	lua "github.com/pschlump/golua55"
-	"github.com/pschlump/golua55/luawasm"
-	"github.com/pschlump/golua55/parse"
-	"github.com/pschlump/golua55/wasm"
+	lua "github.com/pschlump/glasm"
+	"github.com/pschlump/glasm/luawasm"
+	"github.com/pschlump/glasm/parse"
+	"github.com/pschlump/glasm/wasm"
 )
 
 //go:embed lua55_rt.wasm

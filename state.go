@@ -16,7 +16,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/pschlump/golua55/parse"
+	"github.com/pschlump/glasm/parse"
 )
 
 const MultRet = -1

@@ -1,21 +1,42 @@
-# Glasm: VM and compiler for Lua in Go.
+# Glasm
 
-This is originally based on 
-[![Gopher-Lua](https://github.com/yuin/gopher-lua)](https://github.com/yuin/gopher-lua)
-a highly capable Lua interpreter in Go.   At last check this implemented Lua 5.1.
-This is a Lua to WASM compiler implementing Lua 5.5.1.   The WASM compiler pre-compiles
-to machine language for supported architectures, Arm64 and A86.   In some use cases this
-gives a huge performance advantage.   In other use cases this is a big disadvantage.
-This performance comparison is detailed in the performance comparison section below.
+**Glasm** is a Lua 5.5.1 VM and compiler in Go, with a Lua → WebAssembly
+compiler for running untrusted scripts inside pure-Go daemons.
 
+## Credit where credit is due
 
-[![PkgGoDev](https://pkg.go.dev/badge/github.com/yuin/gopher-lua.svg)](https://pkg.go.dev/github.com/yuin/gopher-lua) [![test](https://github.com/yuin/gopher-lua/workflows/test/badge.svg?branch=master&event=push)](https://github.com/yuin/gopher-lua/actions?query=workflow:test) [![Coverage Status](https://coveralls.io/repos/github/yuin/gopher-lua/badge.svg?branch=master)](https://coveralls.io/github/yuin/gopher-lua)
+Glasm is a fork of **[gopher-lua](https://github.com/yuin/gopher-lua)** by
+Yusuke Inuzuka — a highly capable Lua VM and compiler in Go (implementing
+Lua 5.1). The parser, the register-VM interpreter, the code generator, and
+the Go embedding API documented below all originate in gopher-lua.
+**Without gopher-lua, Glasm would not exist.** Thank you, yuin.
 
+Glasm builds on that foundation with:
 
-Glasm is a Lua5.5.1 VM and compiler written in Go. Glasm has a same goal
-with Lua: **Be a scripting language with extensible semantics** . It provides
-Go APIs that allow you to easily embed a scripting language to your Go host
-programs.
+- the language core upgraded through 5.2 to **Lua 5.5.1** semantics — the
+  stock 5.5.1 instruction encoding (85 opcodes), `_ENV`, integer/float
+  duality, goto/labels, `<const>`/`<close>` attributes, the 5.3+ standard
+  library — with differential testing against stock C Lua 5.5.1 as the oracle;
+- a **Lua → WebAssembly compiler** (`luawasm/`) targeting a freestanding
+  wasm32 runtime derived from stock C Lua 5.5.1 (`runtime/`); the host engine
+  JIT-compiles the wasm to native code on supported architectures (arm64,
+  amd64) — a large win on some workloads, a cost on others; `cmd/luabench`
+  measures both sides;
+- the daemon-facing **`host/` package** — a pure-Go (no cgo) embedding
+  surface over the wazero wasm engine: untrusted scripts with memory
+  budgets, deadlines, sandboxed globals, and Go host functions.
+
+Glasm has the same goal as Lua: **Be a scripting language with extensible
+semantics.** It provides Go APIs that allow you to easily embed a scripting
+language in your Go host programs.
+
+> **Note:** the embedding-API sections below are inherited from gopher-lua's
+> README and describe the interpreter's Go API. The 5.5 language surface, the
+> wasm toolchain (`cmd/luawasmc`, `cmd/luawasm-run`, `cmd/glua`), and the
+> production `host/` package are documented in [docs/](docs/) — start with
+> [docs/Lua-Wasm-Design-and-Test-Plan.md](docs/Lua-Wasm-Design-and-Test-Plan.md)
+> and
+> [docs/Upgrade-from-5.2-to-5.5-of-Lua.md](docs/Upgrade-from-5.2-to-5.5-of-Lua.md).
 
 ## Table of Contents
 
@@ -23,10 +44,10 @@ programs.
 - [How about performance?](#how-about-performance)
 - [Installation](#installation)
 - [Usage](#usage)
-- [Differences between Lua and Glasm](#differences-between-lua-and-gopherlua)
+- [Differences between Lua and Glasm](#differences-between-lua-and-glasm)
 - [Standalone interpreter](#standalone-interpreter)
 - [How to Contribute](#how-to-contribute)
-- [Libraries for Glasm](#libraries-for-gopherlua)
+- [Libraries for the gopher-lua ecosystem](#libraries-for-the-gopher-lua-ecosystem)
 - [Donation](#donation)
 - [License](#license)
 - [Author](#author)
@@ -47,12 +68,12 @@ Glasm is not fast but not too slow, I think.
 
 Glasm has almost equivalent ( or little bit better ) performance as Python3 on micro benchmarks.
 
-There are some benchmarks on the [wiki page](https://github.com/yuin/gopher-lua/wiki/Benchmarks) .
+There are some benchmarks on the [gopher-lua wiki page](https://github.com/yuin/gopher-lua/wiki/Benchmarks) (upstream); for Glasm, run `go run ./cmd/luabench`.
 
 ## Installation
 
 ```bash
-$ go get github.com/yuin/gopher-lua
+$ go get github.com/pschlump/glasm
 ```
 
 ## Usage
@@ -66,7 +87,7 @@ Import a package.
 
 ```go
 import (
-    "github.com/yuin/gopher-lua"
+    "github.com/pschlump/glasm"
 )
 ```
 
@@ -88,9 +109,9 @@ if err := L.DoFile("hello.lua"); err != nil {
 }
 ```
 
-Refer to [Lua Reference Manual](http://www.lua.org/manual/5.5/) and [Go doc](http://godoc.org/github.com/yuin/gopher-lua) for further information.
+Refer to [Lua Reference Manual](http://www.lua.org/manual/5.5/) and [Go doc](https://pkg.go.dev/github.com/pschlump/glasm) for further information.
 
-Note that elements that are not commented in [Go doc](http://godoc.org/github.com/yuin/gopher-lua) equivalent to [Lua Reference Manual](http://www.lua.org/manual/5.1/) , except Glasm uses objects instead of Lua stack indices.
+Note that elements that are not commented in [Go doc](https://pkg.go.dev/github.com/pschlump/glasm) equivalent to [Lua Reference Manual](http://www.lua.org/manual/5.5/) , except Glasm uses objects instead of Lua stack indices.
 
 ### Data model
 
@@ -226,7 +247,7 @@ An `LState` object that has been created by `*LState#NewThread()` inherits the c
 
 ### API
 
-Refer to [Lua Reference Manual](http://www.lua.org/manual/5.1/) and [Go doc(LState methods)](http://godoc.org/github.com/yuin/gopher-lua) for further information.
+Refer to [Lua Reference Manual](http://www.lua.org/manual/5.5/) and [Go doc(LState methods)](https://pkg.go.dev/github.com/pschlump/glasm) for further information.
 
 #### Calling Go from Lua
 
@@ -318,7 +339,7 @@ mymodule.go
 package mymodule
 
 import (
-    "github.com/yuin/gopher-lua"
+    "github.com/pschlump/glasm"
 )
 
 func Loader(L *lua.LState) int {
@@ -348,7 +369,7 @@ package main
 
 import (
     "./mymodule"
-    "github.com/yuin/gopher-lua"
+    "github.com/pschlump/glasm"
 )
 
 func main() {
@@ -766,6 +787,10 @@ func main() {
 
 ## Differences between Lua and Glasm
 
+*Inherited from the upstream 5.1-era README and partially superseded by the
+5.5 upgrade — e.g. `string.dump` and debug hooks are implemented in Glasm
+(see docs/); `cmd/glua` remains the standalone interpreter.*
+
 ### Goroutines
 
 - Glasm supports channel operations.
@@ -774,11 +799,9 @@ func main() {
 
 ### Unsupported functions
 
-- `string.dump`
 - `os.setlocale`
 - `lua_Debug.namewhat`
 - `package.loadlib`
-- debug hooks
 
 ### Miscellaneous notes
 
@@ -794,7 +817,7 @@ func main() {
 Lua has an interpreter called `lua` . Glasm has an interpreter called `glua` .
 
 ```bash
-go get github.com/yuin/gopher-lua/cmd/glua
+go install github.com/pschlump/glasm/cmd/glua@latest
 ```
 
 `glua` has same options as `lua` .
@@ -803,7 +826,10 @@ go get github.com/yuin/gopher-lua/cmd/glua
 
 See [Guidelines for contributors](https://github.com/yuin/gopher-lua/tree/master/.github/CONTRIBUTING.md) .
 
-## Libraries for Glasm
+## Libraries for the gopher-lua ecosystem
+
+These target gopher-lua's 5.1-era API; the Glasm interpreter retains that API
+surface where the 5.5 upgrade did not change it.
 
 - [gopher-luar](https://github.com/layeh/gopher-luar) : Simplifies data passing to and from gopher-lua
 - [gluamapper](https://github.com/yuin/gluamapper) : Mapping a Lua table to a Go struct

@@ -1,5 +1,5 @@
 // Package luawasm is the Lua→wasm backend (design doc §4): FunctionProto
-// trees from the golua55 frontend become wasm modules that share linear
+// trees from the glasm frontend become wasm modules that share linear
 // memory with the C runtime and call down through the rt_* ABI.
 //
 // U2e rewrite: the backend speaks the stock 5.5.1 instruction set
@@ -26,8 +26,8 @@ import (
 	"fmt"
 	"strings"
 
-	lua "github.com/pschlump/golua55"
-	"github.com/pschlump/golua55/wasm"
+	lua "github.com/pschlump/glasm"
+	"github.com/pschlump/glasm/wasm"
 )
 
 const (

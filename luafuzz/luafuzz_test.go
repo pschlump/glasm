@@ -22,7 +22,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/pschlump/golua55/testdiff"
+	"github.com/pschlump/glasm/testdiff"
 )
 
 // ---- generator ----

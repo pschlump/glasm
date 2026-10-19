@@ -31,7 +31,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/pschlump/golua55/wasm"
+	"github.com/pschlump/glasm/wasm"
 	"github.com/tetratelabs/wazero"
 	"github.com/tetratelabs/wazero/api"
 	"github.com/tetratelabs/wazero/experimental"

@@ -18,7 +18,7 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/pschlump/golua55/wasm"
+	"github.com/pschlump/glasm/wasm"
 )
 
 // The production runtime blob: lua55_prod.wasm, the zero-patch Lua 5.5.1

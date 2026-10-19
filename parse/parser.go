@@ -8,7 +8,7 @@ import __yyfmt__ "fmt"
 //line parser.go.y:2
 
 import (
-	"github.com/pschlump/golua55/ast"
+	"github.com/pschlump/glasm/ast"
 )
 
 // attribname is one name of a local/global declaration with its effective

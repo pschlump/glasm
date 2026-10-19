@@ -20,8 +20,8 @@ import (
 	"fmt"
 	"sort"
 
-	lua "github.com/pschlump/golua55"
-	"github.com/pschlump/golua55/wasm"
+	lua "github.com/pschlump/glasm"
+	"github.com/pschlump/glasm/wasm"
 )
 
 // multretHeadroomCells (row 92): call results stage at R(A).. with a

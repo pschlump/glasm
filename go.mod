@@ -1,4 +1,4 @@
-module github.com/pschlump/golua55
+module github.com/pschlump/glasm
 
 go 1.27.0
 

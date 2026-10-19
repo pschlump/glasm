@@ -10,7 +10,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/pschlump/golua55/ast"
+	"github.com/pschlump/glasm/ast"
 )
 
 const EOF = -1

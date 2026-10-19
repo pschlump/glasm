@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/pschlump/golua55/parse"
+	"github.com/pschlump/glasm/parse"
 )
 
 const maxMemory = 40

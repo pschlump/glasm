@@ -3,7 +3,7 @@ package lua
 import (
 	"strings"
 
-	"github.com/pschlump/golua55/parse"
+	"github.com/pschlump/glasm/parse"
 )
 
 func OpenDebug(L *LState) int {

@@ -102,7 +102,7 @@ import (
 	"math/rand"
 	"strings"
 
-	"github.com/pschlump/golua55/parse"
+	"github.com/pschlump/glasm/parse"
 )
 
 // caseRNG derives a per-case deterministic RNG stream from the soak's

@@ -11,7 +11,7 @@ import (
 	"log"
 	"time"
 
-	"github.com/pschlump/golua55/host"
+	"github.com/pschlump/glasm/host"
 )
 
 func main() {

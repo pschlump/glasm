@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/pschlump/golua55/pm"
+	"github.com/pschlump/glasm/pm"
 )
 
 const emptyLString LString = LString("")

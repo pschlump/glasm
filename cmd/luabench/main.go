@@ -39,9 +39,9 @@ import (
 	"strings"
 	"time"
 
-	lua "github.com/pschlump/golua55"
-	"github.com/pschlump/golua55/host"
-	"github.com/pschlump/golua55/testdiff"
+	lua "github.com/pschlump/glasm"
+	"github.com/pschlump/glasm/host"
+	"github.com/pschlump/glasm/testdiff"
 )
 
 //go:embed scripts/*.lua

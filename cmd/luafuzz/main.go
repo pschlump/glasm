@@ -31,7 +31,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/pschlump/golua55/luafuzz"
+	"github.com/pschlump/glasm/luafuzz"
 )
 
 var enginesFlag, netsFlag string

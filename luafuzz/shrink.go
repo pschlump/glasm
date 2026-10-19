@@ -13,7 +13,7 @@ package luafuzz
 import (
 	"strings"
 
-	"github.com/pschlump/golua55/testdiff"
+	"github.com/pschlump/glasm/testdiff"
 )
 
 // Minimize shrinks src while the original finding class persists.

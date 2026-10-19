@@ -15,7 +15,7 @@ import (
 	"github.com/tetratelabs/wazero"
 	"github.com/tetratelabs/wazero/api"
 
-	w "github.com/pschlump/golua55/wasm"
+	w "github.com/pschlump/glasm/wasm"
 )
 
 func i32(v ...w.ValueType) []w.ValueType { return v }

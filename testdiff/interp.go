@@ -12,10 +12,10 @@ import (
 	"strings"
 	"time"
 
-	lua "github.com/pschlump/golua55"
+	lua "github.com/pschlump/glasm"
 )
 
-// Interp is the golua55 interpreter oracle. Instances are named so two
+// Interp is the glasm interpreter oracle. Instances are named so two
 // of them can be diffed against each other (the M1 self-diff gate).
 type Interp struct {
 	name string

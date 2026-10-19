@@ -11,7 +11,7 @@ import (
 	"sort"
 	"strconv"
 
-	"github.com/pschlump/golua55"
+	"github.com/pschlump/glasm"
 )
 
 const (

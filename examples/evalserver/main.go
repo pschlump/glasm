@@ -17,7 +17,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/pschlump/golua55/host"
+	"github.com/pschlump/glasm/host"
 )
 
 func main() {

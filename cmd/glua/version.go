@@ -6,7 +6,7 @@ package main
 import (
 	"fmt"
 
-	"github.com/pschlump/golua55"
+	"github.com/pschlump/glasm"
 )
 
 // Overwritten at link time by LDFLAGS in the Makefile; empty in a binary

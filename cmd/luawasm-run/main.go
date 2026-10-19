@@ -16,7 +16,7 @@ import (
 	"os"
 	"strings"
 
-	"github.com/pschlump/golua55/testdiff"
+	"github.com/pschlump/glasm/testdiff"
 )
 
 func main() {

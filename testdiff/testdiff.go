@@ -131,7 +131,7 @@ func (r Result) Diff() string {
 
 // DiffLogs returns a description of the first difference between two event
 // logs ("" when equal). GLOBALS lines are excluded: the engines' library
-// sets differ by construction (golua55 vs C Lua 5.1 — ledger row: the
+// sets differ by construction (glasm vs C Lua 5.1 — ledger row: the
 // globals surface aligns with the host module in M7); the differential
 // contract covers script-observable PRINT/ERROR/STDOUT events.
 //

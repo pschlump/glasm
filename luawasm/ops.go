@@ -9,8 +9,8 @@ package luawasm
 // texts are the runtime's stock 5.5 ones.
 
 import (
-	lua "github.com/pschlump/golua55"
-	"github.com/pschlump/golua55/wasm"
+	lua "github.com/pschlump/glasm"
+	"github.com/pschlump/glasm/wasm"
 )
 
 // tagIs: leaves 1/0 — register k's tag byte equals tag. The load is

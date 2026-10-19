@@ -23,7 +23,7 @@ import (
 
 	wt "github.com/bytecodealliance/wasmtime-go/v48"
 
-	w "github.com/pschlump/golua55/wasm"
+	w "github.com/pschlump/glasm/wasm"
 )
 
 func reentryEmitScript(t *testing.T) []byte {

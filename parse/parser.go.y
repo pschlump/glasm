@@ -2,7 +2,7 @@
 package parse
 
 import (
-  "github.com/pschlump/golua55/ast"
+  "github.com/pschlump/glasm/ast"
 )
 
 // attribname is one name of a local/global declaration with its effective

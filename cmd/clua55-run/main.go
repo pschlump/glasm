@@ -2,7 +2,7 @@
 // oracle blob, lua55_sjlj.wasm) with the CLI-arg surface the other runners
 // provide. The 5.5 companion of cmd/clua-run:
 //
-//	glua prog.lua args...        # golua55 interpreter (5.1 semantics today)
+//	glua prog.lua args...        # glasm interpreter (5.1 semantics today)
 //	glua -w p.wasm prog.lua ...  # luawasm backend
 //	glua -W p.wasm args...       #   (run precompiled)
 //	clua-run prog.lua args...    # stock C Lua 5.1 in wasm
@@ -25,7 +25,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/pschlump/golua55/testdiff"
+	"github.com/pschlump/glasm/testdiff"
 )
 
 func main() {

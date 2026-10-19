@@ -3,7 +3,7 @@
 //
 //	go run ./cmd/testdiff -corpus _glua-tests -engines interp,interp
 //
-// Exit code 1 on any diff. Engine names: interp (the golua55 oracle),
+// Exit code 1 on any diff. Engine names: interp (the glasm oracle),
 // clua (stock C Lua 5.1 in wasm), wasm (the Lua→wasm backend on wasmtime,
 // the dev oracle host), wazero (the same backend on the pure-Go production
 // engine — M6b's engine-parity leg, ledger row 32), wazero-prod (the M6c
@@ -16,7 +16,7 @@ import (
 	"os"
 	"strings"
 
-	"github.com/pschlump/golua55/testdiff"
+	"github.com/pschlump/glasm/testdiff"
 )
 
 func main() {

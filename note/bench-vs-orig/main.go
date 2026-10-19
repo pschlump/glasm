@@ -1,4 +1,4 @@
-// Command luabench compares the modified golua55 fork against the
+// Command luabench compares the modified glasm fork against the
 // near-original baseline, side by side in one process:
 //
 //   - parse+compile time      (orig vs new frontend)
@@ -21,12 +21,12 @@ import (
 	"strings"
 	"time"
 
-	newlua "github.com/pschlump/golua55"
-	newparse "github.com/pschlump/golua55/parse"
-	"github.com/pschlump/golua55/testdiff"
+	newlua "github.com/pschlump/glasm"
+	newparse "github.com/pschlump/glasm/parse"
+	"github.com/pschlump/glasm/testdiff"
 
-	origlua "github.com/pschlump/golua55-orig"
-	origparse "github.com/pschlump/golua55-orig/parse"
+	origlua "github.com/pschlump/gopher-lua-orig"
+	origparse "github.com/pschlump/gopher-lua-orig/parse"
 )
 
 const (

@@ -3,7 +3,7 @@ module luabench
 go 1.27.0
 
 require (
-	github.com/pschlump/gopher-lua v0.0.0
+	github.com/pschlump/glasm v0.0.0
 	github.com/pschlump/gopher-lua-orig v0.0.0
 )
 
@@ -15,6 +15,6 @@ require (
 
 // this module lives at <gopher-lua>/note/bench-vs-orig — the two replaces
 // point at the fork itself and the pristine baseline checkout next to it.
-replace github.com/pschlump/gopher-lua => ../..
+replace github.com/pschlump/glasm => ../..
 
 replace github.com/pschlump/gopher-lua-orig => ../../../gopher-lua-orig

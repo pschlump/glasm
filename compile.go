@@ -5,8 +5,8 @@ import (
 	"math"
 	"reflect"
 
-	"github.com/pschlump/golua55/ast"
-	"github.com/pschlump/golua55/parse"
+	"github.com/pschlump/glasm/ast"
+	"github.com/pschlump/glasm/parse"
 )
 
 /* internal constants & structs  {{{ */
@@ -1458,7 +1458,7 @@ func compileAssignStmtRight(context *funcContext, stmt *ast.AssignStmt, reg int,
 			// slot instead; the reverse assignment loop below moves it,
 			// which also restores stock 5.1's leftmost-wins order for
 			// duplicate targets (a, a = 1, 2 → 1). (Upstream
-			// yuin/golua55 has the sequential bug; found by _cli-tests
+			// yuin/gopher-lua has the sequential bug; found by _cli-tests
 			// fib vs C Lua.) varargopt 0: a non-last RHS adjusts to
 			// exactly one value (`...` and call results alike); the
 			// multi-return case is the branch above.
