@@ -21,8 +21,9 @@ should bring non-tail OP_CALL into that class or better.
 ## FINDING: h_fib output MISMATCH = pre-existing main-tailcall bug
 
 `outputs: MISMATCH! interp="832040" wasm="function"` — the lane caught a
-real divergence, not a script error (bisected live; regression rows
-land in `host/host_test.go` TestEvalBasics with the U9a fix):
+real divergence, not a script error (bisected live; **FIXED at U9a —
+ledger row 103**, regression rows in `host/host_test.go` TestEvalBasics;
+`-only fib` now answers `outputs: OK`):
 
 - `return f(21)` / `return (function(x)...end)(41)` / recursive fib /
   vararg f — single-expression call return → host reads the CLOSURE in
@@ -43,6 +44,8 @@ ends in a C-function call returning a string).
 Fix shape (backend-only, no rt/blob change): emitDispatch saves its entry
 frame param, and when the M5c loop actually restaged, copies nret results
 from the final restaged frame back to the entry frame before returning
-(the original frame is still allocated on every caller path). Ledger row
-+ corpus case (main-chunk tailcall return, incl. vararg/tbc shapes) +
-host test needed. U9 item 0 — correctness before perf.
+(the original frame is still allocated on every caller path) — landed as
+U9a. A differential corpus case (main-chunk tailcall return, incl.
+vararg/tbc shapes) becomes writable with U9a2's RESULTS event, which is
+the chunk-returns-into-the-differential-surface work and prerequisite for
+U9c. U9 item 0 — correctness before perf.

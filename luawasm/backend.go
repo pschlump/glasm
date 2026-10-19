@@ -494,8 +494,22 @@ func (b *backend) emitDispatch() {
 	f := m.NewFunction([]wasm.ValueType{wasm.I32, wasm.I32, wasm.I32, wasm.I32, wasm.I32}, []wasm.ValueType{wasm.I32})
 	b.dispatchFn = f.Idx()
 	const lNret uint32 = 5
+	// U9a (row 103): 6 = the entry frame — the M5c restage loop below
+	// overwrites the frame param (local 1) with each restaged successor
+	// frame, but lua_main's caller reads results at the frame IT passed
+	// (host/vm.go reads entry+16i); 8 = the entry cl, saved because the
+	// restage loop overwrites local 2 as well. 7 = the copy-back loop
+	// index.
+	const lEntry uint32 = 6
+	const lI uint32 = 7
+	const lEntryCl uint32 = 8
+	f.Local(wasm.I32)
+	f.Local(wasm.I32)
+	f.Local(wasm.I32)
 	f.Local(wasm.I32)
 	n := len(b.protos)
+	f.LocalGet(1).LocalSet(lEntry)
+	f.LocalGet(2).LocalSet(lEntryCl)
 
 	f.Loop(wasm.Void) // $again — the M5c restage target
 	// U6b (row 37): the restage loop is an unbounded back edge with no
@@ -531,6 +545,37 @@ func (b *backend) emitDispatch() {
 	f.Br(1) // → the dispatch loop again
 	f.End()
 	f.End() // close loop
+	// U9a (row 103): the restage loop exits with results staged at the
+	// FINAL successor frame (local 1), while lua_main's caller reads
+	// entry+16i — copy the nret cells back when a restage actually moved
+	// the frame. Gated on entry cl==0 (row 53: main runs cl=0 — every
+	// trampoline-driven dispatch carries its nonzero rt_wcl record): in
+	// a NESTED dispatch the copy would be a write through dead cells that
+	// can OVERLAP the successor's live result window (vararg blocks pack
+	// tightly), clobbering the very cells rtw_dispatch_body is about to
+	// copy to the stack — tco08/var13/var07 caught exactly that. Equal
+	// frames (a non-vararg successor lands on the entry block) and
+	// nret==0 need no copy.
+	f.LocalGet(lEntryCl).I32Eqz().If(wasm.Void)
+	f.LocalGet(lNret).I32Const(0).I32GeS().If(wasm.Void)
+	f.LocalGet(1).LocalGet(lEntry).I32Ne().If(wasm.Void)
+	f.I32Const(0).LocalSet(lI)
+	f.Block(wasm.Void)
+	f.Loop(wasm.Void)
+	f.LocalGet(lI).LocalGet(lNret).I32GeS().BrIf(1)
+	f.LocalGet(lEntry).LocalGet(lI).I32Const(int32(cellSize)).I32Mul().I32Add()
+	f.LocalGet(1).LocalGet(lI).I32Const(int32(cellSize)).I32Mul().I32Add().I64Load(0)
+	f.I64Store(0)
+	f.LocalGet(lEntry).LocalGet(lI).I32Const(int32(cellSize)).I32Mul().I32Add()
+	f.LocalGet(1).LocalGet(lI).I32Const(int32(cellSize)).I32Mul().I32Add().I64Load(8)
+	f.I64Store(8)
+	f.LocalGet(lI).I32Const(1).I32Add().LocalSet(lI)
+	f.Br(0)
+	f.End()
+	f.End()
+	f.End()
+	f.End()
+	f.End()
 	f.LocalGet(lNret)
 	f.End()
 	f.Export("lua_dispatch")

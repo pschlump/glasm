@@ -91,6 +91,17 @@ func TestEvalBasics(t *testing.T) {
 				KV{Key: Int(2), Val: String("four")},
 			)},
 		)}},
+		// U9a (row 103): a main chunk ending in a tailcall to a compiled
+		// closure takes the M5c restage — results must still reach the
+		// host at the entry frame (these caught the pre-U9a bug where the
+		// closure in R(A-1) came back instead of the value).
+		{"local function f(x) return x*2 end return f(21)", []Value{Int(42)}},
+		{"local function f(n) if n < 2 then return n end return f(n-1) + f(n-2) end return f(10)", []Value{Int(55)}},
+		{"local function f(...) return ... end return f(42)", []Value{Int(42)}},
+		{"local function f(x) return x*2 end return f(1), f(2)", []Value{Int(2), Int(4)}},
+		{"local function f(x) return x*2 end return tostring(f(21))", []Value{String("42")}},
+		{"local function f() end return f()", nil},
+		{"return (function(x) return x+1 end)(41)", []Value{Int(42)}},
 	}
 	for _, c := range cases {
 		res, err := runScript(t, e, c.src, RunOptions{Keys: []string{"a"}, Argv: []string{"b", "c"}})
