@@ -122,7 +122,9 @@ RT_EXPORTS="$EXPORTS \
   -Wl,--export=rt_tail_restage \
   -Wl,--export=rt_sandbox -Wl,--export=rt_protect_globals \
   -Wl,--export=rt_globals_readonly \
-  -Wl,--export=rt_hostfn -Wl,--export=rt_encode_value"
+  -Wl,--export=rt_hostfn -Wl,--export=rt_encode_value \
+  -Wl,--export=rt_dd_callee -Wl,--export=rt_dd_enter \
+  -Wl,--export=rt_dd_ret -Wl,--export=rt_dd_err -Wl,--export=rt_dd_reset"
 
 # U5e (row 60): the error-position seam — rt_seam55.c interposes
 # luaL_where/lua_error/luaG_runerror for the RT blob only. It must link

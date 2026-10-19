@@ -25,11 +25,12 @@ import (
 // lua55ProdSHA256 pins the embedded 5.5 prod blob (U6d, row 95;
 // re-bumped at U6e: the hostfn seam — host.host_call import +
 // rt_hostfn/rt_encode_value exports, and the PT_INTEGER wire tag;
-// re-bumped at U9a2: the lresults driver export).
+// re-bumped at U9a2: the lresults driver export; re-bumped at U9c:
+// the rt_dd_* direct-dispatch exports, row 104).
 // Rebuild runtime/build55.sh → update this constant (the artifact test
 // is the self-check that forces the bump). Brittle by design (A8:
 // checksummed artifact).
-const lua55ProdSHA256 = "f1269ca18a8d962106eae0078ab1157b7e8fdca572427a2baeedb71ca2dbfd5f"
+const lua55ProdSHA256 = "968171a29a667ff728720fee6b4db405ac8f636f5960b29f6a05866e5c388a47"
 
 // TestM6cProdBlobArtifact (U6d edition, ledger row 95): lua55_prod.wasm
 // — the 5.5 production flavor of the rt blob. The build's output is
@@ -84,7 +85,10 @@ func TestM6cProdBlobArtifact(t *testing.T) {
 		// U6c: the lockdown surface (row 94)
 		"rt_sandbox", "rt_protect_globals", "rt_globals_readonly",
 		// U6e: the hostfn seam (row 96)
-		"rt_hostfn", "rt_encode_value"} {
+		"rt_hostfn", "rt_encode_value",
+		// U9c: the direct-dispatch helpers (row 104)
+		"rt_dd_callee", "rt_dd_enter", "rt_dd_ret", "rt_dd_err",
+		"rt_dd_reset"} {
 		if !exp[name] {
 			t.Errorf("prod blob export %s missing", name)
 		}

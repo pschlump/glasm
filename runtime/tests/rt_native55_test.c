@@ -976,6 +976,113 @@ int main(void) {
     rt_err_clear();
   }
 
+  /* ---- U9c (row 104): the direct-dispatch helpers ---- */
+  {
+    TValue cells[4]; /* [0] = R(A) result slot, [1..2] = the arg window */
+    int32_t linecell = 0;
+    rt_addr saved, frame;
+    int64_t probe;
+    int i;
+
+    /* the probe: accept a trampoline CClosure, decline everything else */
+    rt_mkinteger(cell_of(&cells[0]), 42);
+    CHECK(rt_dd_callee(cell_of(&cells[0])) == 0); /* not a closure */
+    lua_getglobal(L, "print");
+    CHECK(rt_dd_callee(cell_of(s2v(L->top.p - 1))) == 0); /* C closure */
+    lua_pop(L, 1);
+    probe = rt_dd_callee(cell_of(&g_sum_closure));
+    CHECK(probe != 0);
+    /* the low word is the full truth (mdidx+1); the high word carries
+       the record pointer — exact on wasm32, low-32 only natively */
+    CHECK((uint32_t)(probe & 0xffffffff) == (uint32_t)IDX_SUM + 1);
+    CHECK((probe >> 32) != 0);
+    CHECK(rt_err_pending() == 0); /* read-only: never refuses/stages */
+
+    /* sea entry so the ret/err line rebinds land somewhere real (the
+       emitted prologue always runs under one) */
+    rt_sea_main((rt_addr)(uintptr_t)&linecell);
+
+    /* enter/ret, fixed want: truncation to want */
+    saved = rt_frame_cursor();
+    rt_mkinteger(cell_of(&cells[1]), 20);
+    rt_mkinteger(cell_of(&cells[2]), 22);
+    frame = rt_dd_enter((int32_t)(probe & 0xffffffff),
+                        cell_of(&cells[1]), 2);
+    CHECK(frame != 0);
+    CHECK(rt_frame_cursor() > saved); /* the callee's block is live */
+    /* the callee ran: 3 results at its EXIT frame (would be gDispFrame) */
+    rt_mkinteger(frame, 7);
+    rt_mkinteger(frame + (rt_addr)sizeof(TValue), 8);
+    rt_mkinteger(frame + (rt_addr)sizeof(TValue) * 2, 9);
+    CHECK(rt_dd_ret(saved, cell_of(&cells[1]), frame, 3, 1,
+                    (rt_addr)(uintptr_t)&linecell) == RT_OK);
+    CHECK(ttisinteger(&cells[0]) && ivalue(&cells[0]) == 7);
+    CHECK(rt_frame_cursor() == saved); /* region retired exactly */
+
+    /* enter/ret, short return: EXPLICIT nil padding (nothing runs
+       luaD_poscall on this path — the pad is load-bearing) */
+    frame = rt_dd_enter((int32_t)(probe & 0xffffffff),
+                        cell_of(&cells[1]), 2);
+    CHECK(frame != 0);
+    rt_mkinteger(frame, 42);
+    CHECK(rt_dd_ret(saved, cell_of(&cells[1]), frame, 1, 3,
+                    (rt_addr)(uintptr_t)&linecell) == RT_OK);
+    CHECK(ttisinteger(&cells[0]) && ivalue(&cells[0]) == 42);
+    CHECK(ttisnil(&cells[1]) && ttisnil(&cells[2]));
+    CHECK(rt_frame_cursor() == saved);
+
+    /* enter/ret, multret (want<0): -(n+1), rt_call_addr's encoding */
+    frame = rt_dd_enter((int32_t)(probe & 0xffffffff),
+                        cell_of(&cells[1]), 2);
+    CHECK(frame != 0);
+    rt_mkinteger(frame, 11);
+    rt_mkinteger(frame + (rt_addr)sizeof(TValue), 12);
+    CHECK(rt_dd_ret(saved, cell_of(&cells[1]), frame, 2, -1,
+                    (rt_addr)(uintptr_t)&linecell) == -3);
+    CHECK(ttisinteger(&cells[0]) && ivalue(&cells[0]) == 11);
+    CHECK(ttisinteger(&cells[1]) && ivalue(&cells[1]) == 12);
+    CHECK(rt_frame_cursor() == saved);
+
+    /* enter/err: the error STAYS staged (the caller returns -1 in
+       turn), cursor restored, follow-up rt_* unblocked after clear */
+    frame = rt_dd_enter((int32_t)(probe & 0xffffffff),
+                        cell_of(&cells[1]), 2);
+    CHECK(frame != 0);
+    rt_error((rt_addr)(uintptr_t)"dd-boom", 7, 5); /* staged, like a -1 */
+    CHECK(rt_dd_err(saved, (rt_addr)(uintptr_t)&linecell) == -1);
+    CHECK(rt_err_pending() != 0);
+    CHECK(err_ends_with("dd-boom"));
+    CHECK(rt_frame_cursor() == saved);
+    rt_err_clear();
+    CHECK(rt_dd_callee(cell_of(&g_sum_closure)) == probe); /* seam sane */
+
+    /* the depth budget: RT_DD_MAX_DEPTH enters fit, the next refuses
+       with stock's wording, reset heals, and the counter balances
+       through ret afterwards */
+    rt_dd_reset();
+    for (i = 0; i < RT_DD_MAX_DEPTH; i++) {
+      frame = rt_dd_enter((int32_t)(probe & 0xffffffff),
+                          cell_of(&cells[1]), 0);
+      CHECK(frame != 0);
+      if (frame == 0) break;
+    }
+    CHECK(rt_dd_enter((int32_t)(probe & 0xffffffff),
+                      cell_of(&cells[1]), 0) == 0);
+    CHECK(err_ends_with("stack overflow"));
+    rt_err_clear();
+    rt_dd_reset();
+    frame = rt_dd_enter((int32_t)(probe & 0xffffffff),
+                        cell_of(&cells[1]), 0);
+    CHECK(frame != 0);
+    rt_mknil(frame);
+    CHECK(rt_dd_ret(saved, cell_of(&cells[1]), frame, 0, 0,
+                    (rt_addr)(uintptr_t)&linecell) == RT_OK);
+    rt_frame_restore(saved); /* retire the budget stack's blocks */
+    CHECK(rt_frame_cursor() == saved);
+
+    rt_sea_pop();
+  }
+
   /* ---- U4f: the rt-owned tbc registry + error-path closes ---- */
   {
     TValue fcell, okobj, badobj;

@@ -141,6 +141,18 @@ typedef int32_t rt_addr;
    posture, re-pinned for the CClosure seam — ledger row 60). */
 #define RTW_MAX_DEPTH 150
 
+/* U9c (row 104): the direct-dispatch depth budget — bounds the wasm
+   frame nesting of DIRECT lua_dispatch calls (they consume no C stack
+   and cross no host seam, so neither rt_wasm_depth nor nCcalls sees
+   them; the engine's own wasm stack limit would otherwise trap).
+   Pathological mixed interleaves (trampoline levels hosting direct
+   chains hosting deeper trampolines) can still exhaust the engine
+   stack first — that path already maps to the same staged "stack
+   overflow" (RTW_STACKTRAP, row 20 family); the budget keeps common
+   shapes off the trap. Derivation from the row-104 probes pinned here
+   at commit time. */
+#define RT_DD_MAX_DEPTH 1024
+
 #ifdef __wasm__
 __attribute__((import_module("host"), import_name("wasm_dispatch")))
 #endif
@@ -350,6 +362,29 @@ int32_t rt_tail_clidx(void);
 int32_t rt_tail_nargs(void);
 rt_addr rt_tail_funcell(void);
 rt_addr rt_tail_restage(void);
+
+/* U9c (row 104): direct in-module dispatch — a non-tail OP_CALL/
+   TFORCALL on one of THIS module's compiled closures runs the module's
+   own lua_dispatch with no C precall and no host crossing; anything
+   else declines to rt_call_addr unchanged.
+   rt_dd_callee is the fused probe: (cl record << 32) | (mdidx+1), 0 =
+   decline (exact on wasm32; native tests mask the high word).
+   rt_dd_enter takes the probe's low word and the args at their natural
+   R(A+1).. cells; 0 = error staged (budget/OOM) — the caller returns
+   -1. rt_dd_ret stages want-truncated/nil-padded results at R(A)
+   (argcells-16) from lua_dispatch's EXIT frame, restores the cursor,
+   rebinds the caller's line cell, and returns rt_call_addr's success
+   encoding (w<0 ? -(nres+1) : 0). rt_dd_err closes the dying callee
+   frames (the unwinding-boundary form) and keeps the error staged for
+   the caller's -1. rt_dd_reset (lua_main's prologue) clears the C
+   depth counter at run boundaries — a trap that surfaced at main
+   leaves it high on a pooled VM. */
+int64_t rt_dd_callee(rt_addr funcell);
+rt_addr rt_dd_enter(int32_t mdidx1, rt_addr argcells, int32_t nargs);
+int32_t rt_dd_ret(rt_addr saved, rt_addr argcells, rt_addr frame,
+                  int32_t nret, int32_t want, rt_addr linecell);
+int32_t rt_dd_err(rt_addr saved, rt_addr linecell);
+void rt_dd_reset(void);
 
 /* the row-60 error-position seam (U5e; runtime/rt_seam55.c — linked only
    into lua55_rt.wasm, ahead of the stock objects, so its luaL_where/

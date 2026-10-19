@@ -2028,6 +2028,135 @@ rt_addr rt_tail_restage(void) {
   return frame;
 }
 
+/* ---- U9c (row 104): direct in-module dispatch --------------------------
+**
+** A non-tail OP_CALL/TFORCALL whose callee is one of THIS module's
+** compiled closures dispatches the module's own lua_dispatch directly
+** from wasm: probe -> push frame -> wasm call -> retire. No C precall,
+** no protect layer, no host seam crossing. Everything else (C
+** functions, __call chains, foreign-registry closures) declines to the
+** unchanged rt_call_addr fallback — the M5c decline pattern.
+**
+** Depth budget: a C static, NOT a wasm global. A trap caught by a
+** mid-run C pcall skips every wasm-side decrement and lua_main never
+** re-runs its prologue, so a wasm counter would ratchet until every
+** later call falsely overflows. rt_dd_enter increments; rt_dd_ret /
+** rt_dd_err decrement; rtw_dispatch_body bracket-restores around its
+** host call (every trap surfaces at SOME host boundary — the engine
+** stack-exhaustion trap returns through the wasm_dispatch_host import
+** as -4, control resuming normally in C — so the bracket heals every
+** leak); rt_dd_reset at lua_main's prologue covers run boundaries (a
+** trap that surfaced at main leaves the counter high until the next
+** run of a pooled VM). Direct frames consume no C stack, so
+** rt_wasm_depth is untouched: RTW_MAX_DEPTH still bounds trampoline
+** nesting only. The constant's derivation lives in ledger row 104. */
+static int rt_dd_depth;
+static rt_addr dd_disp_save[RT_DD_MAX_DEPTH];
+
+/* the fused probe: (cl record address << 32) | (mdidx+1); 0 = decline.
+   Exact on wasm32 (pointers are 32-bit); under RT_ABI_NATIVE64 the
+   high word carries only the record pointer's low 32 bits — native
+   tests mask, the low word is always the full truth. Read-only: never
+   refuses on a pending staging, never touches the cells. */
+int64_t rt_dd_callee(rt_addr funcell) {
+  const TValue *f = (const TValue *)(size_t)funcell;
+  if (ttisCclosure(f)) {
+    CClosure *c = clCvalue(f);
+    if (c->f == rt_wasm_trampoline) {
+      struct rt_wcl *rec = (struct rt_wcl *)pvalue(&c->upvalue[0]);
+      if (rec->mdidx >= 0 && rec->mdidx < rt_md_n)
+        return ((int64_t)(uint32_t)(size_t)rec << 32) |
+               (int64_t)(uint32_t)(rec->mdidx + 1);
+    }
+  }
+  return 0;
+}
+
+/* push the callee frame — the same rt_push_frame_from the trampoline
+   uses (vararg extras below the window, rt_md sizing), reading args
+   from their natural R(A+1).. cells. Takes the probe's low word
+   (mdidx+1; the emitted code forwards it unopened). Returns the window
+   base, or 0 WITH an error staged (budget/OOM — the caller returns -1
+   and the error propagates as a staged return). Also saves the
+   trampoline's rt_disp_frame shadow at this depth: the callee's
+   wasm-side restage loop publishes restages into that single static,
+   and without the save/restore pair in ret/err a restage inside a
+   direct callee would clobber the OUTER trampoline level's adopt frame
+   (rtw_dispatch_body reads it after its host call). */
+rt_addr rt_dd_enter(int32_t mdidx1, rt_addr argcells, int32_t nargs) {
+  rt_addr frame;
+  int mdidx = (int)mdidx1 - 1;
+  if (mdidx < 0 || mdidx >= rt_md_n) return 0; /* probe bounded it */
+  if (rt_dd_depth >= RT_DD_MAX_DEPTH) {
+    /* stock's own wording (lstate.c luaE_checkcstack), same staging as
+       rt_wasm_enter — byte-identical to the trampoline depth guard */
+    stage_str_error("stack overflow", 1);
+    return 0;
+  }
+  frame = rt_push_frame_from(mdidx, (int)nargs, (const TValue *)(size_t)argcells);
+  if (frame == 0) {
+    stage_str_error("not enough memory", 1);
+    return 0;
+  }
+  dd_disp_save[rt_dd_depth] = rt_disp_frame;
+  rt_dd_depth++;
+  return frame;
+}
+
+/* retire a successful direct dispatch: stage want-truncated results at
+   R(A) (argcells-16) with EXPLICIT nil padding of short returns — the
+   C path gets its padding from luaD_poscall; nothing between here and
+   the wasm callee runs one — then restore the caller's frame region,
+   rebind the caller's line cell (the callee's prologue repointed the
+   shared sea entry at its own cell; without this the caller's next
+   level-1 raise reads a stale line off a dead frame cell), restore the
+   saved rt_disp_frame shadow, and return rt_call_addr's success
+   encoding so the emitted top-adjust is reused verbatim. `frame` is
+   lua_dispatch's EXIT frame (the emitted code passes the module
+   global lua_dispatch publishes on return — the M5c restage loop may
+   have moved the window 16*nv' off the block rt_dd_enter allocated). */
+int32_t rt_dd_ret(rt_addr saved, rt_addr argcells, rt_addr frame,
+                  int32_t nret, int32_t want, rt_addr linecell) {
+  TValue *dst = (TValue *)(size_t)(argcells - (rt_addr)sizeof(TValue));
+  const TValue *src = (const TValue *)(size_t)frame;
+  int w = (int)want, n = (int)nret, i;
+  TValue nilv;
+  if (n < 0) n = 0;
+  setnilvalue(&nilv);
+  if (w >= 0) {
+    for (i = 0; i < w; i++)
+      dst[i] = (i < n) ? src[i] : nilv;
+    n = w;
+  } else {
+    for (i = 0; i < n; i++)
+      dst[i] = src[i];
+  }
+  rt_disp_frame = dd_disp_save[rt_dd_depth - 1];
+  rt_dd_depth--;
+  rt_frame_restore(saved);
+  rt_sea_setline(linecell);
+  return w < 0 ? -(n + 1) : RT_OK;
+}
+
+/* retire a failed one: the callee returned -1 with the error staged.
+   Close the dying callee frames with the unwinding-boundary form BEFORE
+   the region goes away (cells must stay allocated while __close runs —
+   the trampoline arm's ordering). The INNERMOST rt_dd_err does the
+   work; each outer level of the -1 chain finds the list already clean
+   (rt_close_err self-protects). The error stays staged — the caller
+   returns -1 in turn, exactly the in-wasm error protocol. */
+int32_t rt_dd_err(rt_addr saved, rt_addr linecell) {
+  rt_close_err(saved);
+  rt_disp_frame = dd_disp_save[rt_dd_depth - 1];
+  rt_dd_depth--;
+  rt_frame_restore(saved);
+  rt_sea_setline(linecell);
+  return -1;
+}
+
+void rt_dd_reset(void) { rt_dd_depth = 0; }
+
+
 /* ---- the precall seam: the dispatch trampoline (U2d) ------------------
 **
 ** Everything C-initiated (pcall, sort comparators, gsub replacements,
@@ -2179,7 +2308,16 @@ static void rtw_dispatch_body(lua_State *L, void *ud) {
        rt_disp_frame above); the copy below reads c->frame afterward. */
     rt_addr saved_df = rt_disp_frame;
     rt_disp_frame = c->frame;
-    c->nret = wasm_dispatch_host(c->idx, c->frame, c->cl, c->nargs, c->want);
+    {
+      /* U9c (row 104): heal the direct-dispatch depth counter at this
+         host boundary. A trap caught deeper (engine stack exhaustion
+         returns through the import as -4) skipped every wasm-side
+         rt_dd_ret/rt_dd_err decrement — restore the entry depth so a
+         pcall-catch-continue run keeps its full budget. */
+      int saved_dd = rt_dd_depth;
+      c->nret = wasm_dispatch_host(c->idx, c->frame, c->cl, c->nargs, c->want);
+      rt_dd_depth = saved_dd;
+    }
     c->frame = rt_disp_frame; /* adopt this level's latest restage */
     rt_disp_frame = saved_df;
     if (c->nret != RTW_TAIL) break;
