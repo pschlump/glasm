@@ -64,11 +64,80 @@ language in your Go host programs.
 
 ## How about performance?
 
-Glasm is not fast but not too slow, I think.
+Glasm runs Lua two ways, and which one wins depends on the shape of the
+script and how long it runs:
 
-Glasm has almost equivalent ( or little bit better ) performance as Python3 on micro benchmarks.
+- **The interpreter** — the register VM in Go (gopher-lua's). Compiling to
+  bytecode and starting a state both cost microseconds; every instruction
+  then pays Go dispatch.
+- **The compiler** — Glasm compiles the script to a WebAssembly module, and
+  the host engine JIT-compiles that wasm to native machine code (arm64,
+  amd64). Integer and float arithmetic run as straight native code in tight
+  loops — no interpreter dispatch at all. Operations that miss a fast path
+  (string-library calls, table growth, metamethods, coercion) cross into a
+  compiled C Lua 5.5.1 runtime.
 
-There are some benchmarks on the [gopher-lua wiki page](https://github.com/yuin/gopher-lua/wiki/Benchmarks) (upstream); for Glasm, run `go run ./cmd/luabench`.
+The trade is setup cost up front versus native speed afterwards. Compiling
+Lua → wasm is cheap (tens of microseconds for a typical script). What costs
+is standing up a fresh VM — instantiating the runtime blob, opening the
+standard library, linking the script: **about 70 ms before the first Lua
+instruction runs** on the machine below. So:
+
+- **Short scripts, or scripts run once** — the interpreter wins, massively.
+  A script that does 100 µs of work does not repay a 70 ms setup cost.
+- **Computationally intensive scripts** — straight-line numeric and
+  table-indexed loops run at native speed. On a wasmtime-class engine a
+  sieve benchmark runs ~25% *faster* than the interpreter (360 ms vs
+  ~460–530 ms) despite being fully sandboxed; the longer the script runs,
+  the more that per-instruction gap compounds.
+- **Scripts run a lot** — pool the VM. A pooled VM compiles once and
+  re-runs in place; the per-run cost drops back to microseconds and even a
+  trivial script round-trips faster than building a fresh interpreter
+  state (45.6 µs vs 72.8 µs below). The `host/` package is built around
+  this posture.
+
+### Measured — production path (`host/` on wazero), 2026-10-18
+
+Medians on one Apple-silicon Mac (arm64, go1.27); the meaningful column is
+the *ratio* — absolute numbers move with machine and engine version. All
+runs output-checked identical across paths.
+
+| script (shape) | interp | wasm, cold VM | wasm, pooled VM |
+|---|---|---|---|
+| h_tiny (startup only) | 72.8 µs | 70.3 ms | **45.6 µs** |
+| h_str (short string ops) | 182 µs | 71.6 ms | 779 µs |
+| h_strlong (150 KB text processing) | 1.46 ms | 103 ms | 16.5 ms |
+| h_numloop (4 M-iteration numeric) | 127 ms | 1.20 s | 1.14 s |
+| h_tablechurn (table alloc churn) | 10.2 ms | 169 ms | 90.1 ms |
+| h_concat (concat-heavy) | 988 µs | 77.2 ms | 6.0 ms |
+| h_hostfn (3000 Go-call round trips) | 640 µs | 76.6 ms | 6.2 ms |
+
+Read the table as: cold = compile + instantiate + run once; pooled =
+already-instantiated VM, run again. The 70 ms column is the "short script
+you run a lot" penalty — pooling removes it.
+
+### By shape — compiler vs interpreter
+
+| shape | wasm on wasmtime | wasm on wazero | vs interpreter |
+|---|---|---|---|
+| nsieve (numeric loop + table stores) | 360 ms | 9.10 s | interp ~460–530 ms: **~25% faster** on wasmtime |
+| stringwork (~150 KB text) | 67 ms | 446 ms | interp ~17 ms: ~4× / ~26× slower |
+| fib(30) (call-heavy recursion) | 14.2 s | 7.46 s | interp ~160 ms: ~88× / ~48× slower |
+
+Two honest caveats, both active work rather than laws of nature:
+
+- **The production engine is not there yet.** Wazero's generated code for
+  the C runtime's table/string routines currently runs much slower than
+  wasmtime's (nsieve: 25× apart), so on the pure-Go `host/` path the
+  numeric-loop wins have not yet crossed the interpreter — that codegen
+  gap is the top open performance item.
+- **Call-heavy recursion is the weak shape.** Every Lua→Lua call crosses
+  the host dispatch seam; fib(30) pays it ~1.6 M times. Call-thin loops
+  are the compiler's sweet spot today.
+
+To reproduce: `go run ./cmd/luabench` (interp vs wasm cold/warm on the
+production engine, output-checked); see also `cmd/luawasmc` +
+`cmd/luawasm-run -v` for single-script timing on either engine.
 
 ## Installation
 
