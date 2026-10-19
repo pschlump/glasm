@@ -9,16 +9,16 @@ gopher-lua repo delivers today, specifies what must be built on both sides,
 sequences the work into independently-green sub-milestones, and defines the
 gates.
 
-> **Status (2026-10-19, U8): amended for the 5.5 era.** The 5.2→5.5 upgrade
-> (U0–U7, `docs/Upgrade-from-5.2-to-5.5-of-Lua.md`) moved the language core
-> to stock 5.5.1 and the runtime to the zero-patch `runtime/lua55/` tree
-> (ABI v4), and U8 deleted the 5.1 tree, blobs, and build flavors outright
-> (commit `01037c0`). The §1 inventory rows below name the current
-> artifacts; chapters deeper in (§4/§5, written against the M8-era host
-> package) still carry pre-v4 shapes — the daemon-repo breaking release
-> (D12) rewrites those. The repo/module was also renamed gopher-lua →
-> **glasm** (`github.com/pschlump/glasm`): update paths and import paths
-> accordingly.
+> **Status (2026-10-19, U8 / D12 v1.0.0): current for the 5.5 era.** The
+> 5.2→5.5 upgrade (U0–U7, `docs/Upgrade-from-5.2-to-5.5-of-Lua.md`) moved
+> the language core to stock 5.5.1 and the runtime to the zero-patch
+> `runtime/lua55/` tree (ABI v4); U8 deleted the 5.1 tree, blobs, and
+> build flavors outright (commit `01037c0`), and the D12 breaking release
+> (tagged **v1.0.0**) rewrote §4 as-built against the shipped `host/`
+> package, appendices A/B with it. §5 remains the Ultima-side M8 build
+> plan — executable against v1.0.0 as written. The repo/module was renamed
+> gopher-lua → **glasm** (`github.com/pschlump/glasm`): update paths and
+> import paths accordingly.
 
 **Repos and paths** (both on the same machine, side by side):
 
@@ -243,81 +243,92 @@ cache, a result readback, a host-function seam, and the A9 mutex.
 
 ```
 host/
-├── host.go        Engine, Option, Script, ScriptMeta, compile cache
-├── vm.go          VM: instantiate, Run, Close; the per-image sync.Mutex (A9)
-├── protocol.go    the run protocol (§4.3) — distilled from wazeroengine.go
-├── convert.go     Lua⇄Go value conversion (Tier-3: numbers, strings, bools,
-│                  nil, one-level tables; deep tables read back structurally)
-├── hostfn.go      the Lua→Go function seam (§4.2)
+├── host.go        Engine, Option, Script, compile cache, RegisterGlobal/RegisterValue
+├── vm.go          VM: NewVM/Run/Close, the run protocol, deadline, the per-image lock (A9)
+├── wire.go        the value wire (PT_* tags shared with luawasm55.c): Value, KV, kinds
+├── hostfn.go      the host module's functions: event, wasm_dispatch, host_call, deadline_poll
 ├── blob.go        //go:embed lua55_prod.wasm + SHA-256 pin + import self-check
-└── host_test.go   -race concurrency, caps, deadline, determinism gates
-examples/          eval, evalserver (pool + -race), sharedvm, bench (§6.3 of the design)
+└── *_test.go      host_test (concurrency, caps, deadline, determinism),
+                   compile_race, globals_protection, usedbytes gates
+examples/          eval, evalserver (pool + -race), sharedvm
 ```
 
-The API from design §6, amended with the seams this milestone needs
-(marked ▸):
+The API as shipped at the D12 release (v1.0.0) — `host/host.go` and
+`host/wire.go` are the truth; this is the reading order:
 
 ```go
 package host
 
 func NewEngine(opts ...Option) (*Engine, error)
-// Options: WithRuntimeBlob([]byte) (override + still SHA-checked),
-//          WithWazeroConfig(*wazero.RuntimeConfig), WithMaxCacheEntries(int)
+// Options: WithRuntimeBlob([]byte)      (override; still SHA + surface checked)
+//          WithMemoryBudgetBytes(int64) (rt_set_memlimit BEFORE lnewstate —
+//                                        per-image, not per-run; 0 = unlimited,
+//                                        the blob's 256 MiB linear-memory max
+//                                        is the hard backstop either way)
+//          WithEventSink(func)          (observe every guest print(), args
+//                                        wire-decoded, on the lock goroutine)
+//          WithGlobalsProtection(bool)  (Redis-classic lockdown; enable after
+//                                        all Register* calls — VM creation order
+//                                        is sandbox → host staging → protection)
 
 func (e *Engine) Compile(source []byte, name string) (*Script, error)
-// source → wasm bytes, SHA1-keyed cache inside the Engine. Deterministic
-// for (source, name) — the cache key Redis parity requires.
+// parse.Parse → lua.Compile → luawasm.Compile, SHA1-keyed cache; exactly
+// one *Script pointer per (source, name) — the one-script law and
+// consumer-side per-script pools rely on pointer identity.
 
 type Script struct {
-    SHA1 []byte          // the SCRIPT LOAD / EVALSHA identity (hex in replies)
-    Wasm []byte          // durable artifact; what luawasmc writes
-    Meta ScriptMeta      // proto/line tables for Go-side stack traces
-}
+    SHA1 string    // hex SHA-1 of the source — the SCRIPT LOAD / EVALSHA identity
+    Wasm []byte    // durable artifact; what luawasmc writes
+}                   // + Name() — the chunk name (error position prefixes)
 
 type RunOptions struct {
-    Keys, Argv []string      // staged as the KEYS / ARGV globals
-    Deadline  time.Duration  // watchdog writes ctrl+0x10 (M6d D4); ctx
-                             // cancellation arms the same flag (or wazero's
-                             // Call(ctx) aborts outright — both clean kills)
-    Seed      int64          // host RNG seed (S6; applied post-lnewstate)
-}
+    Keys, Argv []string     // staged as the KEYS / ARGV globals (copies)
+    Deadline   time.Duration // watchdog + host.deadline_poll (§4.4); 0 = off
+    Seed       int64         // math.randomseed(n) in-guest: stock xoshiro256**,
+                             // identical stream on every engine; 0 = keep the
+}                            // VM's stream (fresh VMs: the build-pinned stream)
 
 type HostFunc func(vm *VM, args []Value) ([]Value, error)
-func (e *Engine) RegisterGlobal(table, name string, f HostFunc) error
-  // Installs table.name as a Lua function backed by a Go callback (the
-  // bridge for redis.call/pcall/error_reply/status_reply). Frozen once
-  // the first VM exists; each VM snapshots the registry at creation.
+func (e *Engine) RegisterGlobal(table, name string, f HostFunc) error  // redis.call…
+func (e *Engine) RegisterValue(table, name string, v Value) error      // redis.LOG_* scalars
+  // Both frozen once the first VM exists; each VM snapshots the registry.
 
-// The memory budget is an ENGINE option — WithMemoryBudgetBytes(n) —
-// because rt_set_memlimit must precede lnewstate (M6d D3), i.e. it is
-// per-image, not per-run. 0 = unlimited (the blob's 256 MiB linear-
-// memory max is the hard backstop either way).
+// (The memory budget is an ENGINE option — WithMemoryBudgetBytes — because
+// rt_set_memlimit must precede lnewstate: per-image, not per-run.)
 
 func (e *Engine) NewVM() (*VM, error)
 func (vm *VM) Run(ctx context.Context, s *Script, opt RunOptions) (Result, error)
+func (vm *VM) Kill()              // force the deadline flag (the watchdog surface)
+func (vm *VM) UsedBytes(ctx context.Context) int64
 func (vm *VM) Close() error
 func (e *Engine) Run(ctx context.Context, s *Script, opt RunOptions) (Result, error)
 // Engine.Run = NewVM + Run + Close (S4 default deployment).
 
+// Error taxonomy: *ScriptError is a Lua-level error (ErrValue = the exact
+// wire Value, Line = the raise line); *TrapError is the backend-bug class
+// (log the module SHA, never a script error); ErrReentrant; ErrScriptBound.
+
 // As-built v1 laws (differ from the original sketch):
 // • ONE SCRIPT PER VM IMAGE: proto indices are per-script (0-based) into
-//   a per-image registry, so a second script would collide. Re-running
-//   the SAME script on a VM is the Redis-classic shared-globals mode.
-//   Engine.Run (fresh VM) sidesteps the law entirely.
+//   a per-image registry, so a second script would collide (ErrScriptBound).
+//   Re-running the SAME script on a VM is the Redis-classic shared-globals
+//   mode. Engine.Run (fresh VM) sidesteps the law entirely.
 // • ONE WAZERO RUNTIME PER VM (not shared): module names resolve inside
 //   a runtime's namespace at instantiation (the script imports "rt"), so
 //   concurrently-live images cannot share one runtime. Script COMPILATION
 //   stays cached at the Engine level; only wazero's per-instance module
 //   compilation is repaid per VM.
-// • Measured on darwin/arm64 (interpreter engine — the conservative
-//   case): fresh VM ≈ 44 ms, re-run on a bound image ≈ 60 µs (~700×).
-//   Hot paths pool VMs per script (see examples/evalserver); a pooled-
-//   runtime refinement is the M8e item (R3).
+// • Measured 2026-09 on darwin/arm64 (interpreter engine — the
+//   conservative case): fresh VM ≈ 44 ms, re-run on a bound image ≈ 60 µs
+//   (~700×). Hot paths pool VMs per script (see examples/evalserver); the
+//   U7c bench lanes (cmd/luabench) re-measure the engines end-to-end.
 
 type Result struct { Values []Value }   // script return values, converted
-// Value as built: Kind (wire tag), Num, Str, Pairs []KV, More bool —
-// see host/wire.go. ScriptError carries the exact error Value; TrapError
-// is the backend-bug class (log module SHA + meta, never a script error).
+
+type Value struct { Kind ValueKind; Num float64; Int int64; Str string; Pairs []KV; More bool }
+// Kinds: Nil/False/True/Number/String/Table/Function/Cycle/Deep/Integer(13).
+// Int is LOSSLESS (U6e) — integers never narrow through Num. Constructors:
+// Nil/Bool/Number/Int/String/Table; KindTable truncation flags More.
 ```
 
 `Compile` must not re-derive `testdiff.CompileSource` by importing testdiff
@@ -329,7 +340,7 @@ proto, err := lua.Compile(chunk, name)          // root package, clean
 bin, err := luawasm.Compile(proto, name)        // luawasm, clean
 ```
 
-### 4.2 Runtime additions (C, this repo, rebuilt into the blob) — **as built (M8a)**
+### 4.2 Runtime additions (C, this repo, rebuilt into the blob) — **as built (M8a; ABI v4 since U2d/U6d/U6e)**
 
 Additive to the ABI surface as it stood at M8a (v3; the tree is v4 since
 U2d) — new exports/imports plus one
@@ -341,7 +352,7 @@ the SHA pins (`host/blob.go`, `testdiff/m6c_test.go`), `go clean
 **(a) Lua→Go host functions (`redis.call`) — `rt_hostfn` +
 `host.host_call`.** Marshaling rides the *tag-first wire protocol* the
 blob already speaks for print/globals events (`PT_*` tags,
-`runtime/luawasm.c` `enc_value`), not raw TValue cells — strings travel
+`runtime/luawasm55.c`'s wire encoder), not raw TValue cells — strings travel
 inline as bytes and table arguments arrive fully expanded, so the Go side
 needs zero layout knowledge and `redis.error_reply({err=...})`-style
 table arguments are visible to the bridge:
@@ -376,10 +387,13 @@ argsPtr, argsLen, retPtr, retCap)`, and decodes returns from a dedicated
 
 The Go side (`host/hostfn.go`) implements `host.host_call`: decode args →
 `HostFunc` (panics contained) → encode results. Trampolines run on the
-goroutine holding the VM mutex — no new deadlock surface (A9 law). The
-prod blob import list grew from five to six; `testdiff/m6c_test.go` and
-`host/blob.go` pin the new set in lockstep, and every dev-engine host in
-`testdiff/` gained a refusing `host_call` stub.
+goroutine holding the VM mutex — no new deadlock surface (A9 law). On the
+zero-wasi prod flavor the import set settled at exactly three —
+`host.{event, wasm_dispatch, host_call}` (U6d; the RNG imports retired at
+U3b: stock xoshiro256\*\* runs in-guest) — pinned in lockstep by
+`testdiff/m6c_test.go` and `host/blob.go`. The differential engines speak
+the seam too (wazero fully; the wasmtime matrix leg stages a wire refusal
+value).
 
 **(b) Result readback — `rt_encode_value` (replaces the originally
 sketched `rt_value_tostring`).** Rather than teaching the host the
@@ -411,18 +425,20 @@ and the full corpora re-ran green on the new contract.
 
 ### 4.3 The run protocol (normative step list)
 
-Every step below is line-anchored to the working implementation
-(`testdiff/wazeroengine.go`). The host package does exactly this, minus the
-differential-harness event log:
+The living reference implementation is `host/vm.go` (productized from
+`testdiff/wazeroengine.go`, the differential engine). Steps below are the
+v1.0.0 (ABI v4) protocol; the `:NNN` anchors still point into the M8-era
+`wazeroengine.go` and have drifted — trust `host/vm.go` over any anchor:
 
 1. **Runtime config**: `wazero.NewRuntimeConfig().WithCoreFeatures(
    api.CoreFeaturesV2 | experimental.CoreFeaturesExceptionHandling)` —
    non-negotiable for the EH-dialect blob (`:141-143`). One `wazero.Runtime`
    per `Engine`, `Close` on engine shutdown.
-2. **Host module** `"host"`: the five functions (+ `host_call`, §4.2a)
-   (`:202-213`). `event` receives `kind/ptr/len` and reads guest memory via
-   `rtInst.Memory().Read`. RNG state is a host-side `*rand.Rand` guarded by
-   the VM mutex.
+2. **Host module** `"host"`: `event`, `wasm_dispatch`, `host_call`, and
+   `deadline_poll` (§4.4) — `host/hostfn.go` implements all four. `event`
+   receives `kind/ptr/len` and reads guest memory via `Memory().Read`. No
+   RNG imports: the stock xoshiro256\*\* stream lives in the guest
+   (build-pinned; `RunOptions.Seed` reseeds via `math.randomseed`).
 3. **Instantiate the runtime blob** as module `"rt"` with a bare
    `ModuleConfig` (the prod blob needs **no** WASI, no FS, no stdio — its
    absence is the sandbox guarantee; `wasm.HasWASIImports` self-check at
@@ -433,8 +449,9 @@ differential-harness event log:
 5. **Caps before state**: `rt_set_memlimit` from the engine's
    `WithMemoryBudgetBytes` —
    must precede `lnewstate` so the whole VM lifetime counts (`:237-241`).
-6. `lnewstate` → `rt_set_state(L)` (`:243`, `:272`). Apply the run seed
-   *after* `lnewstate` (which reseeds the host RNG to 42) (`:249-253`).
+6. `lnewstate` → `rt_set_state(L)` (the frozen-GC law: pool/frame cells
+   are not GC roots — ledger rows 61/93). `RunOptions.Seed` applies as
+   `math.randomseed(n)` in the guest.
 7. `rt_sandbox(1)` — globals lockdown; on the prod blob it is
    belt-and-suspenders (`:279-283`).
 8. **GC stop** (v1 law: register cells are not GC roots):
@@ -445,24 +462,33 @@ differential-harness event log:
    `testdiff/wasmengine.go:61`). *Alternative for later:* build the tables
    via `rt_newtable`/`rt_intern`/`rt_settable` directly; v1 takes the
    ldostring path because it is the proven one.
-10. `rt_set_dialect(1)` — gopher error wording, byte-exact vs the interp
-    oracle (`:299`). `rt_abi_version()` must return 3 (`:302-308`).
+10. **ABI check**: `rt_abi_version()` must return **4**. (The v3 dialect
+    layer — `rt_set_dialect` — retired at U3: every 5.5 engine speaks
+    stock `luaO_*` texts natively; no dialect call exists on v4.)
 11. **Register host functions** (new, §4.2a): `rt_hostfn("redis", "call",
     0)` etc. — after sandbox, before init.
 12. `luawasm_init(2)` on the script instance; read `gFrameCells`;
     `rt_frame_alloc(frameCells*16)` (`:309-316`).
-13. **Deadline watchdog**: `rt_ctrl_addr()` → flag address; `time.AfterFunc`
-    writes the 4-byte LE `1` into linear memory from the timer goroutine
-    (safe: `Memory.Write` is a plain buffer copy, no engine state; guard
-    with an `atomic` done-flag against the teardown race — M6e soak fix)
-    (`:322-335`). Guest loop back-edges poll the flag and raise
-    `rt_deadline`'s ordinary Lua error.
-14. `lua_main(frame)` (`:337`). A wasm **trap** here (as opposed to a `-1`
-    status) is, by contract, always a backend bug — log module SHA + meta,
+13. **Deadline, three layers**: (a) the `ctx` passed to `lua_main` (wazero
+    aborts the call); (b) the watchdog — `rt_ctrl_addr()` → flag address,
+    `time.AfterFunc` writes the 4-byte LE `1` into linear memory from the
+    timer goroutine (a plain buffer copy, no engine state; an `atomic`
+    done-flag guards the teardown race); (c) **`host.deadline_poll`** —
+    the emitted script module polls the import every 2²⁰-th block
+    transition and raises `rt_deadline`'s ordinary Lua error at the poll.
+    Layer (c) is the durable one: a Go mark-STW landing inside a watchdog
+    window freezes the timer goroutine before its write (row 99 — the
+    GC×JIT wedge), while the poll's import call is a safe point that lets
+    the STW drain (row 100, U7a). **`deadline_poll` is an instantiation
+    contract for every host that instantiates emitted modules.** `Kill()`
+    forces the same flag from Go.
+14. `lua_main(frame)`. A wasm **trap** here (as opposed to a `-1`
+    status) is, by contract, always a backend bug — log the module SHA,
     surface as an internal error, never as a script error.
 15. **Error path** (status ≠ 0): `rt_err_stage_copy` into a 4 KB frame
-    buffer → message bytes; non-string errors via `rt_err_value_ptr` and
-    the 16-byte TValue render (`:341-360`).
+    buffer → message bytes; non-string errors via `rt_err_value_ptr`,
+    rendered through `rt_encode_value` (the same wire — `*ScriptError`
+    carries it as `ErrValue`, plus the raise `Line`).
 16. **Result path** (status ≥ 0 = nret): read nret cells at `frame+0..`,
     decode per §4.2b (each cell through `rt_encode_value`). Convert
     to `Result` (§5.6 does RESP after this point).
@@ -474,10 +500,11 @@ differential-harness event log:
   past the cap raises a clean `rt_oom`-class Lua error the host converts to
   a script error — never a trap, never host OOM. Ultima default cap: S8
   config (§5.1).
-- **Deadline**: soft (BUSY to others) + hard (watchdog kill) per S5. The
-  hard kill lands at the next loop back-edge — a script doing a huge
-  non-looping computation between back-edges is bounded additionally by
-  the Ultima-side `ctx` cancel → treat as a refused run.
+- **Deadline**: soft (BUSY to others) + hard kill per S5. The hard kill
+  lands at the next poll — the in-guest `deadline_poll` backstop (row 100)
+  plus the watchdog's flag write; a Go mark-STW can freeze the bare
+  watchdog mid-window (row 99), so the poll is the layer to rely on.
+  Everything else is bounded by the `ctx` cancel → treat as a refused run.
 - **Determinism**: identical `(script, KEYS, ARGV, Seed)` ⇒ byte-identical
   effects and replies (D5 gates already prove 5×-identical runs on the
   corpora; the host package's tests re-prove it through the public API).
@@ -492,6 +519,7 @@ eng.RegisterGlobal("redis", "call",  bridge.call)      // aborts script on error
 eng.RegisterGlobal("redis", "pcall", bridge.pcall)     // returns {err=...} table
 eng.RegisterGlobal("redis", "error_reply",  bridge.errorReply)
 eng.RegisterGlobal("redis", "status_reply", bridge.statusReply)
+eng.RegisterValue("redis", "LOG_WARNING", host.Int(3))   // the LOG_* scalars
 ```
 
 `KEYS`/`ARGV` are plain globals staged by the protocol (step 9) — Redis
@@ -507,7 +535,7 @@ parity. (`redis.keys`/`redis.argv` clones are a follow-up; not M8.)
   graph, the build fails loudly instead of silently shipping C.
 - Optional belt-and-suspenders (only if import-graph accidents actually
   happen): split `host/` into its own Go module
-  `github.com/pschlump/gopher-lua/host` requiring only wazero, with
+  `github.com/pschlump/glasm/host` requiring only wazero, with
   `replace` directives for the parent. Not needed while the grep-clean
   property holds.
 
@@ -525,10 +553,12 @@ parity. (`redis.keys`/`redis.argv` clones are a follow-up; not M8.)
 - Chaos host: a `redis.call` stub returning wrong types / huge replies /
   errors mid-iteration — engine survives all (host-behavior tests of the
   conversion layer).
-- Blob: SHA pin + `wasm.Imports` self-check (no WASI, exactly the host
-  imports) mirrored from `testdiff/m6c_test.go:29-77`.
+- Blob: SHA pin + `wasm.Imports` self-check (no WASI, exactly the three
+  host.* imports) mirrored by `testdiff/m6c_test.go` and run at every
+  `NewEngine`.
 - Full existing repo gates stay green after the §4.2 blob rebuild:
-  `make test`, the four `testdiff` gates, `_cli-tests` (wasmtime + `WAZERO=1`).
+  `make test`, the corpus gates, `_cli-tests` (wasmtime + `WAZERO=1`).
+  The host gate itself: `go test ./host/` plain + `-race`, twice.
 
 ---
 
@@ -536,10 +566,10 @@ parity. (`redis.keys`/`redis.argv` clones are a follow-up; not M8.)
 
 ### 5.1 Module wiring and config
 
-- `go.mod`: `require github.com/pschlump/gopher-lua <version>` + a
-  `replace github.com/pschlump/gopher-lua => ../gopher-lua` while
-  developing side-by-side (same pattern as pluto). Drop the replace when
-  the host package is tagged.
+- `go.mod`: `require github.com/pschlump/glasm v1.0.0` + a
+  `replace github.com/pschlump/glasm => ../glasm` while developing
+  side-by-side (same pattern as pluto). The tag exists — drop the
+  replace when you want the pinned artifact.
 - New config group (defaults shown; JSON + `default:` tags + `$ENV$` per
   the exsms pattern, §8 of the Ultima design):
 
@@ -944,8 +974,7 @@ func (vm *VM) run(ctx context.Context, s *Script, opt RunOptions) (Result, error
     call(rtInst, "rt_sandbox", 1)
     ldostring("collectgarbage('stop')")                      // v1 GC law
     ldostring("KEYS=" + luaTableLit(opt.Keys) + ";ARGV=" + luaTableLit(opt.Argv))
-    call(rtInst, "rt_set_dialect", 1)
-    if v, _ := call(rtInst, "rt_abi_version"); int32(v[0]) != 3 { /* refuse */ }
+    if v, _ := call(rtInst, "rt_abi_version"); int32(v[0]) != 4 { /* refuse (v3's rt_set_dialect is gone — U3) */ }
     // hostfns registered at NewVM (§4.2a, rt_hostfn per name)
     call(vm.scriptInst, "luawasm_init", 2)
     frame := frameAlloc(scriptInst.Global("gFrameCells") * 16)
@@ -957,26 +986,34 @@ func (vm *VM) run(ctx context.Context, s *Script, opt RunOptions) (Result, error
             if !done.Load() { mem.Write(flagAddr, []byte{1, 0, 0, 0}) }
         })
     }
+    // plus host.deadline_poll: the guest polls every 2^20-th block
+    // transition — the STW-proof layer (§4.3 step 13); the emitted
+    // module imports it, so every instantiating host must define it
     st, err := call(vm.scriptInst, "lua_main", frame)        // nret or <0 (§4.2c)
     done.Store(true)
-    if err != nil { /* trap = backend bug: log SHA+meta */ }
+    if err != nil { /* trap = backend bug: log the module SHA */ }
     if int32(st[0]) < 0 { return Result{}, readStagedError(rtInst, mem) }
     return readResults(rtInst, mem, frame, int32(st[0]))     // §4.2b rt_encode_value
 }
 ```
 
-## Appendix B — TValue cheat sheet (wasm32, frozen ABI v3)
+## Appendix B — the value wire cheat sheet (PT_* tags; ABI v4)
 
-- Cell = 16 bytes at `frame+16*k`; value at offset 0, tag byte at offset 8.
-- Tags: `0` nil, `1` boolean (byte at 0), `3` number (LE f64 at 0),
-  `4` string (ref at 0 — read bytes via `rt_encode_value`), `5` table,
-  `6` function.
+The only value contract a host needs. Cells themselves are 16-byte
+variant-tag TValues — the blob's business (`runtime/rt_abi55.h`); the
+host sees values exclusively through the wire: `rt_encode_value`,
+`host.host_call` args/results, and event payloads.
+
+- Tags: `0` nil, `1` false, `2` true, `3` number (LE f64), `4` string
+  (u32 len + bytes), `5` table (u32 n + n × key value), `6` function,
+  `12` more (an args-side table was truncated — `Value.More`),
+  `13` integer (LE i64 — lossless, U6e).
 - `lua_main` return: `n ≥ 0` results staged at `frame+0..16n`;
   `-1` error (TValue staged in runtime → `rt_err_stage_copy` /
   `rt_err_value_ptr`); `-2` tailcall sentinel; `-3` host refused.
 - Host writes: `rt_mknumber/mkbool/mknil`, `rt_intern(ptr,len)`,
-  `rt_newtable/gettable/settable/getglobal/setglobal` — the same surface
-  `testdiff/rtseam_test.go` exercises.
+  `rt_newtable/gettable/settable/getglobal/setglobal` — the surface
+  `runtime/tests/rt_native55_test.c` exercises natively.
 
 ## Appendix C — Redis 7.2.7 probe list (turn each into a differential row)
 

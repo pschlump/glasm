@@ -511,8 +511,12 @@ The differential harness logs an opcode histogram per script (interpreter side).
 > with its gates, and `cmd/clua-run` (−29,974 lines). The C-Lua differential
 > oracle is `clua55` (stock 5.5.1); ABI/seam unit coverage is
 > `runtime/tests/rt_native55_test.c` (native, plain/ASan/UBSan) plus the
-> differential matrix. Remaining U8: the daemon host-package release (D12)
-> and the D8 5.5.x pin check.
+> differential matrix. D12 then closed the milestone: the breaking
+> host-API release tagged **v1.0.0** (package identity re-pinned —
+> `glasm 1.0.0`, `_GLASM_VERSION`; the How-To §4 host-package chapter
+> rewritten as-built), and the D8 5.5.x pin check resolved (5.5.1 still
+> current per lua.org, 2026-10-19 — the pin stands). **U8 complete: the
+> 5.2→5.5 program (U0–U8) is closed.**
 
 **Total: ~3.5–5.5 months** solo (consistent with the plan doc's estimate). M1 before M4 is deliberate: the differential harness existing *before* the backend is what makes every later milestone measurable. M2 before M3 is deliberate too: a whole-C-Lua-in-wasm oracle de-risks the runtime port with zero new compiler code.
 
