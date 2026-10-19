@@ -160,6 +160,15 @@ var scripts = []scriptDef{
 	{"h_tablechurn.lua", 20, false, true},
 	{"h_concat.lua", 20, false, true},
 	{"h_hostfn.lua", 40, true, false},
+	// U9 call-path lanes: h_fib is the seam worst case (the README
+	// fib(30) row); h_nsieve tracks the wazero rt-table codegen gap;
+	// h_callret isolates the per-call seam without recursion;
+	// h_tco rides the M5c staged tailcall. Low maxCold — fib(30)
+	// alone is ~7.5 s per wasm run.
+	{"h_fib.lua", 2, false, true},
+	{"h_nsieve.lua", 4, false, true},
+	{"h_callret.lua", 8, false, true},
+	{"h_tco.lua", 8, false, true},
 }
 
 var (
