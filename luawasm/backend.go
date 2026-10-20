@@ -70,6 +70,13 @@ func Compile(main *lua.FunctionProto, chunkName string) ([]byte, error) {
 	b.layoutProtos(protos)
 	b.collectTBCNames()
 	b.declareImports()
+	// U9c (row 104): reserve lua_dispatch's function index BEFORE the
+	// bodies — the direct-dispatch arm inside emitCall/emitTForcall calls
+	// it, and the index must already be fixed while the protos are being
+	// lowered (the body itself is written later, in emitDispatch below —
+	// NewFunction reserves the slot; the builder writes into the pointer)
+	b.dispatchF = b.m.NewFunction([]wasm.ValueType{wasm.I32, wasm.I32, wasm.I32, wasm.I32, wasm.I32}, []wasm.ValueType{wasm.I32})
+	b.dispatchFn = b.dispatchF.Idx()
 	for _, pi := range b.protos {
 		fe := b.newFuncEmitter(pi.proto)
 		fe.emitBody()
@@ -93,17 +100,19 @@ func collectProtos(p *lua.FunctionProto) []*lua.FunctionProto {
 }
 
 type backend struct {
-	m          *wasm.Module
-	main       *lua.FunctionProto
-	chunkName  string
-	imports    map[string]uint32
-	gKCells    uint32 // mutable global: constants cells base
-	gDeadline  uint32 // mutable global: the deadline flag's address (U6b)
+	m                *wasm.Module
+	main             *lua.FunctionProto
+	chunkName        string
+	imports          map[string]uint32
+	gKCells          uint32 // mutable global: constants cells base
+	gDeadline        uint32 // mutable global: the deadline flag's address (U6b)
 	gDeadlinePollCtr uint32 // mutable global: the row-100 backstop's back-edge counter (U7a)
-	protos     []protoInfo
-	protoIdx   map[*lua.FunctionProto]int // proto → dispatch index
-	protoFuncs []*wasm.Function           // dispatch idx → wasm function
-	dispatchFn uint32                     // lua_dispatch's function index
+	gDispFrame       uint32 // mutable global: lua_dispatch's EXIT frame (U9c, row 104)
+	protos           []protoInfo
+	protoIdx         map[*lua.FunctionProto]int // proto → dispatch index
+	protoFuncs       []*wasm.Function           // dispatch idx → wasm function
+	dispatchF        *wasm.Function             // lua_dispatch (shell reserved before the bodies — U9c)
+	dispatchFn       uint32                     // lua_dispatch's function index
 	// tbcNames (U4f): the OP_TBC variable names, init-registered via
 	// rt_name_put in this order — the OP_TBC lowering embeds the index
 	tbcNames []string
@@ -241,6 +250,7 @@ func (b *backend) declareImports() {
 	iiiiiiii := []wasm.ValueType{wasm.I32, wasm.I32, wasm.I32, wasm.I32, wasm.I32, wasm.I32, wasm.I32, wasm.I32}
 	i32f64 := []wasm.ValueType{wasm.I32, wasm.F64}
 	i32i64 := []wasm.ValueType{wasm.I32, wasm.I64}
+	i64v := []wasm.ValueType{wasm.I64}
 
 	// ABI v4 (runtime/rt_abi55.h). Dropped vs v3: rt_compat_arg (a
 	// 5.1-ism), the dialect layer (U3), and rt_mknil (inline tag store).
@@ -293,14 +303,27 @@ func (b *backend) declareImports() {
 		"rt_tail_nargs":    m.ImportFunc("rt", "rt_tail_nargs", nil, i32v),
 		"rt_tail_funcell":  m.ImportFunc("rt", "rt_tail_funcell", nil, i32v),
 		"rt_tail_restage":  m.ImportFunc("rt", "rt_tail_restage", nil, i32v),
-		"rt_ctrl_addr":     m.ImportFunc("rt", "rt_ctrl_addr", nil, i32v),
-		"rt_deadline":      m.ImportFunc("rt", "rt_deadline", nil, i32v),
-		"deadline_poll":    m.ImportFunc("host", "deadline_poll", nil, i32v),
+		// U9c: the direct arm saves the frame region itself — the first
+		// backend consumer of the cursor (imp() is a silent map lookup; a
+		// missing name would emit call 0)
+		"rt_frame_cursor": m.ImportFunc("rt", "rt_frame_cursor", nil, i32v),
+		"rt_ctrl_addr":    m.ImportFunc("rt", "rt_ctrl_addr", nil, i32v),
+		"rt_deadline":     m.ImportFunc("rt", "rt_deadline", nil, i32v),
+		// U9c (row 104): the direct-dispatch helpers — a compiled-callee
+		// OP_CALL/TFORCALL runs lua_dispatch in-module (probe -> push frame
+		// -> wasm call -> retire); everything else declines to rt_call_addr.
+		"rt_dd_callee":  m.ImportFunc("rt", "rt_dd_callee", i32v, i64v),
+		"rt_dd_enter":   m.ImportFunc("rt", "rt_dd_enter", iiii, i32v),
+		"rt_dd_ret":     m.ImportFunc("rt", "rt_dd_ret", iiiiii, i32v),
+		"rt_dd_err":     m.ImportFunc("rt", "rt_dd_err", ii, i32v),
+		"rt_dd_reset":   m.ImportFunc("rt", "rt_dd_reset", nil, nil),
+		"deadline_poll": m.ImportFunc("host", "deadline_poll", nil, i32v),
 	}
 	b.gKCells = m.GlobalI32(0, true)
 	m.ExportGlobal("gKCells", b.gKCells)
 	b.gDeadline = m.GlobalI32(0, true)
 	b.gDeadlinePollCtr = m.GlobalI32(deadlinePollInterval, true)
+	b.gDispFrame = m.GlobalI32(0, true)
 	m.ImportMemory("rt", "memory", 1, 0)
 }
 
@@ -490,9 +513,7 @@ func (b *backend) emitInit() {
 // OUT to the -2 check (never to the loop label — that would re-dispatch
 // the same proto forever); default: unknown idx → host-refused (-3).
 func (b *backend) emitDispatch() {
-	m := b.m
-	f := m.NewFunction([]wasm.ValueType{wasm.I32, wasm.I32, wasm.I32, wasm.I32, wasm.I32}, []wasm.ValueType{wasm.I32})
-	b.dispatchFn = f.Idx()
+	f := b.dispatchF // the shell Compile reserved before the bodies (U9c)
 	const lNret uint32 = 5
 	// U9a (row 103): 6 = the entry frame — the M5c restage loop below
 	// overwrites the frame param (local 1) with each restaged successor
@@ -576,6 +597,16 @@ func (b *backend) emitDispatch() {
 	f.End()
 	f.End()
 	f.End()
+	// U9c (row 104): publish the EXIT frame for direct callers. The M5c
+	// restage loop above may have moved local 1 off the block the direct
+	// arm's rt_dd_enter allocated, so the arm reads results through this
+	// global — immediately after its $lua_dispatch returns, before any
+	// other dispatch can publish over it (a nested lua_dispatch publishes
+	// at ITS exit, which precedes this callee's own exit publish; the
+	// read that matters always follows the immediate callee's final
+	// publish). Trampoline-driven dispatches publish harmlessly — no
+	// direct arm is mid-flight across them.
+	f.LocalGet(1).GlobalSet(b.gDispFrame)
 	f.LocalGet(lNret)
 	f.End()
 	f.Export("lua_dispatch")
@@ -600,6 +631,12 @@ func (b *backend) emitDispatch() {
 func (b *backend) emitMain() {
 	f := b.m.NewFunction([]wasm.ValueType{wasm.I32}, []wasm.ValueType{wasm.I32})
 	f.Local(wasm.I32) // 1: the dispatch status
+	// U9c (row 104): heal the direct-dispatch depth counter at the run
+	// boundary — a trap that surfaced HERE (a main-level direct chain that
+	// exhausted the engine stack) unwound lua_main past every wasm-side
+	// rt_dd_ret/rt_dd_err decrement, and a pooled VM's next Run must start
+	// from the full budget.
+	f.Call(b.imp("rt_dd_reset"))
 	// U5e (row 60): plant the main chunk's bottom shadow entry — keyed
 	// &base_ci (lua_main runs cl=0 with no CallInfo, so stock
 	// lua_getstack cannot resolve main level) and bound to main's line

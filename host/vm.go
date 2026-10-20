@@ -105,8 +105,8 @@ type VM struct {
 	hostVals  []registeredVal // snapshot of the engine value registry
 	eventSink func(vm *VM, args []Value)
 
-	script     *Script         // bound at first Run (one-script law)
-	scriptInst api.Module      // nil until then
+	script     *Script    // bound at first Run (one-script law)
+	scriptInst api.Module // nil until then
 	// U9b: the dispatch seam's per-call costs, hoisted into a
 	// DEPTH-INDEXED pool. In wazero v1.12 every ExportedFunction lookup
 	// builds a fresh callEngine — private execCtx AND a fresh machine
@@ -123,12 +123,12 @@ type VM struct {
 	// CallWithStack pattern; the arg slices stay per-level because
 	// wazevo keeps a raw pointer into the caller's slice live across the
 	// whole entrypoint execution.
-	dispatchFns     []api.Function
-	dispatchStacks  [][]uint64
-	dispatchDepth   int
-	frame      uint32          // the script's frame cells (gFrameCells)
-	inAddr     uint32          // cached linbuf staging address (1 MiB)
-	curCtx     context.Context // in-flight Run's ctx (nested dispatches)
+	dispatchFns    []api.Function
+	dispatchStacks [][]uint64
+	dispatchDepth  int
+	frame          uint32          // the script's frame cells (gFrameCells)
+	inAddr         uint32          // cached linbuf staging address (1 MiB)
+	curCtx         context.Context // in-flight Run's ctx (nested dispatches)
 
 	// deadlineAt is the in-flight Run's absolute deadline (UnixNano, 0 =
 	// none) — the row-100 backstop's answer source. Under row 99's wedge
@@ -519,6 +519,16 @@ func (vm *VM) Run(ctx context.Context, s *Script, opt RunOptions) (res Result, e
 	status, err := main.Call(ctx, u32v(int32(vm.frame)))
 	vm.inRun.Store(false)
 	if err != nil {
+		// U9c (row 104): a main-level direct-dispatch chain that exhausts
+		// the ENGINE stack unwinds lua_main itself — no host boundary sat
+		// under it to map the trap to the blob's clean catchable "stack
+		// overflow" (the RTW_STACKTRAP arm), and the wasm-side tbc closes
+		// died with the frame. Map it here: main-frame close hygiene, then
+		// the same stock wording a caught in-guest overflow raises.
+		if strings.Contains(err.Error(), "call stack exhausted") {
+			vm.call0(ctx, "rt_close_err", u32v(int32(vm.frame))) // hygiene only
+			return Result{}, &ScriptError{ErrValue: String("stack overflow")}
+		}
 		// a trap is always a backend bug class (design §6.4): wrap it so
 		// the daemon can log module SHA + meta and answer with an
 		// internal error, never a script error

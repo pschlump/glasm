@@ -53,6 +53,7 @@ type funcEmitter struct {
 	lTop, lBlk, lSt, lT0, lT1 uint32 // i32
 	lVlo, lVhi, lV2           uint32 // i64 (copy + shift temporaries)
 	lF0                       uint32 // f64
+	lDd0, lDd1                uint32 // i32 (U9c: direct dispatch — saved cursor, callee frame)
 
 	blocks  map[int]int  // pc -> block id
 	blockPC []int        // block id -> start pc
@@ -64,6 +65,7 @@ func (b *backend) newFuncEmitter(p *lua.FunctionProto) *funcEmitter {
 	f.Local(wasm.I32).Local(wasm.I32).Local(wasm.I32).Local(wasm.I32).Local(wasm.I32) // 4..8
 	f.Local(wasm.I64).Local(wasm.I64).Local(wasm.I64)                                 // 9,10,11
 	f.Local(wasm.F64)                                                                 // 12
+	f.Local(wasm.I32).Local(wasm.I32)                                                 // 13,14 (U9c)
 	return &funcEmitter{
 		b: b, f: f, proto: p,
 		pi:     b.protoInfoOf(p),
@@ -72,7 +74,7 @@ func (b *backend) newFuncEmitter(p *lua.FunctionProto) *funcEmitter {
 		isMain: p == b.main,
 		code:   p.Code,
 		lTop:   4, lBlk: 5, lSt: 6, lT0: 7, lT1: 8,
-		lVlo: 9, lVhi: 10, lV2: 11, lF0: 12,
+		lVlo: 9, lVhi: 10, lV2: 11, lF0: 12, lDd0: 13, lDd1: 14,
 	}
 }
 

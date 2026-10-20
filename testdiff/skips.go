@@ -20,6 +20,8 @@ func CorpusSkips(dir string) map[string]string {
 		return ledgeredErrSkips
 	case "_u5":
 		return u5WasmSkips
+	case "_u9":
+		return u9WasmSkips
 	default:
 		return nil
 	}
@@ -61,6 +63,17 @@ var u5WasmSkips = map[string]string{
 	// U6a closed row 86 (extras below the window + rt_call_addr): var07/
 	// vgap01/limits01 run on the wasm legs now.
 }
+
+// u9WasmSkips (U9c, row 104): _u9 cases whose interp↔wasm divergence
+// is ruled. The oracle gate (TestU9Gate) runs the corpus whole, zero
+// skips. Empty as of the stack-presence fix: every direct frame now
+// pushes a minimal real CallInfo + sea entry (row 104), so the level
+// walk counts direct frames exactly like trampoline ones — dd02 ran
+// un-skipped and byte-exact after it (and e003/e005/e011 below came
+// back the same way). Only past the Lua-stack headroom do direct frames
+// run ci-less (the ruled degraded posture, row 104) — no corpus case
+// pins introspection at that depth.
+var u9WasmSkips = map[string]string{}
 
 // ProdBlobSkips (U6f row 98, exported at U8): the row-95 prod-flavor
 // skips — the compiled-out surface of lua55_prod.wasm — layered over the
@@ -128,12 +141,18 @@ var ledgeredErrSkips = map[string]string{
 	// U5e landed the row-60 error-position seam (rt_seam55.c: shadow line
 	// stack + interposed luaL_where/lua_error/luaG_runerror): error()'s
 	// level walk now resolves compiled frames through the shadow stack —
-	// e003/e005/e011 run un-skipped and byte-exact. What remains: level-0
-	// raises still gain the rt prefix (luaB_error's level-0 arm calls no
-	// where(), so the seam's nopos verdict never fires — the position
-	// would have to come from interposing the static luaB_error itself),
-	// and nil error objects render "<no error object>" + the rt prefix
-	// where the interp renders "nil".
+	// e003/e005/e011 ran un-skipped and byte-exact until U9c, were
+	// re-ruled under row 104 (a direct frame had no CallInfo and pushed
+	// no shadow entry), and came BACK byte-exact with row 104's
+	// stack-presence fix: every direct frame now pushes a minimal real
+	// CallInfo + sea entry, so the level walk counts it exactly like a
+	// trampoline frame (the three entries stay listed here only in this
+	// comment). What remains from U5e: level-0 raises still gain the rt
+	// prefix (luaB_error's level-0 arm calls no where(), so the seam's
+	// nopos verdict never fires — the position would have to come from
+	// interposing the static luaB_error itself), and nil error objects
+	// render "<no error object>" + the rt prefix where the interp renders
+	// "nil".
 	"e001.lua": "level-0 error gains the rt prefix on wasm — row 60 seam (level-0 arm calls no where)",
 	"e006.lua": "nil error object renders differently on wasm — row 60 seam (U5 re-pin)",
 	"e007.lua": "nil error object renders differently on wasm — row 60 seam (U5 re-pin)",

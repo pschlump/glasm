@@ -369,18 +369,32 @@ rt_addr rt_tail_restage(void);
    else declines to rt_call_addr unchanged.
    rt_dd_callee is the fused probe: (cl record << 32) | (mdidx+1), 0 =
    decline (exact on wasm32; native tests mask the high word).
-   rt_dd_enter takes the probe's low word and the args at their natural
-   R(A+1).. cells; 0 = error staged (budget/OOM) — the caller returns
-   -1. rt_dd_ret stages want-truncated/nil-padded results at R(A)
+   rt_dd_enter takes the probe's low word, the args at their natural
+   R(A+1).. cells, and the call site's line (rt_call_addr's convention —
+   a line number, not a cell); 0 = error staged (budget/OOM — the caller
+   returns -1). The budget arm stages "stack overflow" WITH that
+   position: a budget hit rides a -1 cascade that never crosses an
+   rt_run catch (the old C-stack guard's prefix source — luaG_runerror's
+   isLua arm skips compiled frames), so the prefix is built here or the
+   error surfaces bare. rt_dd_enter also pushes the callee's stack
+   presence: a minimal real CallInfo (func slot = the closure cell,
+   CIST_C, CCMT bits 0 — a direct callee passed through no __call chain,
+   so getinfo's extraargs answers 0, the interp's answer) plus a sea
+   entry keyed by it, so stock lua_getstack/getinfo and the seam's
+   luaL_where resolve direct frames exactly like trampoline ones
+   (luaE_extendCI's non-raising arm: on OOM the level runs ci-less, the
+   degraded posture). rt_dd_ret stages want-truncated/nil-padded
+   results at R(A)
    (argcells-16) from lua_dispatch's EXIT frame, restores the cursor,
    rebinds the caller's line cell, and returns rt_call_addr's success
    encoding (w<0 ? -(nres+1) : 0). rt_dd_err closes the dying callee
    frames (the unwinding-boundary form) and keeps the error staged for
-   the caller's -1. rt_dd_reset (lua_main's prologue) clears the C
-   depth counter at run boundaries — a trap that surfaced at main
-   leaves it high on a pooled VM. */
+   the caller's -1. rt_dd_ret/rt_dd_err pop the presence; rt_dd_reset
+   (lua_main's prologue) unwinds every leaked level at run boundaries —
+   a trap that surfaced at main leaves them pushed on a pooled VM. */
 int64_t rt_dd_callee(rt_addr funcell);
-rt_addr rt_dd_enter(int32_t mdidx1, rt_addr argcells, int32_t nargs);
+rt_addr rt_dd_enter(int32_t mdidx1, rt_addr argcells, int32_t nargs,
+                    int32_t line);
 int32_t rt_dd_ret(rt_addr saved, rt_addr argcells, rt_addr frame,
                   int32_t nret, int32_t want, rt_addr linecell);
 int32_t rt_dd_err(rt_addr saved, rt_addr linecell);

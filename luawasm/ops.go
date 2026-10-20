@@ -579,7 +579,7 @@ func (fe *funcEmitter) emitCall(A, B, C, pc int, tail bool) {
 	// below on the same operands; its results then flow through the
 	// RETURN B=0 sentinel that follows (top = A + count).
 	if tail {
-		fe.cellAddr(A)  // funcell (callee in place)
+		fe.cellAddr(A)     // funcell (callee in place)
 		fe.cellAddr(A + 1) // argcells (natural positions)
 		f.LocalGet(fe.lT0)
 		fe.varargBase() // the BLOCK address — staging restores the
@@ -588,6 +588,72 @@ func (fe *funcEmitter) emitCall(A, B, C, pc int, tail bool) {
 		f.LocalGet(fe.lSt).I32Const(0).I32GeS().If(wasm.Void)
 		f.I32Const(-2).Return()
 		f.End()
+	}
+
+	// U9c (row 104): direct in-module dispatch — a NON-TAIL call whose
+	// callee is one of THIS module's compiled closures runs the module's
+	// own lua_dispatch here: probe -> push frame -> wasm call -> retire.
+	// No C precall, no protect layer, no host seam crossing. The probe's
+	// low word is mdidx+1 (≥1 whenever the probe is nonzero), so
+	// low32 <u len(protos)+1 both bounds the index to this module and
+	// excludes foreign-registry closures (a blob shared across modules
+	// routes those through their own trampoline — the decline). Declined
+	// shapes (C functions, __call'd objects, tail calls) take the
+	// unchanged rt_call_addr fallback on the same operands.
+	if !tail {
+		fe.cellAddr(A)
+		f.Call(fe.b.imp("rt_dd_callee")).LocalSet(fe.lV2)
+		f.LocalGet(fe.lV2).I64Const(0).I64Ne()
+		f.LocalGet(fe.lV2).I32WrapI64().
+			I32Const(int32(len(fe.b.protos) + 1)).I32LtU()
+		f.I32And()
+		f.If(wasm.Void)
+		{
+			// saved = rt_frame_cursor() — the region retire restores to
+			f.Call(fe.b.imp("rt_frame_cursor")).LocalSet(fe.lDd0)
+			// frame = rt_dd_enter(mdidx+1, &R(A+1), nargs, line); 0 =
+			// error staged (budget/OOM, budget prefixed with this line —
+			// the cascade back never crosses an rt_run catch) — join the
+			// -1 protocol
+			f.LocalGet(fe.lV2).I32WrapI64()
+			fe.cellAddr(A + 1)
+			f.LocalGet(fe.lT0)
+			f.I32Const(fe.line(pc))
+			f.Call(fe.b.imp("rt_dd_enter")).LocalSet(fe.lDd1)
+			f.LocalGet(fe.lDd1).I32Const(0).I32Eq().If(wasm.Void)
+			f.I32Const(-1).Return()
+			f.End()
+			// nret = lua_dispatch(mdidx, frame, cl, nargs, want) — a plain
+			// module-internal call; only wasm locals are live across it
+			// (the reentrancy law)
+			f.LocalGet(fe.lV2).I32WrapI64().I32Const(1).I32Sub()
+			f.LocalGet(fe.lDd1)
+			f.LocalGet(fe.lV2).I64Const(32).I64ShrU().I32WrapI64()
+			f.LocalGet(fe.lT0)
+			f.LocalGet(fe.lT1)
+			f.Call(fe.b.dispatchFn).LocalSet(fe.lSt)
+			// error: retire through rt_dd_err (tbc close under the
+			// unwinding-boundary form, cursor + line-cell restore)
+			f.LocalGet(fe.lSt).I32Const(0).I32LtS().If(wasm.Void)
+			f.LocalGet(fe.lDd0)
+			fe.lineCellAddr()
+			f.Call(fe.b.imp("rt_dd_err")).Drop()
+			f.I32Const(-1).Return()
+			f.End()
+			// success: rt_dd_ret stages want-truncated results at R(A)
+			// (nil-padded — nothing runs luaD_poscall here) reading the
+			// callee's EXIT frame from gDispFrame, and returns
+			// rt_call_addr's success encoding — the top-adjust below is
+			// reused verbatim
+			f.LocalGet(fe.lDd0)
+			fe.cellAddr(A + 1)
+			f.GlobalGet(fe.b.gDispFrame)
+			f.LocalGet(fe.lSt)
+			f.LocalGet(fe.lT1)
+			fe.lineCellAddr()
+			f.Call(fe.b.imp("rt_dd_ret")).LocalSet(fe.lSt)
+		}
+		f.Else()
 	}
 
 	// rt_call_addr(&R(A), &R(A+1), nargs, want, line, hcallee)
@@ -604,6 +670,10 @@ func (fe *funcEmitter) emitCall(A, B, C, pc int, tail bool) {
 	f.LocalGet(fe.lSt).I32Const(1).I32Eq().If(wasm.Void)
 	f.I32Const(-1).Return()
 	f.End()
+
+	if !tail {
+		f.End() // close the direct/fallback If
+	}
 
 	// adjust top: multret (C==0, and every tailcall) → A + count;
 	// else A + (C-1)
@@ -768,8 +838,50 @@ func (fe *funcEmitter) emitTForcall(A, C, pc int) {
 	fe.copyCell(fe.cell(A+5), fe.cell(A+3)) // control → arg slot
 	fe.copyCell(fe.cell(A+4), fe.cell(A+1)) // state
 	fe.copyCell(fe.cell(A+3), fe.cell(A))   // iterator (callee)
-	fe.cellAddr(A + 3)                       // funcell (callee in place)
-	fe.cellAddr(A + 4)                       // argcells (natural)
+	// U9c (row 104): the direct-dispatch arm, mirrored from emitCall —
+	// the iterator is a compiled closure of this module (want is C RAW:
+	// the loop reads exactly C values at R(A+3..)). The rt_dd_ret result
+	// is dropped: with a fixed want it stages at R(A+3) and returns RT_OK.
+	fe.cellAddr(A + 3)
+	f.Call(fe.b.imp("rt_dd_callee")).LocalSet(fe.lV2)
+	f.LocalGet(fe.lV2).I64Const(0).I64Ne()
+	f.LocalGet(fe.lV2).I32WrapI64().
+		I32Const(int32(len(fe.b.protos) + 1)).I32LtU()
+	f.I32And()
+	f.If(wasm.Void)
+	{
+		f.Call(fe.b.imp("rt_frame_cursor")).LocalSet(fe.lDd0)
+		f.LocalGet(fe.lV2).I32WrapI64()
+		fe.cellAddr(A + 4)
+		f.I32Const(2)
+		f.I32Const(fe.line(pc))
+		f.Call(fe.b.imp("rt_dd_enter")).LocalSet(fe.lDd1)
+		f.LocalGet(fe.lDd1).I32Const(0).I32Eq().If(wasm.Void)
+		f.I32Const(-1).Return()
+		f.End()
+		f.LocalGet(fe.lV2).I32WrapI64().I32Const(1).I32Sub()
+		f.LocalGet(fe.lDd1)
+		f.LocalGet(fe.lV2).I64Const(32).I64ShrU().I32WrapI64()
+		f.I32Const(2)
+		f.I32Const(int32(C))
+		f.Call(fe.b.dispatchFn).LocalSet(fe.lSt)
+		f.LocalGet(fe.lSt).I32Const(0).I32LtS().If(wasm.Void)
+		f.LocalGet(fe.lDd0)
+		fe.lineCellAddr()
+		f.Call(fe.b.imp("rt_dd_err")).Drop()
+		f.I32Const(-1).Return()
+		f.End()
+		f.LocalGet(fe.lDd0)
+		fe.cellAddr(A + 4)
+		f.GlobalGet(fe.b.gDispFrame)
+		f.LocalGet(fe.lSt)
+		f.I32Const(int32(C))
+		fe.lineCellAddr()
+		f.Call(fe.b.imp("rt_dd_ret")).Drop()
+	}
+	f.Else()
+	fe.cellAddr(A + 3) // funcell (callee in place)
+	fe.cellAddr(A + 4) // argcells (natural)
 	f.I32Const(2)
 	f.I32Const(int32(C))
 	f.I32Const(fe.line(pc))
@@ -779,6 +891,7 @@ func (fe *funcEmitter) emitTForcall(A, C, pc int) {
 	f.LocalGet(fe.lSt).I32Const(1).I32Eq().If(wasm.Void)
 	f.I32Const(-1).Return()
 	f.End()
+	f.End() // close the direct/fallback If
 	f.I32Const(int32(A + 3 + C)).LocalSet(fe.lTop)
 	// TFORLOOP (at pc+1): continue iff R(A+3) ~= nil (byte-wide tag load —
 	// the iterator cell is C-written)

@@ -2052,6 +2052,7 @@ rt_addr rt_tail_restage(void) {
 ** nesting only. The constant's derivation lives in ledger row 104. */
 static int rt_dd_depth;
 static rt_addr dd_disp_save[RT_DD_MAX_DEPTH];
+static CallInfo *dd_ci_save[RT_DD_MAX_DEPTH]; /* NULL = degraded level */
 
 /* the fused probe: (cl record address << 32) | (mdidx+1); 0 = decline.
    Exact on wasm32 (pointers are 32-bit); under RT_ABI_NATIVE64 the
@@ -2072,31 +2073,128 @@ int64_t rt_dd_callee(rt_addr funcell) {
   return 0;
 }
 
+/* the callee's stack presence (row 104): every direct frame gets a
+   minimal real CallInfo — prepCallInfo's exact shape over a func slot
+   holding the closure, CIST_C like the trampoline's own frame — plus a
+   sea entry keyed by that ci. Stock lua_getstack/getinfo and the seam's
+   luaL_where then resolve direct frames exactly like trampoline ones:
+   level-1 getinfo answers istailcall/extraargs (0 — a direct callee
+   passed through no __call chain, the interp's answer), where(1) is the
+   callee's line, where(2) the caller's. luaE_extendCI's err=0 arm
+   REPORTS OOM instead of raising (ldo.c's own non-raising use), so no
+   longjmp can start here; on NULL the frame runs ci-less — the degraded
+   posture (no levels for it; the callee prologue then binds the
+   caller's sea entry, which dd_ret's rebind heals on the way out). */
+
+/* pop the presence for the current (deepest) level — ret's and err's
+   exit share it. `retract` restores L->top to the closure slot and is
+   for the NORMAL return only: there the stack above the slot is exactly
+   the callee's balanced windows (luaD_poscall's own discipline — it too
+   runs only on a normal return). The error path passes 0: an error
+   leaves live content above the slot (call_body's un-retracted window,
+   the error object at L->top-1) that the CATCH boundary owns
+   (luaD_pcall resets L->top to its save point; stock never lets an
+   intermediate frame retract past a throw) — retracting here clobbers
+   it. Same for the trap unwinds: the catch or the next run boundary
+   cleans up. The ci pop itself is safe on every path (the error object
+   is not ci-relative), and required — the in-wasm -1 cascade keeps
+   executing (close handlers) with a truthful L->ci. */
+static void dd_pop_ci(int retract) {
+  CallInfo *ci = dd_ci_save[rt_dd_depth - 1];
+  if (ci != NULL) {
+    lua_State *L = curL;
+    dd_ci_save[rt_dd_depth - 1] = NULL;
+    rt_sea_pop();              /* LIFO: entered ci-then-sea, pop sea first */
+    if (retract) L->top.p = ci->func.p; /* retract the closure slot */
+    L->ci = ci->previous;      /* stock's pop */
+  }
+}
+
+/* unwind leaked direct frames down to `depth`: a trap kills a wasm
+   activation without running its rt_dd_ret/rt_dd_err, and L->ci is the
+   dead activation's deepest frame (nothing else pushes at a wasm call
+   boundary), so popping level by level restores L->ci/L->top/sea to the
+   save point exactly. Callers: the rtw_dispatch_body bracket (every
+   trap surfaces at some host boundary) and rt_dd_reset (run
+   boundaries). */
+static void dd_unwind_to(int depth) {
+  while (rt_dd_depth > depth) {
+    dd_pop_ci(0); /* trap path: no retract (see dd_pop_ci) */
+    rt_dd_depth--;
+  }
+}
+
 /* push the callee frame — the same rt_push_frame_from the trampoline
    uses (vararg extras below the window, rt_md sizing), reading args
-   from their natural R(A+1).. cells. Takes the probe's low word
-   (mdidx+1; the emitted code forwards it unopened). Returns the window
-   base, or 0 WITH an error staged (budget/OOM — the caller returns -1
-   and the error propagates as a staged return). Also saves the
+   from their natural R(A+1).. cells — plus the callee's stack presence
+   (a minimal CallInfo + sea entry, the block comment above rt_dd_callee).
+   Takes the probe's low word
+   (mdidx+1; the emitted code forwards it unopened) and the call site's
+   line (rt_call_addr's convention). Returns the window base, or 0 WITH
+   an error staged (budget/OOM — the caller returns -1 and the error
+   propagates as a staged return; the budget arm stages PREFIXED, see
+   the arm). Also saves the
    trampoline's rt_disp_frame shadow at this depth: the callee's
    wasm-side restage loop publishes restages into that single static,
    and without the save/restore pair in ret/err a restage inside a
    direct callee would clobber the OUTER trampoline level's adopt frame
    (rtw_dispatch_body reads it after its host call). */
-rt_addr rt_dd_enter(int32_t mdidx1, rt_addr argcells, int32_t nargs) {
+rt_addr rt_dd_enter(int32_t mdidx1, rt_addr argcells, int32_t nargs,
+                    int32_t line) {
   rt_addr frame;
   int mdidx = (int)mdidx1 - 1;
   if (mdidx < 0 || mdidx >= rt_md_n) return 0; /* probe bounded it */
   if (rt_dd_depth >= RT_DD_MAX_DEPTH) {
-    /* stock's own wording (lstate.c luaE_checkcstack), same staging as
-       rt_wasm_enter — byte-identical to the trampoline depth guard */
-    stage_str_error("stack overflow", 1);
+    /* stock's own wording (lstate.c luaE_checkcstack), staged WITH the
+       call site's position: a budget hit rides a -1 cascade back to the
+       outermost trampoline, which re-raises the staged value verbatim —
+       no rt_run catch ever prefixes it (the trampoline depth guard gets
+       its prefix from luaG_runerror, whose isLua arm skips compiled
+       frames and so never fired for the caller anyway). Same formatting
+       as rt_error. */
+    int w = snprintf(err_buf, sizeof err_buf, "%.*s:%d: stack overflow",
+                     chunk_name_len, chunk_name, (int)line);
+    err_buf_len = w > 0 ? w : 0;
+    err_prefixed = 1;
+    err_pending = 1;
+    rt_sea_msgh_ran_set(0); /* fresh error: its handler has not run */
+    stage_err_line((int)line);
+    setsvalue(curL, &err_value,
+              luaS_newlstr(curL, err_buf, (size_t)err_buf_len));
     return 0;
   }
   frame = rt_push_frame_from(mdidx, (int)nargs, (const TValue *)(size_t)argcells);
   if (frame == 0) {
     stage_str_error("not enough memory", 1);
     return 0;
+  }
+  { /* push the callee's stack presence — see the block comment above.
+       Gated on headroom: each direct level parks ONE closure slot above
+       L->top for the callee's lifetime, and a deep direct chain stacks
+       them — beyond the containing frames' checkstack guarantees the
+       writes would run off the Lua stack into the heap (found the hard
+       way: deep OP_CALL recursion corrupted the globals table). No
+       wasm-safe growth exists (luaD_growstack raises), so past the
+       headroom the levels degrade to the ci-less posture — the ruled
+       fallback, exactly like the extendCI-NULL case. */
+    lua_State *L = curL;
+    CallInfo *ci = NULL;
+    if (L->top.p < L->stack_last.p - LUA_MINSTACK) {
+      CallInfo *prev = L->ci;
+      ci = prev->next != NULL ? prev->next : luaE_extendCI(L, 0);
+      if (ci != NULL) {
+        TValue *f = (TValue *)(size_t)(argcells - (rt_addr)sizeof(TValue));
+        setobj2s(L, L->top.p, f); /* getinfo 'f'/'u' read this slot */
+        ci->func.p = L->top.p;
+        L->top.p++; /* one slot, inside the headroom just checked */
+        ci->callstatus = CIST_C; /* nresults/CCMT/TAIL bits 0 */
+        ci->top.p = L->top.p;
+        ci->previous = prev; /* restated; extendCI/shrinkCI maintain it */
+        L->ci = ci;
+        rt_sea_push(ci); /* the callee prologue's setline binds here */
+      }
+    }
+    dd_ci_save[rt_dd_depth] = ci; /* NULL = degraded */
   }
   dd_disp_save[rt_dd_depth] = rt_disp_frame;
   rt_dd_depth++;
@@ -2121,6 +2219,7 @@ int32_t rt_dd_ret(rt_addr saved, rt_addr argcells, rt_addr frame,
   const TValue *src = (const TValue *)(size_t)frame;
   int w = (int)want, n = (int)nret, i;
   TValue nilv;
+  dd_pop_ci(1); /* normal return: poscall's retract discipline */
   if (n < 0) n = 0;
   setnilvalue(&nilv);
   if (w >= 0) {
@@ -2147,6 +2246,9 @@ int32_t rt_dd_ret(rt_addr saved, rt_addr argcells, rt_addr frame,
    returns -1 in turn, exactly the in-wasm error protocol. */
 int32_t rt_dd_err(rt_addr saved, rt_addr linecell) {
   rt_close_err(saved);
+  dd_pop_ci(0); /* after the close: __close handlers run inside the dying
+                   frame, with its ci/sea entry still live; no retract —
+                   the catch boundary owns L->top on the error path */
   rt_disp_frame = dd_disp_save[rt_dd_depth - 1];
   rt_dd_depth--;
   rt_frame_restore(saved);
@@ -2154,7 +2256,9 @@ int32_t rt_dd_err(rt_addr saved, rt_addr linecell) {
   return -1;
 }
 
-void rt_dd_reset(void) { rt_dd_depth = 0; }
+void rt_dd_reset(void) {
+  dd_unwind_to(0); /* also unwinds a lua_main-level trap's leaked frames */
+}
 
 
 /* ---- the precall seam: the dispatch trampoline (U2d) ------------------
@@ -2309,14 +2413,15 @@ static void rtw_dispatch_body(lua_State *L, void *ud) {
     rt_addr saved_df = rt_disp_frame;
     rt_disp_frame = c->frame;
     {
-      /* U9c (row 104): heal the direct-dispatch depth counter at this
-         host boundary. A trap caught deeper (engine stack exhaustion
-         returns through the import as -4) skipped every wasm-side
-         rt_dd_ret/rt_dd_err decrement — restore the entry depth so a
-         pcall-catch-continue run keeps its full budget. */
+      /* U9c (row 104): heal the direct-dispatch state at this host
+         boundary. A trap caught deeper (engine stack exhaustion returns
+         through the import as -4) skipped every wasm-side rt_dd_ret/
+         rt_dd_err — unwind the leaked levels so a pcall-catch-continue
+         run keeps its full budget AND its CallInfo/sea stack (the dead
+         activation's deepest frame is L->ci, so the pops land exactly). */
       int saved_dd = rt_dd_depth;
       c->nret = wasm_dispatch_host(c->idx, c->frame, c->cl, c->nargs, c->want);
-      rt_dd_depth = saved_dd;
+      dd_unwind_to(saved_dd);
     }
     c->frame = rt_disp_frame; /* adopt this level's latest restage */
     rt_disp_frame = saved_df;

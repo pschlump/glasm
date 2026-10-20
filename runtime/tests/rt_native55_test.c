@@ -1007,7 +1007,7 @@ int main(void) {
     rt_mkinteger(cell_of(&cells[1]), 20);
     rt_mkinteger(cell_of(&cells[2]), 22);
     frame = rt_dd_enter((int32_t)(probe & 0xffffffff),
-                        cell_of(&cells[1]), 2);
+                        cell_of(&cells[1]), 2, 0);
     CHECK(frame != 0);
     CHECK(rt_frame_cursor() > saved); /* the callee's block is live */
     /* the callee ran: 3 results at its EXIT frame (would be gDispFrame) */
@@ -1022,7 +1022,7 @@ int main(void) {
     /* enter/ret, short return: EXPLICIT nil padding (nothing runs
        luaD_poscall on this path — the pad is load-bearing) */
     frame = rt_dd_enter((int32_t)(probe & 0xffffffff),
-                        cell_of(&cells[1]), 2);
+                        cell_of(&cells[1]), 2, 0);
     CHECK(frame != 0);
     rt_mkinteger(frame, 42);
     CHECK(rt_dd_ret(saved, cell_of(&cells[1]), frame, 1, 3,
@@ -1033,7 +1033,7 @@ int main(void) {
 
     /* enter/ret, multret (want<0): -(n+1), rt_call_addr's encoding */
     frame = rt_dd_enter((int32_t)(probe & 0xffffffff),
-                        cell_of(&cells[1]), 2);
+                        cell_of(&cells[1]), 2, 0);
     CHECK(frame != 0);
     rt_mkinteger(frame, 11);
     rt_mkinteger(frame + (rt_addr)sizeof(TValue), 12);
@@ -1046,7 +1046,7 @@ int main(void) {
     /* enter/err: the error STAYS staged (the caller returns -1 in
        turn), cursor restored, follow-up rt_* unblocked after clear */
     frame = rt_dd_enter((int32_t)(probe & 0xffffffff),
-                        cell_of(&cells[1]), 2);
+                        cell_of(&cells[1]), 2, 0);
     CHECK(frame != 0);
     rt_error((rt_addr)(uintptr_t)"dd-boom", 7, 5); /* staged, like a -1 */
     CHECK(rt_dd_err(saved, (rt_addr)(uintptr_t)&linecell) == -1);
@@ -1062,17 +1062,20 @@ int main(void) {
     rt_dd_reset();
     for (i = 0; i < RT_DD_MAX_DEPTH; i++) {
       frame = rt_dd_enter((int32_t)(probe & 0xffffffff),
-                          cell_of(&cells[1]), 0);
+                          cell_of(&cells[1]), 0, 0);
       CHECK(frame != 0);
       if (frame == 0) break;
     }
     CHECK(rt_dd_enter((int32_t)(probe & 0xffffffff),
-                      cell_of(&cells[1]), 0) == 0);
-    CHECK(err_ends_with("stack overflow"));
+                      cell_of(&cells[1]), 0, 9) == 0);
+    /* row 104: the refusal carries the call site's position — the -1
+       cascade it rides never crosses an rt_run catch, so this staging is
+       the prefix's only source */
+    CHECK(err_ends_with("script:9: stack overflow"));
     rt_err_clear();
     rt_dd_reset();
     frame = rt_dd_enter((int32_t)(probe & 0xffffffff),
-                        cell_of(&cells[1]), 0);
+                        cell_of(&cells[1]), 0, 0);
     CHECK(frame != 0);
     rt_mknil(frame);
     CHECK(rt_dd_ret(saved, cell_of(&cells[1]), frame, 0, 0,

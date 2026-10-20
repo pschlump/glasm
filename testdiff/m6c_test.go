@@ -26,11 +26,16 @@ import (
 // re-bumped at U6e: the hostfn seam — host.host_call import +
 // rt_hostfn/rt_encode_value exports, and the PT_INTEGER wire tag;
 // re-bumped at U9a2: the lresults driver export; re-bumped at U9c:
-// the rt_dd_* direct-dispatch exports, row 104).
+// the rt_dd_* direct-dispatch exports, row 104; re-bumped at U9c again:
+// rt_dd_enter's line param — the budget arm stages "stack overflow"
+// with the call site's position, same commit as the backend arm; and
+// again: the direct frame's stack presence — a minimal real CallInfo +
+// sea entry per direct call, so lua_getstack/getinfo and where() see
+// direct frames like trampoline ones, row 104).
 // Rebuild runtime/build55.sh → update this constant (the artifact test
 // is the self-check that forces the bump). Brittle by design (A8:
 // checksummed artifact).
-const lua55ProdSHA256 = "968171a29a667ff728720fee6b4db405ac8f636f5960b29f6a05866e5c388a47"
+const lua55ProdSHA256 = "94ce38f16f03f01771b7187cd363655c87f520e9b552ef8c76bd401257098666"
 
 // TestM6cProdBlobArtifact (U6d edition, ledger row 95): lua55_prod.wasm
 // — the 5.5 production flavor of the rt blob. The build's output is
