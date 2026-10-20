@@ -158,7 +158,55 @@ func (fe *funcEmitter) emitArithReg(op, A, B, C, pc int) {
 		f.Else()
 		fe.mmbinFallback(A, pc)
 		f.End()
-	case intFast:
+	case fltFast:
+		// + − *: four numeric arms (intFast covers these ops too, so
+		// the old float arm placed after intFast was dead code — every
+		// float or mixed ADD/SUB/MUL paid the rt_arith import). int×int
+		// first (wraparound exact on two i64s), then float×float, then
+		// the two int/float mixes — the mixed side promotes inline
+		// exactly as luaO_arith would (i64→f64, then the f64 op;
+		// emitArithK's K-form twin).
+		fe.tagIs(B, rtTagInt)
+		fe.tagIs(C, rtTagInt)
+		f.I32And().If(wasm.Void)
+		fe.cellAddr(A)
+		fe.cellAddr(B).I64Load(0)
+		fe.cellAddr(C).I64Load(0)
+		fe.i64Op(op)
+		f.I64Store(0)
+		fe.cellAddr(A)
+		f.I32Const(rtTagInt).I32Store(8) // full 4-byte tag (row 45)
+		fe.bumpTop(A + 1)
+		f.Else()
+		fe.tagIs(B, rtTagFloat)
+		fe.tagIs(C, rtTagFloat)
+		f.I32And().If(wasm.Void)
+		fe.fltArm(op, A,
+			func() { fe.cellAddr(B).F64Load(0) },
+			func() { fe.cellAddr(C).F64Load(0) })
+		f.Else()
+		// float reg × int reg: promote the int side
+		fe.tagIs(B, rtTagFloat)
+		fe.tagIs(C, rtTagInt)
+		f.I32And().If(wasm.Void)
+		fe.fltArm(op, A,
+			func() { fe.cellAddr(B).F64Load(0) },
+			func() { fe.cellAddr(C).I64Load(0).F64ConvertI64S() })
+		f.Else()
+		// int reg × float reg
+		fe.tagIs(B, rtTagInt)
+		fe.tagIs(C, rtTagFloat)
+		f.I32And().If(wasm.Void)
+		fe.fltArm(op, A,
+			func() { fe.cellAddr(B).I64Load(0).F64ConvertI64S() },
+			func() { fe.cellAddr(C).F64Load(0) })
+		f.Else()
+		fe.mmbinFallback(A, pc)
+		f.End()
+		f.End()
+		f.End()
+		f.End()
+	case intFast: // BAND/BOR/BXOR: int×int only (floats don't bitwise)
 		fe.tagIs(B, rtTagInt)
 		fe.tagIs(C, rtTagInt)
 		f.I32And().If(wasm.Void)
@@ -173,33 +221,32 @@ func (fe *funcEmitter) emitArithReg(op, A, B, C, pc int) {
 		f.Else()
 		fe.mmbinFallback(A, pc)
 		f.End()
-	case fltFast:
-		fe.tagIs(B, rtTagFloat)
-		fe.tagIs(C, rtTagFloat)
-		f.I32And().If(wasm.Void)
-		fe.cellAddr(A)
-		fe.cellAddr(B).F64Load(0)
-		fe.cellAddr(C).F64Load(0)
-		switch op {
-		case lua.OP_ADD:
-			f.F64Add()
-		case lua.OP_SUB:
-			f.F64Sub()
-		case lua.OP_MUL:
-			f.F64Mul()
-		}
-		f.F64Store(0)
-		fe.cellAddr(A)
-		f.I32Const(rtTagFloat).I32Store(8)
-		fe.bumpTop(A + 1)
-		f.Else()
-		fe.mmbinFallback(A, pc)
-		f.End()
 	default:
 		// MOD/POW/DIV/IDIV: always the runtime (floor semantics, the
 		// 'attempt to divide by zero' family, float promotion)
 		fe.mmbinFallback(A, pc)
 	}
+}
+
+// fltArm: store A := lhs op rhs as a float cell — the shared f64
+// ADD/SUB/MUL arm body for emitArithReg's three float shapes.
+func (fe *funcEmitter) fltArm(op, A int, lhs, rhs func()) {
+	f := fe.f
+	fe.cellAddr(A)
+	lhs()
+	rhs()
+	switch op {
+	case lua.OP_ADD:
+		f.F64Add()
+	case lua.OP_SUB:
+		f.F64Sub()
+	case lua.OP_MUL:
+		f.F64Mul()
+	}
+	f.F64Store(0)
+	fe.cellAddr(A)
+	f.I32Const(rtTagFloat).I32Store(8)
+	fe.bumpTop(A + 1)
 }
 
 // emitShiftCompute: luaV_shiftl with x in lVlo and y in lVhi → lV2.
@@ -456,71 +503,311 @@ func (fe *funcEmitter) emitBnot(A, B, pc int) {
 	f.End()
 }
 
-// emitCompare: the condJump family. The condition goes through rt_eq/
-// rt_lt/rt_le into static scratch 0 (mixed types, strings, metamethods
-// — the runtime's stock semantics); the immediate forms materialize the
-// aux into scratch 1 with the C flag's type (the metamethod sees the
-// float/int provenance, _vm.go opOrderI's aux). Jump taken when
-// cond == k.
+// Mixed int/float compare constants: the lua_numbertointeger bounds
+// and l_intfitsf's MAXINTFITSF — all exact powers of two in f64/i64.
+const (
+	fMinInt  = -9223372036854775808.0  // -(2^63)
+	fMaxInt  = 9223372036854775808.0   // 2^63
+	intFitsF = int64(9007199254740992) // 2^53
+)
+
+// condI64/condF64: the LT/LE/EQ/GT/GE compare over the two operands
+// already on the stack, the 0/1 result into lT0 (GT/GE serve the
+// immediate forms, whose op code carries the direction directly).
+func (fe *funcEmitter) condI64(op int) {
+	f := fe.f
+	switch op {
+	case lua.OP_LT, lua.OP_LTI:
+		f.I64LtS()
+	case lua.OP_LE, lua.OP_LEI:
+		f.I64LeS()
+	case lua.OP_EQ, lua.OP_EQI:
+		f.I64Eq()
+	case lua.OP_GTI:
+		f.I64GtS()
+	default: // OP_GEI
+		f.I64GeS()
+	}
+	f.LocalSet(fe.lT0)
+}
+
+func (fe *funcEmitter) condF64(op int) {
+	f := fe.f
+	switch op {
+	case lua.OP_LT, lua.OP_LTI:
+		f.F64Lt()
+	case lua.OP_LE, lua.OP_LEI:
+		f.F64Le()
+	case lua.OP_EQ, lua.OP_EQI:
+		f.F64Eq()
+	case lua.OP_GTI:
+		f.F64Gt()
+	default: // OP_GEI
+		f.F64Ge()
+	}
+	f.LocalSet(fe.lT0)
+}
+
+// mixedNumCmp: cond := (int op float) / (float op int) — lvm.c's
+// LTintfloat/LEintfloat/LTfloatint/LEfloatint mirrored exactly. If the
+// integer fits a float (l_intfitsf: (u64)(i + 2^53) <= 2^54) the two
+// compare as floats — the conversion is exact, so the f64 compare IS
+// the C one; otherwise the float rounds toward the integer (ceil for
+// LTintfloat/LEfloatint, floor for the other two) and the compare
+// goes i64, with a float beyond all integers (or NaN — every f64
+// compare on it is false) decided by its sign relative to the
+// integer's side.
+func (fe *funcEmitter) mixedNumCmp(op int, leftIsInt bool, intAddr, fltAddr func() *wasm.Function) {
+	f := fe.f
+	roundUp := (op == lua.OP_LT) == leftIsInt
+	intAddr().I64Load(0).I64Const(intFitsF).I64Add()
+	f.I64Const(2 * intFitsF).I64LeU().If(wasm.Void)
+	// exact-float path: both as f64, original operand order
+	if leftIsInt {
+		intAddr().I64Load(0).F64ConvertI64S()
+		fltAddr().F64Load(0)
+	} else {
+		fltAddr().F64Load(0)
+		intAddr().I64Load(0).F64ConvertI64S()
+	}
+	fe.condF64(op)
+	f.Else()
+	fltAddr().F64Load(0)
+	if roundUp {
+		f.F64Ceil()
+	} else {
+		f.F64Floor()
+	}
+	f.LocalSet(fe.lF0)
+	f.LocalGet(fe.lF0).F64Const(fMinInt).F64Ge()
+	f.LocalGet(fe.lF0).F64Const(fMaxInt).F64Lt()
+	f.I32And().If(wasm.Void)
+	if leftIsInt {
+		intAddr().I64Load(0)
+		f.LocalGet(fe.lF0).I64TruncF64S()
+	} else {
+		f.LocalGet(fe.lF0).I64TruncF64S()
+		intAddr().I64Load(0)
+	}
+	fe.condI64(op)
+	f.Else()
+	fltAddr().F64Load(0).F64Const(0)
+	if leftIsInt {
+		f.F64Gt() // beyond all integers: above?
+	} else {
+		f.F64Lt() // ...or below?
+	}
+	f.LocalSet(fe.lT0)
+	f.End()
+	f.End()
+}
+
+// eqIntFloat: the mixed number arm of luaV_equalobj — equal iff the
+// float's value is integral and inside the integer range
+// (luaV_flttointeger F2Ieq: f == floor(f), then lua_numbertointeger's
+// bounds) and equals the integer. NaN fails in wasm exactly as in C
+// (floor(NaN) compares unequal to NaN).
+func (fe *funcEmitter) eqIntFloat(intPush func(), fltPush func() *wasm.Function) {
+	f := fe.f
+	fltPush().F64Floor().LocalSet(fe.lF0)
+	f.LocalGet(fe.lF0)
+	fltPush()
+	f.F64Eq()
+	f.LocalGet(fe.lF0).F64Const(fMinInt).F64Ge()
+	f.LocalGet(fe.lF0).F64Const(fMaxInt).F64Lt()
+	f.I32And()
+	f.I32And().If(wasm.Void)
+	intPush()
+	f.LocalGet(fe.lF0).I64TruncF64S()
+	f.I64Eq().LocalSet(fe.lT0)
+	f.Else()
+	f.I32Const(0).LocalSet(fe.lT0)
+	f.End()
+}
+
+// emitCompare: the condJump family. Number operands never take the
+// import: int/int and float/float compare inline, the int/float mixes
+// mirror lvm.c's exact helpers (mixedNumCmp, eqIntFloat), the
+// immediate forms compare against sB in the register's own flavor
+// (op_orderI's opi/opf), and EQK's number constants fold to
+// compile-time immediates. Every miss — strings, metamethods,
+// non-numbers (except the definitive type-mismatch shapes, which are
+// 0 outright: luaV_equalobj's different-ttype arm, OP_EQI's
+// "other types cannot be equal to a number", EQK's raw equality) —
+// goes through rt_eq/rt_lt/rt_le into static scratch 0 (the runtime's
+// stock semantics); the immediate forms materialize the aux into
+// scratch 1 with the C flag's type (the metamethod sees the float/int
+// provenance, _vm.go opOrderI's aux). The condition lands in lT0
+// either way; jump taken when cond == k.
 func (fe *funcEmitter) emitCompare(op, A, B, C, k, pc int) {
 	f := fe.f
-	var fn string
-	var a, b func() *wasm.Function
+	rtLeaf := func(fn string, a, b func() *wasm.Function) {
+		a()
+		b()
+		fe.scratchAddr(0)
+		f.I32Const(fe.line(pc))
+		f.Call(fe.b.imp(fn))
+		fe.checkStatus()
+		// the boolean cell's tag is the truth (byte-wide tag load: rt_eq
+		// wrote tt_ as one byte, see tagIs)
+		fe.scratchAddr(0)
+		f.I32Load8U(8)
+		f.I32Const(rtTagTrue).I32Eq().LocalSet(fe.lT0)
+	}
 	switch op {
+	case lua.OP_LT, lua.OP_LE:
+		fn := "rt_lt"
+		if op == lua.OP_LE {
+			fn = "rt_le"
+		}
+		fe.tagIs(A, rtTagInt)
+		fe.tagIs(B, rtTagInt)
+		f.I32And().If(wasm.Void)
+		fe.cellAddr(A).I64Load(0)
+		fe.cellAddr(B).I64Load(0)
+		fe.condI64(op)
+		f.Else()
+		fe.tagIs(A, rtTagInt)
+		fe.tagIs(B, rtTagFloat)
+		f.I32And().If(wasm.Void)
+		fe.mixedNumCmp(op, true, fe.cell(A), fe.cell(B))
+		f.Else()
+		fe.tagIs(A, rtTagFloat)
+		fe.tagIs(B, rtTagFloat)
+		f.I32And().If(wasm.Void)
+		fe.cellAddr(A).F64Load(0)
+		fe.cellAddr(B).F64Load(0)
+		fe.condF64(op)
+		f.Else()
+		fe.tagIs(A, rtTagFloat)
+		fe.tagIs(B, rtTagInt)
+		f.I32And().If(wasm.Void)
+		fe.mixedNumCmp(op, false, fe.cell(B), fe.cell(A))
+		f.Else()
+		rtLeaf(fn, fe.cell(A), fe.cell(B))
+		f.End()
+		f.End()
+		f.End()
+		f.End()
 	case lua.OP_EQ:
-		fn = "rt_eq"
-		a, b = fe.cell(A), fe.cell(B)
-	case lua.OP_LT:
-		fn = "rt_lt"
-		a, b = fe.cell(A), fe.cell(B)
-	case lua.OP_LE:
-		fn = "rt_le"
-		a, b = fe.cell(A), fe.cell(B)
+		fe.tagIs(A, rtTagInt)
+		fe.tagIs(B, rtTagInt)
+		f.I32And().If(wasm.Void)
+		fe.cellAddr(A).I64Load(0)
+		fe.cellAddr(B).I64Load(0)
+		f.I64Eq().LocalSet(fe.lT0)
+		f.Else()
+		fe.tagIs(A, rtTagInt)
+		fe.tagIs(B, rtTagFloat)
+		f.I32And().If(wasm.Void)
+		fe.eqIntFloat(func() { fe.cellAddr(A).I64Load(0) },
+			func() *wasm.Function { return fe.cellAddr(B).F64Load(0) })
+		f.Else()
+		// int vs non-number: different ttype — luaV_equalobj is 0, and
+		// __eq can never fire (both operands would need to be tables)
+		fe.tagIs(A, rtTagInt).If(wasm.Void)
+		f.I32Const(0).LocalSet(fe.lT0)
+		f.Else()
+		fe.tagIs(A, rtTagFloat)
+		fe.tagIs(B, rtTagFloat)
+		f.I32And().If(wasm.Void)
+		fe.cellAddr(A).F64Load(0)
+		fe.cellAddr(B).F64Load(0)
+		f.F64Eq().LocalSet(fe.lT0)
+		f.Else()
+		fe.tagIs(A, rtTagFloat)
+		fe.tagIs(B, rtTagInt)
+		f.I32And().If(wasm.Void)
+		fe.eqIntFloat(func() { fe.cellAddr(B).I64Load(0) },
+			func() *wasm.Function { return fe.cellAddr(A).F64Load(0) })
+		f.Else()
+		fe.tagIs(A, rtTagFloat).If(wasm.Void)
+		f.I32Const(0).LocalSet(fe.lT0) // float vs non-number: same as above
+		f.Else()
+		rtLeaf("rt_eq", fe.cell(A), fe.cell(B))
+		f.End()
+		f.End()
+		f.End()
+		f.End()
+		f.End()
+		f.End()
 	case lua.OP_EQK:
 		// raw equality against a constant (stock luaV_rawequalobj —
-		// constants never carry __eq, so rt_eq is exact)
-		fn = "rt_eq"
-		a, b = fe.cell(A), fe.kcellFn(B)
+		// constants never carry __eq); number constants fold to
+		// compile-time immediates, everything else (strings compare by
+		// identity) stays on the import
+		switch kv := fe.proto.Constants[B].(type) {
+		case lua.LInteger:
+			imm := int64(kv)
+			fe.tagIs(A, rtTagInt).If(wasm.Void)
+			fe.cellAddr(A).I64Load(0)
+			f.I64Const(imm)
+			f.I64Eq().LocalSet(fe.lT0)
+			f.Else()
+			fe.tagIs(A, rtTagFloat).If(wasm.Void)
+			fe.eqIntFloat(func() { f.I64Const(imm) },
+				func() *wasm.Function { return fe.cellAddr(A).F64Load(0) })
+			f.Else()
+			f.I32Const(0).LocalSet(fe.lT0) // number K vs non-number
+			f.End()
+			f.End()
+		case lua.LNumber:
+			fv := float64(kv)
+			fe.tagIs(A, rtTagFloat).If(wasm.Void)
+			fe.cellAddr(A).F64Load(0)
+			f.F64Const(fv)
+			f.F64Eq().LocalSet(fe.lT0)
+			f.Else()
+			fe.tagIs(A, rtTagInt).If(wasm.Void)
+			fe.eqIntFloat(func() { fe.cellAddr(A).I64Load(0) },
+				func() *wasm.Function { return f.F64Const(fv) })
+			f.Else()
+			f.I32Const(0).LocalSet(fe.lT0) // number K vs non-number
+			f.End()
+			f.End()
+		default:
+			rtLeaf("rt_eq", fe.cell(A), fe.kcellFn(B))
+		}
 	case lua.OP_EQI, lua.OP_LTI, lua.OP_LEI, lua.OP_GTI, lua.OP_GEI:
 		imm := int64(scInt(B))
-		if C != 0 { // float-sourced immediate
-			fe.mkFloatScratch(1, float64(imm))
+		fe.tagIs(A, rtTagInt).If(wasm.Void)
+		fe.cellAddr(A).I64Load(0)
+		f.I64Const(imm)
+		fe.condI64(op)
+		f.Else()
+		fe.tagIs(A, rtTagFloat).If(wasm.Void)
+		fe.cellAddr(A).F64Load(0)
+		f.F64Const(float64(imm))
+		fe.condF64(op)
+		f.Else()
+		if op == lua.OP_EQI {
+			// other types cannot be equal to a number (lvm.c OP_EQI)
+			f.I32Const(0).LocalSet(fe.lT0)
 		} else {
-			fe.mkIntScratch(1, imm)
+			// order miss: the metamethod sees the aux materialized with
+			// the C flag's type, flipped for GTI/GEI (a > imm ⇔ imm < a)
+			if C != 0 {
+				fe.mkFloatScratch(1, float64(imm))
+			} else {
+				fe.mkIntScratch(1, imm)
+			}
+			switch op {
+			case lua.OP_LTI:
+				rtLeaf("rt_lt", fe.cell(A), fe.scratchAddrCell(1))
+			case lua.OP_LEI:
+				rtLeaf("rt_le", fe.cell(A), fe.scratchAddrCell(1))
+			case lua.OP_GTI:
+				rtLeaf("rt_lt", fe.scratchAddrCell(1), fe.cell(A))
+			default: // GEI
+				rtLeaf("rt_le", fe.scratchAddrCell(1), fe.cell(A))
+			}
 		}
-		switch op {
-		case lua.OP_EQI:
-			fn = "rt_eq"
-			a, b = fe.cell(A), fe.scratchAddrCell(1)
-		case lua.OP_LTI:
-			fn = "rt_lt"
-			a, b = fe.cell(A), fe.scratchAddrCell(1)
-		case lua.OP_LEI:
-			fn = "rt_le"
-			a, b = fe.cell(A), fe.scratchAddrCell(1)
-		case lua.OP_GTI: // (a > imm) <=> imm < a
-			fn = "rt_lt"
-			a, b = fe.scratchAddrCell(1), fe.cell(A)
-		default: // GEI: (a >= imm) <=> imm <= a
-			fn = "rt_le"
-			a, b = fe.scratchAddrCell(1), fe.cell(A)
-		}
+		f.End()
+		f.End()
 	}
-	a()
-	b()
-	fe.scratchAddr(0)
-	f.I32Const(fe.line(pc))
-	f.Call(fe.b.imp(fn))
-	fe.checkStatus()
 	// condJump: taken (to the JMP partner's target) when cond == k,
-	// else skip the partner word (pc+2). v4 boolean cells carry the
-	// truth in the TAG (VTRUE=17/VFALSE=1 — value_.b reads 0 either way,
-	// unlike v3's shared TBOOLEAN with the bit at word0). Byte-wide tag
-	// load: rt_eq wrote tt_ as one byte (see tagIs).
-	fe.scratchAddr(0)
-	f.I32Load8U(8)
-	f.I32Const(rtTagTrue).I32Eq()
-	f.I32Const(int32(k)).I32Eq().If(wasm.Void)
+	// else skip the partner word (pc+2)
+	f.LocalGet(fe.lT0).I32Const(int32(k)).I32Eq().If(wasm.Void)
 	fe.setBlk(fe.branchPartner(pc))
 	f.Else()
 	fe.setBlk(fe.blockOf(pc + 2))

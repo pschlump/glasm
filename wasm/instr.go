@@ -203,6 +203,7 @@ func (f *Function) I64GtS() *Function  { return f.op(0x55) }
 func (f *Function) I64LeS() *Function  { return f.op(0x57) }
 func (f *Function) I64GeS() *Function  { return f.op(0x59) }
 func (f *Function) I64LtU() *Function  { return f.op(0x54) }
+func (f *Function) I64LeU() *Function  { return f.op(0x58) }
 func (f *Function) I64GeU() *Function  { return f.op(0x5A) }
 func (f *Function) I64Add() *Function  { return f.op(0x7C) }
 func (f *Function) I64Sub() *Function  { return f.op(0x7D) }
@@ -223,6 +224,8 @@ func (f *Function) F64Le() *Function   { return f.op(0x65) }
 func (f *Function) F64Ge() *Function   { return f.op(0x66) }
 func (f *Function) F64Abs() *Function  { return f.op(0x99) }
 func (f *Function) F64Neg() *Function  { return f.op(0x9A) }
+func (f *Function) F64Ceil() *Function  { return f.op(0x9C) }
+func (f *Function) F64Floor() *Function { return f.op(0x9D) }
 func (f *Function) F64Sqrt() *Function { return f.op(0x9F) }
 func (f *Function) F64Add() *Function  { return f.op(0xA0) }
 func (f *Function) F64Sub() *Function  { return f.op(0xA1) }
@@ -238,6 +241,7 @@ func (f *Function) I32TruncF64S() *Function   { return f.op(0xAA) }
 func (f *Function) I32TruncF64U() *Function   { return f.op(0xAB) }
 func (f *Function) I64ExtendI32S() *Function  { return f.op(0xAC) }
 func (f *Function) I64ExtendI32U() *Function  { return f.op(0xAD) }
+func (f *Function) I64TruncF64S() *Function   { return f.op(0xB0) }
 func (f *Function) F64ConvertI32S() *Function { return f.op(0xB7) }
 func (f *Function) F64ConvertI32U() *Function { return f.op(0xB8) }
 func (f *Function) F64ConvertI64S() *Function { return f.op(0xB9) }
