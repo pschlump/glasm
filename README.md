@@ -93,24 +93,26 @@ instruction runs** on the machine below. So:
 - **Scripts run a lot** — pool the VM. A pooled VM compiles once and
   re-runs in place; the per-run cost drops back to microseconds and even a
   trivial script round-trips faster than building a fresh interpreter
-  state (45.6 µs vs 72.8 µs below). The `host/` package is built around
+  state (40 µs vs 67 µs below). The `host/` package is built around
   this posture.
 
-### Measured — production path (`host/` on wazero), 2026-10-18
+### Measured — production path (`host/` on wazero), 2026-10-20
 
 Medians on one Apple-silicon Mac (arm64, go1.27); the meaningful column is
 the *ratio* — absolute numbers move with machine and engine version. All
-runs output-checked identical across paths.
+runs output-checked identical across paths. (These lanes are call-thin —
+for the call-shaped post-U9c numbers see the by-shape table below and
+`docs/U9-perf.md`.)
 
 | script (shape) | interp | wasm, cold VM | wasm, pooled VM |
 |---|---|---|---|
-| h_tiny (startup only) | 72.8 µs | 70.3 ms | **45.6 µs** |
-| h_str (short string ops) | 182 µs | 71.6 ms | 779 µs |
-| h_strlong (150 KB text processing) | 1.46 ms | 103 ms | 16.5 ms |
-| h_numloop (4 M-iteration numeric) | 127 ms | 1.20 s | 1.14 s |
-| h_tablechurn (table alloc churn) | 10.2 ms | 169 ms | 90.1 ms |
-| h_concat (concat-heavy) | 988 µs | 77.2 ms | 6.0 ms |
-| h_hostfn (3000 Go-call round trips) | 640 µs | 76.6 ms | 6.2 ms |
+| h_tiny (startup only) | 67.4 µs | 70.2 ms | **40.2 µs** |
+| h_str (short string ops) | 173 µs | 73.2 ms | 851 µs |
+| h_strlong (150 KB text processing) | 1.71 ms | 106 ms | 17.2 ms |
+| h_numloop (4 M-iteration numeric) | 131 ms | 1.27 s | 1.18 s |
+| h_tablechurn (table alloc churn) | 10.8 ms | 169 ms | 91.1 ms |
+| h_concat (concat-heavy) | 1.25 ms | 78.8 ms | 5.9 ms |
+| h_hostfn (3000 Go-call round trips) | 749 µs | 78.0 ms | 6.4 ms |
 
 Read the table as: cold = compile + instantiate + run once; pooled =
 already-instantiated VM, run again. The 70 ms column is the "short script
