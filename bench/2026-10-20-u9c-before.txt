@@ -1,0 +1,78 @@
+# luabench — go1.27.0 | host/ prod blob + wazero-prod engine | GOMAXPROCS=14 | 2026-10-20 06:42
+
+=== h_tiny.lua  (123 bytes)  outputs: OK
+posture                        n        min     median       mean
+interp TOTAL (fork)          400     40.1µs     68.0µs     69.0µs
+wasm cold: fresh VM/run       18    69.58ms    70.26ms    70.31ms
+wasm warm: pooled VM rerun   400     31.5µs     43.1µs     44.9µs
+wazero-prod engine cold       17    69.80ms    70.97ms    71.06ms
+
+=== h_str.lua  (428 bytes)  outputs: OK
+posture                        n        min     median       mean
+interp TOTAL (fork)          400    133.0µs    171.8µs    172.9µs
+wasm cold: fresh VM/run       17    71.04ms    72.07ms    72.22ms
+wasm warm: pooled VM rerun   400    711.8µs    783.2µs    784.8µs
+wazero-prod engine cold       17    71.95ms    72.60ms    72.66ms
+
+=== h_strlong.lua  (1235 bytes)  outputs: OK
+posture                        n        min     median       mean
+interp TOTAL (fork)          400     1.31ms     1.46ms     1.46ms
+wasm cold: fresh VM/run        4    97.35ms   100.89ms    99.89ms
+wasm warm: pooled VM rerun    77    14.56ms    16.24ms    16.54ms
+wazero-prod engine cold        4    94.92ms    97.22ms    97.01ms
+
+=== h_numloop.lua  (882 bytes)  outputs: OK
+posture                        n        min     median       mean
+interp TOTAL (fork)            9   126.45ms   127.97ms   130.08ms
+wasm cold: fresh VM/run        3     1.15s      1.17s      1.17s 
+wasm warm: pooled VM rerun     3     1.08s      1.09s      1.09s 
+wazero-prod engine cold        3     1.15s      1.16s      1.16s 
+
+=== h_tablechurn.lua  (537 bytes)  outputs: OK
+posture                        n        min     median       mean
+interp TOTAL (fork)          121     9.84ms    10.41ms    10.48ms
+wasm cold: fresh VM/run        8   160.46ms   166.71ms   165.85ms
+wasm warm: pooled VM rerun    14    80.82ms    88.77ms    86.90ms
+wazero-prod engine cold        7   165.86ms   175.68ms   173.65ms
+
+=== h_concat.lua  (702 bytes)  outputs: OK
+posture                        n        min     median       mean
+interp TOTAL (fork)          400    831.8µs    980.3µs    982.7µs
+wasm cold: fresh VM/run       16    76.58ms    78.25ms    78.50ms
+wasm warm: pooled VM rerun   197     5.49ms     5.94ms     5.95ms
+wazero-prod engine cold       15    77.47ms    78.20ms    80.64ms
+
+=== h_hostfn.lua  (476 bytes)  outputs: OK
+posture                        n        min     median       mean
+interp TOTAL (fork)          400    528.1µs    629.1µs    631.5µs
+wasm cold: fresh VM/run       15    76.73ms    77.84ms    77.94ms
+wasm warm: pooled VM rerun   197     5.73ms     6.12ms     6.14ms
+
+=== h_fib.lua  (566 bytes)  outputs: OK
+posture                        n        min     median       mean
+interp TOTAL (fork)            8   158.61ms   160.13ms   159.77ms
+wasm cold: fresh VM/run        2     5.76s      5.79s      5.78s 
+wasm warm: pooled VM rerun     3     5.90s      5.95s      5.96s 
+wazero-prod engine cold        2     6.33s      6.33s      6.33s 
+
+=== h_nsieve.lua  (853 bytes)  outputs: OK
+posture                        n        min     median       mean
+interp TOTAL (fork)           21    50.06ms    51.82ms    53.09ms
+wasm cold: fresh VM/run        3     1.23s      1.26s      1.26s 
+wasm warm: pooled VM rerun     3     1.13s      1.16s      1.15s 
+wazero-prod engine cold        3     1.26s      1.28s      1.27s 
+
+=== h_callret.lua  (466 bytes)  outputs: OK
+posture                        n        min     median       mean
+interp TOTAL (fork)           51    21.89ms    22.94ms    23.09ms
+wasm cold: fresh VM/run        3   566.31ms   569.52ms   574.77ms
+wasm warm: pooled VM rerun     3   494.62ms   525.81ms   520.09ms
+wazero-prod engine cold        3   584.08ms   592.32ms   593.51ms
+
+=== h_tco.lua  (464 bytes)  outputs: OK
+posture                        n        min     median       mean
+interp TOTAL (fork)           95    12.01ms    12.88ms    12.92ms
+wasm cold: fresh VM/run        6   211.27ms   220.03ms   217.66ms
+wasm warm: pooled VM rerun    10   120.31ms   129.11ms   128.24ms
+wazero-prod engine cold        6   201.97ms   221.88ms   217.03ms
+

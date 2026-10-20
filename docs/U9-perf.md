@@ -104,3 +104,62 @@ with instantiation constant on both sides. Outputs byte-checked OK on
 every posture. Gates: host plain (7.56s) + `host -race -count=2`
 (170.0s) + full `testdiff` suite (`ok 1024.954s`, GODEBUG=asyncpreemptoff=1,
 -timeout 40m, zero FAILs) — all green on the committed tree.
+
+## U9c — direct in-module dispatch at OP_CALL/TFORCALL
+
+Same-day before/after (2026-10-20 06:42/06:46, back-to-back, quiet
+machine; BEFORE = HEAD 0427c66 in a separate worktree, AFTER = the
+working tree): `bench/2026-10-20-u9c-{before,after}.txt`.
+
+The change (ledger row 104): a non-tail OP_CALL/TFORCALL whose callee
+is one of the module's own compiled closures no longer crosses the host
+seam — probe (`rt_dd_callee`) → `rt_dd_enter` → a plain module-internal
+call to `lua_dispatch` → `rt_dd_ret`/`rt_dd_err`. C callees, `__call`
+chains, and foreign-registry closures decline to the unchanged
+`rt_call_addr` fallback, and `return f(x)` still rides the M5c staged
+tailcall (OP_TAILCALL) — the arm is the OP_CALL family: call statements,
+non-tail recursion, `fib(n-1)+fib(n-2)` (two direct calls per
+invocation). Riding with it: the direct frame's stack presence (a real
+CallInfo + sea entry per level, so getinfo/where/level walks are
+byte-exact — see row 104's (c) for the retract rule and headroom gate
+that ovfl01 forced).
+
+h_callret / h_fib medians (the two direct-arm lanes; interp flat,
+h_nsieve flat at 1.16→1.12s, h_tco flat at 129→116ms):
+
+| lane                    | before   | after    | Δ        |
+|-------------------------|----------|----------|----------|
+| h_callret interp TOTAL  | 22.94ms  | 21.12ms  | flat     |
+| h_callret wasm warm     | 525.81ms | 22.87ms  | **−95.7%** |
+| h_callret wasm cold     | 569.52ms | 93.64ms  | −83.6%   |
+| h_callret prod cold     | 592.32ms | 94.86ms  | −84.0%   |
+| h_fib interp TOTAL      | 160.13ms | 157.89ms | flat     |
+| h_fib wasm warm         | 5.95s    | 2.00s    | **−66.4%** |
+| h_fib wasm cold         | 5.79s    | 2.04s    | −64.8%   |
+| h_fib prod cold         | 6.33s    | 2.05s    | −67.6%   |
+
+Reading: leaf-call churn is at interpreter parity warm (22.87ms vs the
+interp's 21.12ms — the per-call host-seam cost is gone; U9b had already
+taken it 382→526ms-equivalent, U9c removes the crossing itself). fib(30)
+warm drops 3×; the residual 12.7× vs interp is NOT the seam anymore —
+it is the known wazero-vs-wasmtime codegen gap over the rt table/arith
+helpers (the nsieve-family item, top open perf work). On wasmtime the
+same fib(30) now runs in **0.15s** (prebuilt `luawasm-run`, 3 runs,
+0.47s first-touch) — at interp parity (interp 158ms), from the 14.2s
+the README had pinned.
+
+Budget-depth probe (budget scratch-lifted to 1e6, isolated blobs,
+tree SHA-restored): pure-direct recursion completes 2000 frames on
+every engine; wasmtime raises a catchable position-less "stack
+overflow" by 3000 (pcall catches — no engine trap), wazero/wazero-prod
+complete 32000+ (wasm frames ride the goroutine stack). Worst mixed
+case ≈ 150 trampolines (≥2 direct-equivalents each) + 1024 budgeted
+direct levels ≈ 1324 < 2000 — RT_DD_MAX_DEPTH=1024 fires first on every
+engine with ≥1.5× margin (row 104).
+
+Gates (all on the final blobs, prod SHA 94ce38f1…, rt SHA ac453d77…):
+vet + `go test -short ./...` green; full `testdiff` heavy suite
+`ok 1135.720s` (GODEBUG=asyncpreemptoff=1, -timeout 40m); runtime/tests
+run.sh ×{plain,ASan,UBSan}; host plain (8.39s) + `host -race -count=2`
+(177.02s); `_cli-tests` ×{wasmtime, WAZERO=1} PASS; `_u9` corpus 7/7
+(interp↔wasm, zero skips) + TestU9Gate + TestU9DeadlineMidDirect.

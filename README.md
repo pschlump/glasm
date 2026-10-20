@@ -122,7 +122,13 @@ you run a lot" penalty — pooling removes it.
 |---|---|---|---|
 | nsieve (numeric loop + table stores) | 360 ms | 9.10 s | interp ~460–530 ms: **~25% faster** on wasmtime |
 | stringwork (~150 KB text) | 67 ms | 446 ms | interp ~17 ms: ~4× / ~26× slower |
-| fib(30) (call-heavy recursion) | 14.2 s | 7.46 s | interp ~160 ms: ~88× / ~48× slower |
+| fib(30) (call-heavy recursion)¹ | **0.15 s** | **2.0 s** | interp ~158 ms: parity / ~12.7× slower |
+
+¹ Re-measured 2026-10-20 after U9c (direct in-module dispatch —
+compiled-callee OP_CALL no longer crosses the host seam, ledger row
+104): wasmtime fib(30) 14.2 s → 0.15 s (prebuilt `luawasm-run`, 3
+runs), wazero warm 7.46 s-era → 2.0 s. The nsieve/stringwork rows are
+older measurements kept for shape context.
 
 Two honest caveats, both active work rather than laws of nature:
 
@@ -130,10 +136,13 @@ Two honest caveats, both active work rather than laws of nature:
   the C runtime's table/string routines currently runs much slower than
   wasmtime's (nsieve: 25× apart), so on the pure-Go `host/` path the
   numeric-loop wins have not yet crossed the interpreter — that codegen
-  gap is the top open performance item.
-- **Call-heavy recursion is the weak shape.** Every Lua→Lua call crosses
-  the host dispatch seam; fib(30) pays it ~1.6 M times. Call-thin loops
-  are the compiler's sweet spot today.
+  gap is the top open performance item (it is also what remains of the
+  fib gap above: the per-call seam is gone, the rt-helper codegen is
+  what's left).
+- **Call shape, post-U9c.** Compiled-callee calls now run in-module
+  (leaf-call churn is at interpreter parity; see `docs/U9-perf.md`).
+  C callees, `__call` chains and cross-module closures still take the
+  host dispatch seam, and tailcalls ride the staged M5c path.
 
 To reproduce: `go run ./cmd/luabench` (interp vs wasm cold/warm on the
 production engine, output-checked); see also `cmd/luawasmc` +
