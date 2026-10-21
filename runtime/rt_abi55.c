@@ -627,6 +627,81 @@ static TString *sc_tostring_key; /* "__tostring": 5.5.1 has no TM slot
                                     (luaL_tolstring rawgets the real mt) */
 static int sc_resolved = 0;
 
+/* U11e-c: gmatch's iterator is a CClosure over lstrlib.c's STATIC
+** gmatch_aux — not pinable by value like the light-C targets. It is
+** pinned by CONSTRUCTION: the stock gmatch runs once over two empty
+** strings (under protection, one enter per process at state init)
+** and the resulting closure's C-function pointer is recorded; no
+** Lua code can place gmatch_aux under a different f. The structs
+** below are lstrlib.c's verbatim — the pin verifies them against a
+** live object before arming (a vendored-layout drift disarms the
+** probe; every call then declines). */
+#define GMP_MAXCCALLS 200 /* lstrlib.c's MAXCCALLS default */
+typedef struct gmp_MatchState {
+  const char *src_init; /* init of source string */
+  const char *src_end;  /* end ('\0') of source string */
+  const char *p_end;    /* end ('\0') of pattern */
+  lua_State *L;
+  int matchdepth; /* control for recursive depth */
+  int level;      /* total number of captures */
+  struct {
+    const char *init;
+    ptrdiff_t len; /* length or special value (CAP_*) */
+  } capture[32];   /* LUA_MAXCAPTURES */
+} gmp_MatchState;
+typedef struct gmp_GMatchState {
+  const char *src;       /* current position */
+  const char *p;         /* pattern */
+  const char *lastmatch; /* end of last match */
+  gmp_MatchState ms;     /* match state */
+} gmp_GMatchState;
+
+static lua_CFunction sc_gmatch_aux;
+
+static void gmp_pin_body(void) {
+  lua_State *L = curL;
+  TValue st, key;
+  Table *gt;
+  CClosure *cl;
+  if (!ttistable(&G(L)->l_registry))
+    return;
+  luaH_getint(hvalue(&G(L)->l_registry), LUA_RIDX_GLOBALS, &st);
+  if (!ttistable(&st))
+    return;
+  gt = hvalue(&st);
+  setsvalue(L, &key, luaS_new(L, "string"));
+  luaH_getshortstr(gt, tsvalue(&key), &st);
+  if (!ttistable(&st))
+    return;
+  setsvalue(L, &key, luaS_new(L, "gmatch"));
+  luaH_getshortstr(hvalue(&st), tsvalue(&key), &st);
+  if (!ttislcf(&st))
+    return; /* swapped gmatch: no pin, the probes all decline */
+  luaD_checkstack(L, 4);
+  setobj2s(L, L->top.p, &st);
+  L->top.p++;
+  setsvalue(L, s2v(L->top.p), luaS_new(L, "")); /* the EMPTYSTRING singleton */
+  L->top.p++;
+  setsvalue(L, s2v(L->top.p), luaS_new(L, ""));
+  L->top.p++;
+  lua_call(L, 2, 1);
+  cl = clCvalue(s2v(L->top.p - 1));
+  if (cl->nupvalues == 3 && ttisstring(&cl->upvalue[0]) &&
+      ttisstring(&cl->upvalue[1]) && ttisfulluserdata(&cl->upvalue[2])) {
+    Udata *u = uvalue(&cl->upvalue[2]);
+    if (u->nuvalue == 0 && u->len == sizeof(gmp_GMatchState)) {
+      gmp_GMatchState *gm = (gmp_GMatchState *)getudatamem(u);
+      const char *es = getstr(tsvalue(&cl->upvalue[0]));
+      const char *ep = getstr(tsvalue(&cl->upvalue[1]));
+      if (gm->src == es && gm->p == ep && gm->lastmatch == NULL &&
+          gm->ms.src_init == es && gm->ms.src_end == es &&
+          gm->ms.p_end == ep)
+        sc_gmatch_aux = cl->f; /* layout verified against a live object */
+    }
+  }
+  L->top.p--;
+}
+
 static void sc_resolve(void) {
   TValue st, key;
   Table *gt;
@@ -664,6 +739,9 @@ static void sc_resolve(void) {
   luaH_getshortstr(gt, tsvalue(&key), &sc_format);
   if (!ttislcf(&sc_format))
     setnilvalue(&sc_format);
+  /* U11e-c: the gmatch_aux pin (by construction — see gmp_pin_body) */
+  if (rt_run(gmp_pin_body, 0, -1, -1, -1, NULL) != RT_OK)
+    sc_gmatch_aux = NULL; /* OOM-only; the staged raise is the truth */
 }
 
 /* lstrlib.c's index helpers, verbatim (arg coercion removed: the
@@ -1844,6 +1922,434 @@ static int sc_format_arm(TValue *args, int n, TValue *dst, int w) {
     ts = luaS_newlstr(curL, sbuff, total);
   setsvalue(curL, &resv, ts);
   return sc_stage(dst, w, &resv, 1);
+}
+
+/* ---- U11e-c: the gmatch iterator step (rt_gmatch_probe) ----
+**
+** ~600 of h_strlong's residual enters were the per-step protected
+** call of the gmatch iterator — a CClosure over lstrlib.c's static
+** gmatch_aux, pinned by construction at rt_set_state (gmp_pin_body
+** above). What follows is lstrlib.c's pattern engine ported VERBATIM
+** (check_capture .. match, reprepstate) with every raise site
+** converted to a decline: this probe never raises. A raise-shaped
+** step returns MISS and the protected gmatch_aux re-runs it from
+** the UN-mutated userdata and raises the stock text — the probe's
+** only state change is stock's own `gm->src = gm->lastmatch = e`,
+** made only after the whole step's outcome is computed and its
+** allocations are two-sided pre-flighted (rt_probe_mem_ok), so
+** probe/protected interleaving over the shared userdata is seamless.
+** Results stage at the callee cell as rt_call_addr would (truncated,
+** nil-padded, fixed want only — TFORCALL never asks multret);
+** 1 = MISS, else rt_call_addr's success encoding. Additive;
+** LUA_RT_ABI stays 4. */
+#define GMP_ESC '%'
+static int gmp_err; /* a raise site tripped: decline the whole step */
+
+static int gmp_check_capture(gmp_MatchState *ms, int l) {
+  l -= '1';
+  if (l_unlikely(l < 0 || l >= ms->level ||
+                 ms->capture[l].len == -1)) { /* CAP_UNFINISHED */
+    gmp_err = 1;
+    return -1; /* "invalid capture index %%%d" — the protected path */
+  }
+  return l;
+}
+
+static int gmp_capture_to_close(gmp_MatchState *ms) {
+  int level = ms->level;
+  for (level--; level >= 0; level--)
+    if (ms->capture[level].len == -1)
+      return level;
+  gmp_err = 1; /* "invalid pattern capture" */
+  return 0;
+}
+
+static const char *gmp_classend(gmp_MatchState *ms, const char *p) {
+  switch (*p++) {
+    case GMP_ESC: {
+      if (l_unlikely(p == ms->p_end)) {
+        gmp_err = 1; /* "malformed pattern (ends with '%%')" */
+        return p;
+      }
+      return p + 1;
+    }
+    case '[': {
+      if (*p == '^')
+        p++;
+      do { /* look for a ']' */
+        if (l_unlikely(p == ms->p_end)) {
+          gmp_err = 1; /* "malformed pattern (missing ']')" */
+          return p;
+        }
+        if (*(p++) == GMP_ESC && p < ms->p_end)
+          p++; /* skip escapes (e.g. '%]') */
+      } while (*p != ']');
+      return p + 1;
+    }
+    default: {
+      return p;
+    }
+  }
+}
+
+static int gmp_match_class(int c, int cl) { /* verbatim */
+  int res;
+  switch (tolower(cl)) {
+    case 'a': res = isalpha(c); break;
+    case 'c': res = iscntrl(c); break;
+    case 'd': res = isdigit(c); break;
+    case 'g': res = isgraph(c); break;
+    case 'l': res = islower(c); break;
+    case 'p': res = ispunct(c); break;
+    case 's': res = isspace(c); break;
+    case 'u': res = isupper(c); break;
+    case 'w': res = isalnum(c); break;
+    case 'x': res = isxdigit(c); break;
+    case 'z': res = (c == 0); break; /* deprecated option */
+    default: return (cl == c);
+  }
+  return (islower(cl) ? res : !res);
+}
+
+static int gmp_matchbracketclass(int c, const char *p, const char *ec) {
+  /* verbatim */
+  int sig = 1;
+  if (*(p + 1) == '^') {
+    sig = 0;
+    p++; /* skip the '^' */
+  }
+  while (++p < ec) {
+    if (*p == GMP_ESC) {
+      p++;
+      if (gmp_match_class(c, cast_uchar(*p)))
+        return sig;
+    } else if ((*(p + 1) == '-') && (p + 2 < ec)) {
+      p += 2;
+      if (cast_uchar(*(p - 2)) <= c && c <= cast_uchar(*p))
+        return sig;
+    } else if (cast_uchar(*p) == c)
+      return sig;
+  }
+  return !sig;
+}
+
+static int gmp_singlematch(gmp_MatchState *ms, const char *s,
+                           const char *p, const char *ep) { /* verbatim */
+  if (s >= ms->src_end)
+    return 0;
+  else {
+    int c = cast_uchar(*s);
+    switch (*p) {
+      case '.': return 1; /* matches any char */
+      case GMP_ESC: return gmp_match_class(c, cast_uchar(*(p + 1)));
+      case '[': return gmp_matchbracketclass(c, p, ep - 1);
+      default: return (cast_uchar(*p) == c);
+    }
+  }
+}
+
+static const char *gmp_match(gmp_MatchState *ms, const char *s,
+                             const char *p);
+
+static const char *gmp_matchbalance(gmp_MatchState *ms, const char *s,
+                                    const char *p) {
+  if (l_unlikely(p >= ms->p_end - 1)) {
+    gmp_err = 1; /* "malformed pattern (missing arguments to '%%b')" */
+    return NULL;
+  }
+  if (*s != *p)
+    return NULL;
+  else {
+    int b = *p;
+    int e = *(p + 1);
+    int cont = 1;
+    while (++s < ms->src_end) {
+      if (*s == e) {
+        if (--cont == 0)
+          return s + 1;
+      } else if (*s == b)
+        cont++;
+    }
+  }
+  return NULL; /* string ends out of balance */
+}
+
+static const char *gmp_max_expand(gmp_MatchState *ms, const char *s,
+                                  const char *p, const char *ep) {
+  ptrdiff_t i = 0; /* counts maximum expand for item */
+  while (gmp_singlematch(ms, s + i, p, ep))
+    i++;
+  /* keeps trying to match with the maximum repetitions */
+  while (i >= 0) {
+    const char *res = gmp_match(ms, (s + i), ep + 1);
+    if (gmp_err)
+      return NULL;
+    if (res)
+      return res;
+    i--; /* else didn't match; reduce 1 repetition to try again */
+  }
+  return NULL;
+}
+
+static const char *gmp_min_expand(gmp_MatchState *ms, const char *s,
+                                  const char *p, const char *ep) {
+  for (;;) {
+    const char *res = gmp_match(ms, s, ep + 1);
+    if (gmp_err)
+      return NULL;
+    if (res != NULL)
+      return res;
+    else if (gmp_singlematch(ms, s, p, ep))
+      s++; /* try with one more repetition */
+    else
+      return NULL;
+  }
+}
+
+static const char *gmp_start_capture(gmp_MatchState *ms, const char *s,
+                                     const char *p, int what) {
+  const char *res;
+  int level = ms->level;
+  if (level >= 32) { /* LUA_MAXCAPTURES */
+    gmp_err = 1;     /* "too many captures" */
+    return NULL;
+  }
+  ms->capture[level].init = s;
+  ms->capture[level].len = what;
+  ms->level = level + 1;
+  if ((res = gmp_match(ms, s, p)) == NULL) /* match failed? */
+    ms->level--;                            /* undo capture */
+  return res;
+}
+
+static const char *gmp_end_capture(gmp_MatchState *ms, const char *s,
+                                   const char *p) {
+  int l = gmp_capture_to_close(ms);
+  const char *res;
+  if (gmp_err)
+    return NULL;
+  ms->capture[l].len = s - ms->capture[l].init; /* close capture */
+  if ((res = gmp_match(ms, s, p)) == NULL)      /* match failed? */
+    ms->capture[l].len = -1; /* undo capture (CAP_UNFINISHED) */
+  return res;
+}
+
+static const char *gmp_match_capture(gmp_MatchState *ms, const char *s,
+                                     int l) {
+  size_t len;
+  l = gmp_check_capture(ms, l);
+  if (gmp_err)
+    return NULL;
+  len = cast_sizet(ms->capture[l].len);
+  if ((size_t)(ms->src_end - s) >= len &&
+      memcmp(ms->capture[l].init, s, len) == 0)
+    return s + len;
+  else
+    return NULL;
+}
+
+static const char *gmp_match(gmp_MatchState *ms, const char *s,
+                             const char *p) {
+  if (l_unlikely(ms->matchdepth-- == 0)) {
+    gmp_err = 1; /* "pattern too complex" */
+    return NULL;
+  }
+  if (gmp_err)
+    return NULL; /* a lower frame tripped: unwind without walking */
+init: /* using goto to optimize tail recursion */
+  if (p != ms->p_end) { /* end of pattern? */
+    switch (*p) {
+      case '(': { /* start capture */
+        if (*(p + 1) == ')') /* position capture? */
+          s = gmp_start_capture(ms, s, p + 2, -2); /* CAP_POSITION */
+        else
+          s = gmp_start_capture(ms, s, p + 1, -1); /* CAP_UNFINISHED */
+        break;
+      }
+      case ')': { /* end capture */
+        s = gmp_end_capture(ms, s, p + 1);
+        break;
+      }
+      case '$': {
+        if ((p + 1) != ms->p_end) /* is the '$' the last char? */
+          goto dflt;              /* no; go to default */
+        s = (s == ms->src_end) ? s : NULL; /* check end of string */
+        break;
+      }
+      case GMP_ESC: { /* escaped sequences not in the class format */
+        switch (*(p + 1)) {
+          case 'b': { /* balanced string? */
+            s = gmp_matchbalance(ms, s, p + 2);
+            if (s != NULL) {
+              p += 4;
+              goto init; /* return match(ms, s, p + 4) */
+            }             /* else fail (s == NULL) */
+            break;
+          }
+          case 'f': { /* frontier? */
+            const char *ep;
+            char previous;
+            p += 2;
+            if (l_unlikely(*p != '[')) {
+              gmp_err = 1; /* "missing '[' after '%%f' in pattern" */
+              return NULL;
+            }
+            ep = gmp_classend(ms, p); /* points to what is next */
+            if (gmp_err)
+              return NULL;
+            previous = (s == ms->src_init) ? '\0' : *(s - 1);
+            if (!gmp_matchbracketclass(cast_uchar(previous), p, ep - 1) &&
+                gmp_matchbracketclass(cast_uchar(*s), p, ep - 1)) {
+              p = ep;
+              goto init; /* return match(ms, s, ep) */
+            }
+            s = NULL; /* match failed */
+            break;
+          }
+          case '0': case '1': case '2': case '3':
+          case '4': case '5': case '6': case '7':
+          case '8': case '9': { /* capture results (%0-%9)? */
+            s = gmp_match_capture(ms, s, cast_uchar(*(p + 1)));
+            if (s != NULL) {
+              p += 2;
+              goto init; /* return match(ms, s, p + 2) */
+            }
+            break;
+          }
+          default:
+            goto dflt;
+        }
+        break;
+      }
+      default: dflt: { /* pattern class plus optional suffix */
+        const char *ep = gmp_classend(ms, p); /* optional suffix */
+        if (gmp_err)
+          return NULL;
+        /* does not match at least once? */
+        if (!gmp_singlematch(ms, s, p, ep)) {
+          if (*ep == '*' || *ep == '?' || *ep == '-') { /* accept empty? */
+            p = ep + 1;
+            goto init; /* return match(ms, s, ep + 1) */
+          } else        /* '+' or no suffix */
+            s = NULL;   /* fail */
+        } else {        /* matched once */
+          switch (*ep) { /* handle optional suffix */
+            case '?': { /* optional */
+              const char *res;
+              if ((res = gmp_match(ms, s + 1, ep + 1)) != NULL)
+                s = res;
+              else {
+                p = ep + 1;
+                goto init; /* else return match(ms, s, ep + 1) */
+              }
+              break;
+            }
+            case '+': /* 1 or more repetitions */
+              s++;   /* 1 match already done */
+              /* FALLTHROUGH */
+            case '*': /* 0 or more repetitions */
+              s = gmp_max_expand(ms, s, p, ep);
+              break;
+            case '-': /* 0 or more repetitions (minimum) */
+              s = gmp_min_expand(ms, s, p, ep);
+              break;
+            default: /* no suffix */
+              s++;
+              p = ep;
+              goto init; /* return match(ms, s + 1, ep) */
+          }
+        }
+        break;
+      }
+    }
+  }
+  ms->matchdepth++;
+  return s;
+}
+
+static void gmp_reprepstate(gmp_MatchState *ms) { /* verbatim */
+  ms->matchdepth = GMP_MAXCCALLS;
+  ms->level = 0;
+}
+
+int32_t rt_gmatch_probe(rt_addr funcell, int32_t want) {
+  const TValue *fn = (const TValue *)(size_t)funcell;
+  TValue *dst = (TValue *)(size_t)funcell;
+  int w = (int)want, i, nlevels, nstr;
+  size_t need;
+  CClosure *cl;
+  gmp_GMatchState *gm;
+  const char *src, *e;
+  TValue res[32];
+  Udata *u;
+  if (sc_gmatch_aux == NULL || w < 1 || !ttisCclosure(fn))
+    return 1;
+  cl = clCvalue(fn);
+  if (cl->f != sc_gmatch_aux || cl->nupvalues != 3 ||
+      !ttisstring(&cl->upvalue[0]) || !ttisstring(&cl->upvalue[1]) ||
+      !ttisfulluserdata(&cl->upvalue[2]))
+    return 1;
+  u = uvalue(&cl->upvalue[2]);
+  if (u->nuvalue != 0 || u->len != sizeof(gmp_GMatchState))
+    return 1;
+  gm = (gmp_GMatchState *)getudatamem(u);
+  gm->ms.L = curL; /* verbatim (gmatch_aux's first line) */
+  gmp_err = 0;
+  for (src = gm->src; src <= gm->ms.src_end; src++) {
+    gmp_reprepstate(&gm->ms);
+    e = gmp_match(&gm->ms, src, gm->p);
+    if (gmp_err)
+      return 1; /* raise-shaped: the protected step raises the stock text */
+    if (e != NULL && e != gm->lastmatch) {
+      /* push_captures computed, not pushed: every capture validated and
+         its bytes summed BEFORE any mutation or allocation */
+      nlevels = (gm->ms.level == 0 && src) ? 1 : gm->ms.level;
+      need = 0;
+      nstr = 0;
+      for (i = 0; i < nlevels; i++) {
+        const char *cap;
+        ptrdiff_t l;
+        if (i >= gm->ms.level) {
+          /* i==0, level==0: the whole match */
+          cap = src;
+          l = e - src;
+        } else {
+          l = gm->ms.capture[i].len;
+          cap = gm->ms.capture[i].init;
+          if (l_unlikely(l == -1)) /* CAP_UNFINISHED */
+            return 1; /* "unfinished capture" — the protected path */
+          if (l == -2) /* CAP_POSITION: an integer result, no bytes */
+            continue;
+        }
+        need += (size_t)l + sizeof(TString) + 1;
+        nstr++;
+      }
+      /* the shared two-sided pre-flight (sum-contiguous: stricter than
+         nstr separate requests ever need; mayintern covers the one
+         growstrtab peak a step can trigger) */
+      if (nstr > 0 && !rt_probe_mem_ok(need, 1))
+        return 1;
+      gm->src = gm->lastmatch = e; /* stock's only state change */
+      for (i = 0; i < nlevels; i++) {
+        const char *cap;
+        ptrdiff_t l;
+        if (i >= gm->ms.level) {
+          cap = src;
+          l = e - src;
+        } else {
+          l = gm->ms.capture[i].len;
+          cap = gm->ms.capture[i].init;
+          if (l == -2) { /* CAP_POSITION */
+            setivalue(&res[i], ct_diff2S(cap - gm->ms.src_init) + 1);
+            continue;
+          }
+        }
+        setsvalue(curL, &res[i], luaS_newlstr(curL, cap, cast_sizet(l)));
+      }
+      return sc_stage(dst, w, res, nlevels);
+    }
+  }
+  return sc_stage(dst, w, res, 0); /* exhausted: no values, nil-padded */
 }
 
 /* ---- U6b (row 37): the deadline control block ----

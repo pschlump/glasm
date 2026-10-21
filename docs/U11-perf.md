@@ -249,13 +249,62 @@ object, so only the Go protect surfaces can see this class —
 `go test ./host/` and TestM6cProtectGlobals are the detectors that
 matter for probe work.
 
+**U11e-c — the gmatch iterator probe (2026-10-21):** the last item of
+the U11e-b residual. `string.gmatch` returns a **CClosure** (3
+upvalues: subject, pattern, a `GMatchState` full userdata) — not a
+light C function, so `rt_stdcall_probe`'s `ttislcf` gate can never take
+it. New export **`rt_gmatch_probe(funcell, want)`**, called at the head
+of `emitTForcall` before the U9c direct arm:
+
+- **Pin by construction, once per process:** at the first
+  `rt_set_state`, `sc_resolve`'s tail runs stock `string.gmatch("","")`
+  under `rt_run` and records `clCvalue(res)->f` — lstrlib.c's STATIC
+  `gmatch_aux` — then verifies this file's `gmp_GMatchState` copy
+  field-by-field against the live object (a vendored-layout drift
+  disarms the probe; `matchdepth`/`level` are garbage until the first
+  `reprepstate` and are not checked). Each call site re-checks
+  `cl->f == sc_gmatch_aux` + the 3-upvalue/nuvalue/len shape, so a
+  redefined or hand-built closure declines.
+- **The engine is lstrlib.c verbatim** (`check_capture` … `match`,
+  `reprepstate`) with every raise site converted to a decline
+  (`gmp_err`); stock's step loop keeps the `e != lastmatch` empty-match
+  dance and the `src <= src_end` end-of-string position. The probe's
+  ONLY state change is stock's own `gm->src = gm->lastmatch = e`, made
+  only after the whole step's outcome is computed — captures validated
+  (CAP_UNFINISHED declines), string bytes summed and pre-flighted
+  (`rt_probe_mem_ok`, mayintern — the interning after the mutation
+  cannot fail), so probe/protected interleaving over the shared
+  userdata is seamless: every decline leaves un-mutated state and the
+  protected `gmatch_aux` re-runs to the same stock raise ("unfinished
+  capture" / "too many captures" / "pattern too complex" / memlimit
+  OOM — all byte-stock, verified against the oracle; remember
+  `clua55-run`'s arg prelude shifts positions +1 when eyeballing).
+  Returns 1 = MISS; results stage at the callee cell with
+  `rt_call_addr`'s fixed-want encoding (an exhausted iterator stages
+  all-nil = loop exit). Pinned against the budget cap by
+  `TestMemoryBudgetGmatch` (the pre-flight decline → protected OOM).
+
+Measured (probe-alloc, warm): the gmatch micro (804 single-capture
+steps + 200 concats) runs at **zero enters**; a two-capture micro
+(600 steps) sits at the 6-enter process floor; h_strlong **706 → 105**
+(−85% — the delta ≈ 601 = exactly the gmatch attribution; the residual
+is the un-probed stdlib callees, `math.min`/`table.concat` in the
+lane). The native battery pins the step engine byte-exactly: twin
+iterators (probe cells vs the real `gmatch_aux` via `lua_call`) over
+six patterns — `[^\n]+`, `%a+`, `(%a+)%s+(%d+)`, `()`, `%f[%w]%w+`,
+`x*` — comparing nil-ness, integers, and string bytes at every step,
+plus the miss shapes (an LCf, a string callee, w<1). Blob re-pin:
+prod `77b6b7dc…` 289,413 B, rt `1fd0bb56…` 326,987 B.
+
 ## Enter attribution (wazero, warm; 10,880-byte allocations = enters)
 
-| lane | U10 | U11 | U11c | U11d | U11e | U11e-b | residual |
-|---|---|---|---|---|---|---|---|
-| h_strlong | 27,439 | 14,371 | 14,366 | 13,801 | 6,942 | **706** | gmatch (~600) + misc |
-| h_concat | 12,028 | 6,059 | 139 | 172* | 79 | **78** | sub/misc (its ONE format call now rides the probe) |
-| h_str | 1,329 | 533 | 533 | 526 | 493 | **54** | misc |
+| lane | U10 | U11 | U11c | U11d | U11e | U11e-b | U11e-c | residual |
+|---|---|---|---|---|---|---|---|---|
+| h_strlong | 27,439 | 14,371 | 14,366 | 13,801 | 6,942 | 706 | **105** | un-probed stdlib (`math.min`, `table.concat`) |
+| h_concat | 12,028 | 6,059 | 139 | 172* | 79 | **78** | 78 | sub/misc (its ONE format call now rides the probe) |
+| h_str | 1,329 | 533 | 533 | 526 | 493 | 54 | **54** | misc |
+| gmatch micro (804 steps) | — | — | — | — | — | ~800 | **0** | none — the whole iterator runs in-wasm |
+| gmatch micro (2-cap, 600 steps) | — | — | — | — | — | ~1,200 | **6** | the process floor |
 
 \* cross-blob recount, not a regression signal: the residual was never
 format-dominated (one format call in the lane), and enter counts are
@@ -266,7 +315,7 @@ U11c's (−5,920) takes the `..` fold itself off the protected path —
 under the DEFAULT host posture (no budget), where the v1 pre-flight
 was measuring 6,059 because it gated on the memlimit (see U11c above).
 
-## Benchmarks (same-day, quiet machine — `bench/2026-10-21-u11eb.txt`)
+## Benchmarks (same-day, quiet machine — `bench/2026-10-21-u11ec.txt`)
 
 Warm = pooled VM rerun on the production path (`host/` on wazero).
 Columns U10/U11/U11c are the 2026-10-20 runs (`bench/2026-10-20-u10.txt`,
@@ -276,28 +325,38 @@ and U11e-b + their interp columns are same-day 2026-10-21
 `bench/2026-10-21-u11eb.txt`) — per the bench protocol the
 same-day/interp ratios are the only comparisons that cross columns
 cleanly (the machine shifts between days; absolute cross-day deltas
-are not meaningful):
+are not meaningful). U11e-c ran the same day too
+(`bench/2026-10-21-u11ec.txt` — interp re-measured each run):
 
-| lane | U10 warm | U11 warm | U11c warm | U11d warm | U11e warm | U11e-b warm | U11e-b / interp |
-|---|---|---|---|---|---|---|---|
-| h_str | 552 µs | 297 µs | 282 µs | 224 µs | 215 µs | **110 µs** | **0.65× — faster than interp** (interp 169 µs) |
-| h_strlong | 15.2 ms | 6.01 ms | 5.98 ms | 4.99 ms | 2.87 ms | **1.02 ms** | **0.73× — interp parity crossed** (interp 1.39 ms; was 2.2× at U11e, 3.8× at U11d) |
-| h_concat | 5.2 ms | 3.20 ms | 1.55 ms | 1.49 ms | 1.45 ms | **1.59 ms** | 1.7× (interp 922 µs — unchanged, the lane holds no global reads; the cross-day 1.45→1.59 wobble is day noise) |
+| lane | U10 warm | U11 warm | U11c warm | U11d warm | U11e warm | U11e-b warm | U11e-c warm | U11e-c / interp |
+|---|---|---|---|---|---|---|---|---|
+| h_str | 552 µs | 297 µs | 282 µs | 224 µs | 215 µs | 110 µs | **94 µs** | **0.69× — faster than interp** (interp 136 µs) |
+| h_strlong | 15.2 ms | 6.01 ms | 5.98 ms | 4.99 ms | 2.87 ms | 1.02 ms | **762 µs** | **0.57×** (interp 1.33 ms; 0.73× at U11e-b, 2.2× at U11e, 3.8× at U11d) |
+| h_concat | 5.2 ms | 3.20 ms | 1.55 ms | 1.49 ms | 1.45 ms | 1.59 ms | 1.46 ms | 1.68× (interp 870 µs — unchanged; the lane holds no global reads) |
 
-The non-string lanes are unchanged within noise, as expected (U11e-b
-removes enters, not work): numloop 41.5 ms vs interp 127.1, fib 134.0
-vs 150.9, nsieve 42.5 vs 47.8, tco 9.17 vs 9.84, callret 21.6 vs 19.7,
-tiny 24.0 µs vs 51.4. After U11e-b, every lane except h_concat (1.7×)
-and h_callret (1.10×) is at or faster than interp warm same-day — the
-string lanes crossed parity at U11e-b, and what remains of the string
-gap is the gmatch iterator (below) and h_concat's allocating fold.
+The non-string lanes are unchanged within noise, as expected (U11e-c
+removes enters, not work — the U11e-c run's same-day columns: numloop
+39.3 ms vs interp 117.1, fib 133.6 vs 150.8, nsieve 44.5 vs 48.6, tco
+9.39 vs 10.50, callret 21.6 vs 19.7, tiny 17.0 µs vs 52.5). After
+U11e-c, every lane except h_concat (1.68×) and h_callret (1.09×) is at
+or faster than interp warm same-day — h_strlong's gmatch residual is
+gone (the remaining 105 enters are the un-probed stdlib callees), and
+what remains of the string gap is h_concat's allocating fold and those
+callees.
 
 ## Open items
 
-- **The gmatch iterator (the top item now):** ~600 of h_strlong's 706
-  residual enters — `string.gmatch` returns a C closure with 3
-  upvalues, not a light C function, so it needs its own pin/dispatch
-  shape beyond `rt_stdcall_probe`'s `ttislcf` check, plus a
-  TFORCALL-site hook.
+- **The interp's `string.gmatch` constructs eagerly** (found while
+  smoking U11e-c, pre-existing): the interp's `strGmatch` runs the
+  pattern match at construction, so `pcall(string.gmatch, s, "a(")`
+  raises "unfinished capture" immediately, where stock (and the wasm
+  path) construct lazily and raise at the first iteration. Un-ruled in
+  the ledger — needs the lazy fix in `strGmatchIter`'s first call plus
+  a covering corpus case. The wasm engines are byte-stock on the shape
+  (the probe declines; the protected `gmatch_aux` raises).
+- h_strlong's 105 residual enters: the un-probed stdlib callees
+  (`math.min`, `table.concat` …) — the same pin-by-name shape as
+  `rt_stdcall_probe`'s targets, extendable callee by callee.
+- h_concat's allocating fold at 1.7× interp.
 - wazero upstream: the per-enter stack clone is an engine cost the
   probes route around, not fix.

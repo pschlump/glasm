@@ -31,11 +31,14 @@ import (
 // with the call site's position, same commit as the backend arm; and
 // again: the direct frame's stack presence — a minimal real CallInfo +
 // sea entry per direct call, so lua_getstack/getinfo and where() see
-// direct frames like trampoline ones, row 104).
+// direct frames like trampoline ones, row 104; re-bumped at U11e-b:
+// rt_globals_cell + the globals probes in the GETTABUP/SETTABUP arms;
+// re-bumped at U11e-c: the rt_gmatch_probe export — one gmatch step
+// runs in-wasm at TFORCALL).
 // Rebuild runtime/build55.sh → update this constant (the artifact test
 // is the self-check that forces the bump). Brittle by design (A8:
 // checksummed artifact).
-const lua55ProdSHA256 = "c5deec15b261e549918e7feceb77a0fb9f468e60f8f7d4a3f1feb633537c31f9"
+const lua55ProdSHA256 = "77b6b7dcbde226b410cccef39d99e30ce6b305af3a297be1bcbccb5f8aad2bd5"
 
 // TestM6cProdBlobArtifact (U6d edition, ledger row 95): lua55_prod.wasm
 // — the 5.5 production flavor of the rt blob. The build's output is

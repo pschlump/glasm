@@ -1309,60 +1309,74 @@ func (fe *funcEmitter) emitTForcall(A, C, pc int) {
 	fe.copyCell(fe.cell(A+5), fe.cell(A+3)) // control → arg slot
 	fe.copyCell(fe.cell(A+4), fe.cell(A+1)) // state
 	fe.copyCell(fe.cell(A+3), fe.cell(A))   // iterator (callee)
-	// U9c (row 104): the direct-dispatch arm, mirrored from emitCall —
-	// the iterator is a compiled closure of this module (want is C RAW:
-	// the loop reads exactly C values at R(A+3..)). The rt_dd_ret result
-	// is dropped: with a fixed want it stages at R(A+3) and returns RT_OK.
+	// U11e-c: the gmatch iterator probe — the callee is a stock
+	// string.gmatch iterator (a CClosure pinned by construction at
+	// rt_set_state); one step runs in-wasm over the shared userdata,
+	// results staged at the callee cell exactly like rt_call_addr's
+	// fixed want (an exhausted iterator stages all-nil = loop exit).
+	// 1 = MISS: every other callee, any raise-shaped step, and the
+	// manual-call multret shape take the paths below.
 	fe.cellAddr(A + 3)
-	f.Call(fe.b.imp("rt_dd_callee")).LocalSet(fe.lV2)
-	f.LocalGet(fe.lV2).I64Const(0).I64Ne()
-	f.LocalGet(fe.lV2).I32WrapI64().
-		I32Const(int32(len(fe.b.protos) + 1)).I32LtU()
-	f.I32And()
-	f.If(wasm.Void)
-	{
-		f.Call(fe.b.imp("rt_frame_cursor")).LocalSet(fe.lDd0)
-		f.LocalGet(fe.lV2).I32WrapI64()
-		fe.cellAddr(A + 4)
-		f.I32Const(2)
-		f.I32Const(fe.line(pc))
-		f.Call(fe.b.imp("rt_dd_enter")).LocalSet(fe.lDd1)
-		f.LocalGet(fe.lDd1).I32Const(0).I32Eq().If(wasm.Void)
-		f.I32Const(-1).Return()
-		f.End()
-		f.LocalGet(fe.lV2).I32WrapI64().I32Const(1).I32Sub()
-		f.LocalGet(fe.lDd1)
-		f.LocalGet(fe.lV2).I64Const(32).I64ShrU().I32WrapI64()
-		f.I32Const(2)
-		f.I32Const(int32(C))
-		f.Call(fe.b.dispatchFn).LocalSet(fe.lSt)
-		f.LocalGet(fe.lSt).I32Const(0).I32LtS().If(wasm.Void)
-		f.LocalGet(fe.lDd0)
-		fe.lineCellAddr()
-		f.Call(fe.b.imp("rt_dd_err")).Drop()
-		f.I32Const(-1).Return()
-		f.End()
-		f.LocalGet(fe.lDd0)
-		fe.cellAddr(A + 4)
-		f.GlobalGet(fe.b.gDispFrame)
-		f.LocalGet(fe.lSt)
-		f.I32Const(int32(C))
-		fe.lineCellAddr()
-		f.Call(fe.b.imp("rt_dd_ret")).Drop()
-	}
-	f.Else()
-	fe.cellAddr(A + 3) // funcell (callee in place)
-	fe.cellAddr(A + 4) // argcells (natural)
-	f.I32Const(2)
 	f.I32Const(int32(C))
-	f.I32Const(fe.line(pc))
-	// row-71: funcnamefromcode over TFORCALL names the for iterator
-	f.I32Const(int32(fe.hintCallSite(pc)))
-	f.Call(fe.b.imp("rt_call_addr")).LocalSet(fe.lSt)
+	f.Call(fe.b.imp("rt_gmatch_probe")).LocalSet(fe.lSt)
 	f.LocalGet(fe.lSt).I32Const(1).I32Eq().If(wasm.Void)
-	f.I32Const(-1).Return()
-	f.End()
-	f.End() // close the direct/fallback If
+	{
+		// U9c (row 104): the direct-dispatch arm, mirrored from emitCall —
+		// the iterator is a compiled closure of this module (want is C RAW:
+		// the loop reads exactly C values at R(A+3..)). The rt_dd_ret result
+		// is dropped: with a fixed want it stages at R(A+3) and returns RT_OK.
+		fe.cellAddr(A + 3)
+		f.Call(fe.b.imp("rt_dd_callee")).LocalSet(fe.lV2)
+		f.LocalGet(fe.lV2).I64Const(0).I64Ne()
+		f.LocalGet(fe.lV2).I32WrapI64().
+			I32Const(int32(len(fe.b.protos) + 1)).I32LtU()
+		f.I32And()
+		f.If(wasm.Void)
+		{
+			f.Call(fe.b.imp("rt_frame_cursor")).LocalSet(fe.lDd0)
+			f.LocalGet(fe.lV2).I32WrapI64()
+			fe.cellAddr(A + 4)
+			f.I32Const(2)
+			f.I32Const(fe.line(pc))
+			f.Call(fe.b.imp("rt_dd_enter")).LocalSet(fe.lDd1)
+			f.LocalGet(fe.lDd1).I32Const(0).I32Eq().If(wasm.Void)
+			f.I32Const(-1).Return()
+			f.End()
+			f.LocalGet(fe.lV2).I32WrapI64().I32Const(1).I32Sub()
+			f.LocalGet(fe.lDd1)
+			f.LocalGet(fe.lV2).I64Const(32).I64ShrU().I32WrapI64()
+			f.I32Const(2)
+			f.I32Const(int32(C))
+			f.Call(fe.b.dispatchFn).LocalSet(fe.lSt)
+			f.LocalGet(fe.lSt).I32Const(0).I32LtS().If(wasm.Void)
+			f.LocalGet(fe.lDd0)
+			fe.lineCellAddr()
+			f.Call(fe.b.imp("rt_dd_err")).Drop()
+			f.I32Const(-1).Return()
+			f.End()
+			f.LocalGet(fe.lDd0)
+			fe.cellAddr(A + 4)
+			f.GlobalGet(fe.b.gDispFrame)
+			f.LocalGet(fe.lSt)
+			f.I32Const(int32(C))
+			fe.lineCellAddr()
+			f.Call(fe.b.imp("rt_dd_ret")).Drop()
+		}
+		f.Else()
+		fe.cellAddr(A + 3) // funcell (callee in place)
+		fe.cellAddr(A + 4) // argcells (natural)
+		f.I32Const(2)
+		f.I32Const(int32(C))
+		f.I32Const(fe.line(pc))
+		// row-71: funcnamefromcode over TFORCALL names the for iterator
+		f.I32Const(int32(fe.hintCallSite(pc)))
+		f.Call(fe.b.imp("rt_call_addr")).LocalSet(fe.lSt)
+		f.LocalGet(fe.lSt).I32Const(1).I32Eq().If(wasm.Void)
+		f.I32Const(-1).Return()
+		f.End()
+		f.End() // close the direct/fallback If
+	}
+	f.End() // close the gmatch-probe miss If
 	f.I32Const(int32(A + 3 + C)).LocalSet(fe.lTop)
 	// TFORLOOP (at pc+1): continue iff R(A+3) ~= nil (byte-wide tag load —
 	// the iterator cell is C-written)

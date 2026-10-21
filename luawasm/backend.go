@@ -288,6 +288,7 @@ func (b *backend) declareImports() {
 		// verbatim — cannot raise, so no enter)
 		"rt_fmod":          m.ImportFunc("rt", "rt_fmod", dd, f64v),
 		"rt_pow":           m.ImportFunc("rt", "rt_pow", dd, f64v),
+		"rt_gmatch_probe":  m.ImportFunc("rt", "rt_gmatch_probe", ii, i32v),
 		"rt_call":          m.ImportFunc("rt", "rt_call", iiiiii, i32v),
 		"rt_call_addr":     m.ImportFunc("rt", "rt_call_addr", iiiiii, i32v),
 		"rt_call_count":    m.ImportFunc("rt", "rt_call_count", i32v, i32v),

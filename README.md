@@ -107,8 +107,8 @@ the by-shape table below, `docs/U9-perf.md`, and `docs/U10-perf.md`.)
 | script (shape)                      | interp  | wasm, cold VM | wasm, pooled VM |
 |-------------------------------------|---------|---------------|-----------------|
 | h_tiny (startup only)               | 51.4 µs | 67.0 ms       | **24.0 µs**     |
-| h_str (short string ops)            | 169 µs  | 73.2 ms       | **110 µs**      |
-| h_strlong (150 KB text processing)  | 1.39 ms | 77.5 ms       | **1.02 ms**     |
+| h_str (short string ops)            | 136 µs  | 73.5 ms       | **94 µs**       |
+| h_strlong (150 KB text processing)  | 1.33 ms | 74.0 ms       | **762 µs**      |
 | h_numloop (4 M-iteration numeric)   | 127.1 ms| 114.0 ms      | **41.5 ms**     |
 | h_tablechurn (table alloc churn)    | 9.9 ms  | 107.1 ms      | 28.0 ms         |
 | h_concat (concat-heavy)             | 922 µs  | 74.8 ms       | 1.59 ms         |
@@ -124,8 +124,9 @@ Process-time medians (3 runs) over the luabench scripts, re-measured
 2026-10-21 after U9c (direct dispatch), U10 (arith/compare/table fast
 paths), U11 (string-lane probes), U11c (the concat fold probe),
 U11d (the `string.format` probe), U11e (the in-wasm `// % / ^`
-arith arms) and U11e-b (the `_ENV` GETTABUP/SETTABUP globals probes) —
-`bench/2026-10-21-u11eb.txt` (the U11/U11c runs:
+arith arms), U11e-b (the `_ENV` GETTABUP/SETTABUP globals probes) and
+U11e-c (the gmatch iterator probe) —
+`bench/2026-10-21-u11ec.txt` (the U11/U11c runs:
 `bench/2026-10-20-u11*.txt`):
 
 | shape                                | wasm on wasmtime | wasm on wazero | vs interpreter                        |
@@ -155,15 +156,18 @@ One caveat, active work rather than a law of nature:
   (one-pass fold with a two-sided memory pre-flight), U11d folded
   `string.format`, U11e moved the last arith fallbacks in-wasm
   (`%`/`//` floor semantics, `/`/`^` float arms via plain never-raise
-  helpers), and U11e-b staged the `_ENV` globals cell plain so
-  per-loop global reads ride the short-string probe — h_strlong
-  **0.73× interp** (was ~10× at U10, 2.2× at U11e), h_str 0.65×
+  helpers), U11e-b staged the `_ENV` globals cell plain so per-loop
+  global reads ride the short-string probe, and U11e-c runs the
+  `string.gmatch` iterator step itself in-wasm (lstrlib's pattern
+  engine ported verbatim, pinned by construction, every raise-shaped
+  step declining to the stock-protected path) — h_strlong **0.57×
+  interp** (was ~10× at U10, 0.73× at U11e-b), h_str 0.69×
   (`docs/U11-perf.md`). What still pays the protected C route:
-  gmatch's iterator (~600 of h_strlong's 706 residual enters — the
-  next item), h_concat's allocating fold (1.7× interp), and the
-  un-probed stdlib callees (`sub`, `rep`, …). C callees beyond the
-  probed set, `__call` chains and cross-module closures still take
-  the host dispatch seam, and tailcalls ride the staged M5c path.
+  h_concat's allocating fold (1.7× interp), and the un-probed stdlib
+  callees (`sub`, `rep`, `math.min`, `table.concat`, …). C callees
+  beyond the probed set, `__call` chains and cross-module closures
+  still take the host dispatch seam, and tailcalls ride the staged M5c
+  path.
 
 To reproduce: `go run ./cmd/luabench` (interp vs wasm cold/warm on the
 production engine, output-checked); see also `cmd/luawasmc` +

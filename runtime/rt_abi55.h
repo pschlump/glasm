@@ -221,6 +221,22 @@ int32_t rt_stdcall_probe(rt_addr funcaddr, rt_addr argcells, int32_t nargs,
 ** shapes fall to the protected rt_concat). Additive; LUA_RT_ABI
 ** stays 4. */
 int32_t rt_concat_probe(rt_addr cells, int32_t count, rt_addr dstcell);
+/* U11e-c: the gmatch iterator step at TFORCALL — the callee is a
+** stock string.gmatch iterator (a CClosure over lstrlib.c's STATIC
+** gmatch_aux, pinned BY CONSTRUCTION once per process at the first
+** rt_set_state; the pin also verifies this file's gmp_GMatchState
+** copy against a live object — a vendored-layout drift disarms the
+** probe). The step is lstrlib.c's pattern engine verbatim with every
+** raise site converted to a decline; the probe's only state change
+** is stock's own `gm->src = gm->lastmatch = e`, made only after the
+** whole step's outcome is computed and pre-flighted, so probe/
+** protected interleaving over the shared userdata is seamless.
+** Returns 1 = MISS (this probe never errors; every raise-shaped step
+** declines and the protected gmatch_aux raises the stock text);
+** results stage at the callee cell (funcell) with rt_call_addr's
+** encoding — fixed want only, truncated and nil-padded. Additive;
+** LUA_RT_ABI stays 4. */
+int32_t rt_gmatch_probe(rt_addr funcell, int32_t want);
 /* U11e: luai_nummod / luai_numpow verbatim as plain calls — neither
 ** can raise, so the in-wasm float MOD/POW arms pay no enter for them.
 ** Additive; LUA_RT_ABI stays 4. */

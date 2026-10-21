@@ -538,6 +538,29 @@ func TestMemoryBudget(t *testing.T) {
 	}
 }
 
+// TestMemoryBudgetGmatch pins U11e-c's gmatch probe against the budget
+// cap: a step whose capture interning would cross the limit must
+// decline (pre-flight happens BEFORE the iterator state mutates), so
+// the OOM surfaces from the protected gmatch_aux exactly like the
+// concat spin above — never a half-stepped iterator or a trap.
+func TestMemoryBudgetGmatch(t *testing.T) {
+	noHostGC(t)
+	e := mustEngine(t, WithMemoryBudgetBytes(8<<20))
+	_, err := runScript(t, e, `
+local s = string.rep("alpha ", 1000)
+while true do
+  for w in string.gmatch(s, "(%a+)") do end
+  s = s .. s
+end`, RunOptions{Deadline: 60 * time.Second})
+	se, ok := err.(*ScriptError)
+	if !ok {
+		t.Fatalf("want ScriptError, got %T %v", err, err)
+	}
+	if !strings.Contains(se.Error(), "not enough memory") {
+		t.Fatalf("oom text: %q", se.Error())
+	}
+}
+
 // --- determinism ---------------------------------------------------------------
 
 func TestDeterminism(t *testing.T) {

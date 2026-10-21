@@ -2231,6 +2231,110 @@ int main(void) {
     CHECK(hvalue(&after) == hvalue(&before));
   }
 
+  /* ---- U11e-c: rt_gmatch_probe — the gmatch iterator step ----
+  ** twin iterators over the same subject/pattern: A driven by the
+  ** probe (cells), B driven by the real gmatch_aux (lua_call) —
+  ** every step must agree exactly */
+  {
+    static const char *subj = "alpha 42\nbravo 7\ncharlie\n";
+    static const char *pats[] = {
+      "[^\n]+",           /* the h_strlong shape */
+      "%a+",              /* class + quantifier */
+      "(%a+)%s+(%d+)",    /* real captures, two results */
+      "()",               /* position capture */
+      "%f[%w]%w+",        /* frontier */
+      "x*",               /* empty-match progress dance */
+    };
+    int pi;
+    for (pi = 0; pi < (int)(sizeof pats / sizeof pats[0]); pi++) {
+      TValue keep[1];  /* pristine closure — staging at the callee cell never
+                          touches it (the ra+3 site never aliases ra) */
+      TValue pcell[4]; /* per-step callee copy + staging scratch (want = 2) */
+      int step, mism = 0;
+      /* iterator A: owned by the probe's cells */
+      lua_getglobal(L, "string");
+      lua_getfield(L, -1, "gmatch");
+      lua_remove(L, -2);
+      lua_pushstring(L, subj);
+      lua_pushstring(L, pats[pi]);
+      lua_call(L, 2, 1);
+      keep[0] = *s2v(L->top.p - 1);
+      lua_pop(L, 1);
+      /* iterator B: driven by the real closure, kept on the stack */
+      lua_getglobal(L, "string");
+      lua_getfield(L, -1, "gmatch");
+      lua_remove(L, -2);
+      lua_pushstring(L, subj);
+      lua_pushstring(L, pats[pi]);
+      lua_call(L, 2, 1);
+      for (step = 0; step < 32; step++) {
+        int rc;
+        pcell[0] = keep[0];
+        rc = rt_gmatch_probe(cell_of(&pcell[0]), 2);
+        lua_pushvalue(L, -1); /* B */
+        lua_call(L, 0, 2);    /* the real step, two results */
+        if (rc == 1) {
+          mism = 1;
+          lua_pop(L, 2);
+          break;
+        }
+        {
+          const TValue *b1 = s2v(L->top.p - 2), *b2 = s2v(L->top.p - 1);
+          const TValue *a1 = &pcell[0], *a2 = &pcell[1];
+          if (ttisnil(a1) != ttisnil(b1) ||
+              ttisnil(a2) != ttisnil(b2))
+            mism = 1;
+          else if (!ttisnil(a1)) {
+            if (ttisinteger(a1)
+                    ? (!ttisinteger(b1) || ivalue(a1) != ivalue(b1))
+                    : (!ttisstring(b1) ||
+                       tsslen(tsvalue(a1)) != tsslen(tsvalue(b1)) ||
+                       memcmp(getstr(tsvalue(a1)), getstr(tsvalue(b1)),
+                              tsslen(tsvalue(a1))) != 0))
+              mism = 1;
+            if (ttisinteger(a2)) {
+              if (!ttisinteger(b2) || ivalue(a2) != ivalue(b2))
+                mism = 1;
+            } else if (ttisstring(a2)) {
+              if (!ttisstring(b2) ||
+                  tsslen(tsvalue(a2)) != tsslen(tsvalue(b2)) ||
+                  memcmp(getstr(tsvalue(a2)), getstr(tsvalue(b2)),
+                         tsslen(tsvalue(a2))) != 0)
+                mism = 1;
+            } else if (!ttisnil(a2) || !ttisnil(b2))
+              mism = 1;
+          }
+        }
+        lua_pop(L, 2);
+        if (ttisnil(&pcell[0])) /* both exhausted (results compared) */
+          break;
+      }
+      CHECK(mism == 0);
+      lua_pop(L, 1); /* B */
+    }
+    /* miss shapes: a non-closure callee, a light C function, w < 1 */
+    {
+      TValue fncell[2], sv;
+      lua_getglobal(L, "string");
+      lua_getfield(L, -1, "rep");
+      fncell[0] = *s2v(L->top.p - 1);
+      CHECK(rt_gmatch_probe(cell_of(&fncell[0]), 1) == 1);
+      lua_pop(L, 2);
+      setsvalue(L, &sv, luaS_new(L, "x"));
+      CHECK(rt_gmatch_probe(cell_of(&sv), 1) == 1);
+      lua_getglobal(L, "string");
+      lua_getfield(L, -1, "gmatch");
+      lua_remove(L, -2);
+      lua_pushliteral(L, "a b");
+      lua_pushliteral(L, "%a");
+      lua_call(L, 2, 1);
+      fncell[0] = *s2v(L->top.p - 1);
+      CHECK(rt_gmatch_probe(cell_of(&fncell[0]), 0) == 1);  /* w < 1 */
+      CHECK(rt_gmatch_probe(cell_of(&fncell[0]), -1) == 1); /* multret */
+      lua_pop(L, 1);
+    }
+  }
+
   CHECK(rt_wasm_count() == IDX_TAILVA + 1);
   CHECK(rt_wasm_proto(-1, 0, 0, 0, 0) == RT_ERR);
 
