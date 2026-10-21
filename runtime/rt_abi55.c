@@ -482,6 +482,47 @@ int32_t rt_settable(rt_addr tblcell, rt_addr keycell, rt_addr valcell,
   return rt_run(settable_body, line, hobj, -1, hcall, &st_t);
 }
 
+/* ---- U10: unprotected table probes (int keys) ----
+**
+** The VM's own lvm.c fast paths (OP_GETTABLE/OP_SETTABLE's
+** luaV_fastgeti/luaV_fastseti), lifted to probes so the compiled hit
+** path skips the per-op try_table enter inside rt_run. Same macros,
+** same conditions — semantics identical by construction. They cannot
+** raise (no allocation, no luaD_* call: fval2arr/luaH_psetint are
+** pure writes or code returns, and the barrier is pointer work under
+** the frozen-GC posture the VM itself runs), so they carry no
+** rt_run/setjmp; the caller falls back to the protected rt_gettable/
+** rt_settable on a miss (non-table, non-integer key, hole,
+** NEWINDEX metamethod, growth needed). */
+
+int32_t rt_geti_probe(rt_addr tblcell, rt_addr keycell, rt_addr dstcell) {
+  TValue *t = (TValue *)(size_t)tblcell;
+  const TValue *k = (const TValue *)(size_t)keycell;
+  TValue *dst = (TValue *)(size_t)dstcell;
+  if (ttisinteger(k)) {
+    lu_byte tag;
+    luaV_fastgeti(t, ivalue(k), dst, tag);
+    if (!tagisempty(tag))
+      return 1; /* dst holds the value */
+  }
+  return 0; /* miss: the protected path observes metamethods etc. */
+}
+
+int32_t rt_seti_probe(rt_addr tblcell, rt_addr keycell, rt_addr valcell) {
+  TValue *t = (TValue *)(size_t)tblcell;
+  const TValue *k = (const TValue *)(size_t)keycell;
+  TValue *v = (TValue *)(size_t)valcell;
+  if (ttisinteger(k)) {
+    int hres;
+    luaV_fastseti(t, ivalue(k), v, hres);
+    if (hres == HOK) {
+      luaV_finishfastset(curL, t, v); /* the write barrier */
+      return 1;
+    }
+  }
+  return 0;
+}
+
 /* ---- arithmetic: 5.5's own engine, stock texts ----
 **
 ** luaO_arith (lobject.c) is the complete stock dispatcher: raw int/float

@@ -91,6 +91,7 @@ RT_EXPORTS="$EXPORTS \
   -Wl,--export=rt_mknumber -Wl,--export=rt_mkinteger \
   -Wl,--export=rt_mkbool -Wl,--export=rt_mknil -Wl,--export=rt_intern \
   -Wl,--export=rt_newtable -Wl,--export=rt_gettable -Wl,--export=rt_settable \
+  -Wl,--export=rt_geti_probe -Wl,--export=rt_seti_probe \
   -Wl,--export=rt_arith -Wl,--export=rt_len -Wl,--export=rt_eq \
   -Wl,--export=rt_lt -Wl,--export=rt_le -Wl,--export=rt_concat \
   -Wl,--export=rt_call -Wl,--export=rt_call_addr \

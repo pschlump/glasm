@@ -509,6 +509,52 @@ int main(void) {
     CHECK(rt_gettable(rt_, rk, rr, 25, -1, -1) == RT_OK);
     CHECK(ttisinteger(&r) && ivalue(&r) == 9);
 
+    /* ---- U10 probes: the luaV_fastgeti/fastseti arms as call-ins ----
+       (mirrors the emitted fast paths; every miss must leave dst alone
+       and every hit must agree with the protected path's result) */
+    {
+      TValue kk, vv, dst;
+      /* geti hit: t[2] was written above via the protected path */
+      rt_mkinteger(cell_of(&kk), 2);
+      CHECK(rt_geti_probe(rt_, cell_of(&kk), cell_of(&dst)) == 1);
+      CHECK(ttisinteger(&dst) && ivalue(&dst) == 7);
+      /* geti miss: absent key must NOT write dst */
+      rt_mkinteger(cell_of(&kk), 4);
+      rt_mkinteger(cell_of(&dst), 0x1234);
+      CHECK(rt_geti_probe(rt_, cell_of(&kk), cell_of(&dst)) == 0);
+      CHECK(ttisinteger(&dst) && ivalue(&dst) == 0x1234);
+      /* geti miss: string key (exists, but not the int-key probe) */
+      rt_intern(cell_of(&kk), (rt_addr)(uintptr_t)"x", 1);
+      CHECK(rt_geti_probe(rt_, cell_of(&kk), cell_of(&dst)) == 0);
+      /* geti miss: non-table receiver */
+      CHECK(rt_geti_probe(rv, cell_of(&kk), cell_of(&dst)) == 0);
+
+      /* seti hit: plain array write, read back through the probe */
+      rt_mkinteger(cell_of(&kk), 1);
+      rt_mkinteger(cell_of(&vv), 100);
+      CHECK(rt_seti_probe(rt_, cell_of(&kk), cell_of(&vv)) == 1);
+      CHECK(rt_geti_probe(rt_, cell_of(&kk), cell_of(&dst)) == 1);
+      CHECK(ttisinteger(&dst) && ivalue(&dst) == 100);
+      /* seti hit: a nil write is HOK, and the slot now reads empty —
+         the geti probe misses (the tablechurn hole shape) */
+      rt_mknil(cell_of(&vv));
+      CHECK(rt_seti_probe(rt_, cell_of(&kk), cell_of(&vv)) == 1);
+      CHECK(rt_geti_probe(rt_, cell_of(&kk), cell_of(&dst)) == 0);
+      /* seti miss: key beyond the array part with no hash entry yet */
+      rt_mkinteger(cell_of(&kk), 10);
+      rt_mkinteger(cell_of(&vv), 55);
+      CHECK(rt_seti_probe(rt_, cell_of(&kk), cell_of(&vv)) == 0);
+      /* ... the protected path creates it, then both probes hit */
+      CHECK(rt_settable(rt_, cell_of(&kk), cell_of(&vv), 28, -1, -1) == RT_OK);
+      CHECK(rt_seti_probe(rt_, cell_of(&kk), cell_of(&vv)) == 1);
+      CHECK(rt_geti_probe(rt_, cell_of(&kk), cell_of(&dst)) == 1);
+      CHECK(ttisinteger(&dst) && ivalue(&dst) == 55);
+      /* seti miss: string key / non-table receiver */
+      rt_intern(cell_of(&kk), (rt_addr)(uintptr_t)"x", 1);
+      CHECK(rt_seti_probe(rt_, cell_of(&kk), cell_of(&vv)) == 0);
+      CHECK(rt_seti_probe(rv, cell_of(&kk), cell_of(&vv)) == 0);
+    }
+
     /* __index metamethod through the seam (a Lua closure runs under
        rt_run's protect — the metamethod body is real Lua) */
     {

@@ -663,6 +663,15 @@ func (fe *funcEmitter) emitBlockBody(start, end int) {
 				fe.checkStatus()
 			}
 		case lua.OP_GETTABLE:
+			// U10: the VM's own luaV_fastgeti arm as an unprotected
+			// probe (int key, table present, slot non-empty) — a hit
+			// writes A with no try_table enter; any miss re-issues the
+			// cells to the protected rt_gettable (metamethods, errors)
+			fe.cellAddr(B)
+			fe.cellAddr(C)
+			fe.cellAddr(A)
+			fe.f.Call(fe.b.imp("rt_geti_probe"))
+			fe.f.I32Eqz().If(wasm.Void)
 			fe.cellAddr(B)
 			fe.cellAddr(C)
 			fe.cellAddr(A)
@@ -671,9 +680,15 @@ func (fe *funcEmitter) emitBlockBody(start, end int) {
 			fe.f.I32Const(int32(fe.hintCallSite(pc)))
 			fe.f.Call(fe.b.imp("rt_gettable"))
 			fe.checkStatus()
+			fe.f.End()
 			fe.bumpTop(A + 1)
 		case lua.OP_GETI:
 			fe.mkIntScratch(1, int64(C))
+			fe.cellAddr(B)
+			fe.scratchAddr(1)
+			fe.cellAddr(A)
+			fe.f.Call(fe.b.imp("rt_geti_probe"))
+			fe.f.I32Eqz().If(wasm.Void)
 			fe.cellAddr(B)
 			fe.scratchAddr(1)
 			fe.cellAddr(A)
@@ -682,6 +697,7 @@ func (fe *funcEmitter) emitBlockBody(start, end int) {
 			fe.f.I32Const(int32(fe.hintCallSite(pc)))
 			fe.f.Call(fe.b.imp("rt_gettable"))
 			fe.checkStatus()
+			fe.f.End()
 			fe.bumpTop(A + 1)
 		case lua.OP_GETFIELD:
 			fe.cellAddr(B)
@@ -694,6 +710,13 @@ func (fe *funcEmitter) emitBlockBody(start, end int) {
 			fe.checkStatus()
 			fe.bumpTop(A + 1)
 		case lua.OP_SETTABLE:
+			// U10: rt_seti_probe first (luaV_fastseti: int key, in-place
+			// write, no NEWINDEX); the protected rt_settable on a miss
+			fe.cellAddr(A)
+			fe.cellAddr(B)
+			fe.vcCell(C, k)
+			fe.f.Call(fe.b.imp("rt_seti_probe"))
+			fe.f.I32Eqz().If(wasm.Void)
 			fe.cellAddr(A)
 			fe.cellAddr(B)
 			fe.vcCell(C, k)
@@ -702,8 +725,14 @@ func (fe *funcEmitter) emitBlockBody(start, end int) {
 			fe.f.I32Const(int32(fe.hintCallSite(pc)))
 			fe.f.Call(fe.b.imp("rt_settable"))
 			fe.checkStatus()
+			fe.f.End()
 		case lua.OP_SETI:
 			fe.mkIntScratch(1, int64(B))
+			fe.cellAddr(A)
+			fe.scratchAddr(1)
+			fe.vcCell(C, k)
+			fe.f.Call(fe.b.imp("rt_seti_probe"))
+			fe.f.I32Eqz().If(wasm.Void)
 			fe.cellAddr(A)
 			fe.scratchAddr(1)
 			fe.vcCell(C, k)
@@ -712,6 +741,7 @@ func (fe *funcEmitter) emitBlockBody(start, end int) {
 			fe.f.I32Const(int32(fe.hintCallSite(pc)))
 			fe.f.Call(fe.b.imp("rt_settable"))
 			fe.checkStatus()
+			fe.f.End()
 		case lua.OP_SETFIELD:
 			fe.cellAddr(A)
 			fe.kcell(B)

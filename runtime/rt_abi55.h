@@ -184,6 +184,13 @@ int32_t rt_gettable(rt_addr tblcell, rt_addr keycell, rt_addr dstcell,
                     int32_t line, int32_t hobj, int32_t hcall);
 int32_t rt_settable(rt_addr tblcell, rt_addr keycell, rt_addr valcell,
                     int32_t line, int32_t hobj, int32_t hcall);
+/* U10 probes: the luaV_fastgeti/luaV_fastseti fast paths as call-ins.
+** Return 1 = the op is done (dst written / slot stored, nothing
+** staged), 0 = miss, the caller takes the protected rt_gettable/
+** rt_settable. Can never raise — no rt_run inside. Additive; LUA_RT_ABI
+** stays 4 (blob and backend evolve together in-tree). */
+int32_t rt_geti_probe(rt_addr tblcell, rt_addr keycell, rt_addr dstcell);
+int32_t rt_seti_probe(rt_addr tblcell, rt_addr keycell, rt_addr valcell);
 int32_t rt_arith(int32_t op, rt_addr lhscell, rt_addr rhscell, rt_addr dstcell,
                  int32_t line, int32_t h1, int32_t h2, int32_t hcall);
 int32_t rt_len(rt_addr cell, rt_addr dstcell, int32_t line, int32_t hobj,

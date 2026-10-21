@@ -93,7 +93,7 @@ instruction runs** on the machine below. So:
 - **Scripts run a lot** — pool the VM. A pooled VM compiles once and
   re-runs in place; the per-run cost drops back to microseconds and even a
   trivial script round-trips faster than building a fresh interpreter
-  state (40 µs vs 67 µs below). The `host/` package is built around
+  state (43 µs vs 68 µs below). The `host/` package is built around
   this posture.
 
 ### Measured — production path (`host/` on wazero), 2026-10-20
@@ -101,18 +101,18 @@ instruction runs** on the machine below. So:
 Medians on one Apple-silicon Mac (arm64, go1.27); the meaningful column is
 the *ratio* — absolute numbers move with machine and engine version. All
 runs output-checked identical across paths. (These lanes are call-thin —
-for the call-shaped post-U9c numbers see the by-shape table below and
-`docs/U9-perf.md`.)
+for the call-shaped post-U9c numbers and the post-U10 fast-path work see
+the by-shape table below, `docs/U9-perf.md`, and `docs/U10-perf.md`.)
 
-| script (shape) | interp | wasm, cold VM | wasm, pooled VM |
-|---|---|---|---|
-| h_tiny (startup only) | 67.4 µs | 70.2 ms | **40.2 µs** |
-| h_str (short string ops) | 173 µs | 73.2 ms | 851 µs |
-| h_strlong (150 KB text processing) | 1.71 ms | 106 ms | 17.2 ms |
-| h_numloop (4 M-iteration numeric) | 131 ms | 1.27 s | 1.18 s |
-| h_tablechurn (table alloc churn) | 10.8 ms | 169 ms | 91.1 ms |
-| h_concat (concat-heavy) | 1.25 ms | 78.8 ms | 5.9 ms |
-| h_hostfn (3000 Go-call round trips) | 749 µs | 78.0 ms | 6.4 ms |
+| script (shape)                      | interp  | wasm, cold VM | wasm, pooled VM |
+|-------------------------------------|---------|---------------|-----------------|
+| h_tiny (startup only)               | 67.9 µs | 69.8 ms       | **42.6 µs**     |
+| h_str (short string ops)            | 170 µs  | 72.7 ms       | 552 µs          |
+| h_strlong (150 KB text processing)  | 1.45 ms | 91.2 ms       | 15.2 ms         |
+| h_numloop (4 M-iteration numeric)   | 128.6 ms| 112.6 ms      | **42.0 ms**     |
+| h_tablechurn (table alloc churn)    | 10.1 ms | 136.2 ms      | 57.4 ms         |
+| h_concat (concat-heavy)             | 941 µs  | 77.3 ms       | 5.2 ms          |
+| h_hostfn (3000 Go-call round trips) | 595 µs  | 77.0 ms       | 6.0 ms          |
 
 Read the table as: cold = compile + instantiate + run once; pooled =
 already-instantiated VM, run again. The 70 ms column is the "short script
@@ -120,29 +120,29 @@ you run a lot" penalty — pooling removes it.
 
 ### By shape — compiler vs interpreter
 
-| shape | wasm on wasmtime | wasm on wazero | vs interpreter |
-|---|---|---|---|
-| nsieve (numeric loop + table stores) | 360 ms | 9.10 s | interp ~460–530 ms: **~25% faster** on wasmtime |
-| stringwork (~150 KB text) | 67 ms | 446 ms | interp ~17 ms: ~4× / ~26× slower |
-| fib(30) (call-heavy recursion)¹ | **0.15 s** | **2.0 s** | interp ~158 ms: parity / ~12.7× slower |
+| shape                                | wasm on wasmtime | wasm on wazero | vs interpreter                                   |
+|--------------------------------------|------------------|----------------|--------------------------------------------------|
+| nsieve (numeric loop + table stores) | **80 ms**        | 230 ms         | interp 290 ms: **3.6× faster** on wasmtime, parity on wazero |
+| stringwork (~150 KB text)            | 40 ms            | 140 ms         | interp ~10 ms: ~4× / ~14× slower                 |
+| fib(30) (call-heavy recursion)¹      | **110 ms**       | 230 ms         | interp 160 ms: **1.5× faster** on wasmtime, parity on wazero |
 
-¹ Re-measured 2026-10-20 after U9c (direct in-module dispatch —
-compiled-callee OP_CALL no longer crosses the host seam, ledger row
-104): wasmtime fib(30) 14.2 s → 0.15 s (prebuilt `luawasm-run`, 3
-runs), wazero warm 7.46 s-era → 2.0 s. The nsieve/stringwork rows are
-older measurements kept for shape context.
+¹ Re-measured 2026-10-20 after U9c (direct in-module dispatch, ledger
+row 104) and U10 (in-wasm arith/compare fast paths + unprotected table
+probes — `docs/U10-perf.md`): fib on wazero went 2.0 s → 0.23 s
+process time (0.14 s warm pooled, *below* the interpreter's 157 ms).
+The old "wazero codegen gap" was not codegen: every per-op protected
+rt helper entered a `try_table`, and wazero clones the machine stack
+per enter (10,880 B). U10 removed those per-op enters; process times
+here include ~70–100 ms instantiation.
 
-Two honest caveats, both active work rather than laws of nature:
+One caveat, active work rather than a law of nature:
 
-- **The production engine is not there yet.** Wazero's generated code for
-  the C runtime's table/string routines currently runs much slower than
-  wasmtime's (nsieve: 25× apart), so on the pure-Go `host/` path the
-  numeric-loop wins have not yet crossed the interpreter — that codegen
-  gap is the top open performance item (it is also what remains of the
-  fib gap above: the per-call seam is gone, the rt-helper codegen is
-  what's left).
-- **Call shape, post-U9c.** Compiled-callee calls now run in-module
-  (leaf-call churn is at interpreter parity; see `docs/U9-perf.md`).
+- **Strings are the remaining gap.** Numeric, call, and table lanes now
+  beat the interpreter on the pooled production path (numloop 3.1×,
+  fib/nsieve/tco ~1.1×). String-heavy lanes are still behind
+  (`h_strlong` ~10× interp warm): Lua's string routines running as
+  wazero-compiled C — no enter tax left there either, so this is
+  genuine codegen/RT work and the top open perf item.
   C callees, `__call` chains and cross-module closures still take the
   host dispatch seam, and tailcalls ride the staged M5c path.
 

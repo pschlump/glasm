@@ -263,6 +263,10 @@ func (b *backend) declareImports() {
 		"rt_newtable":      m.ImportFunc("rt", "rt_newtable", iii, i32v),
 		"rt_gettable":      m.ImportFunc("rt", "rt_gettable", iiiiii, i32v),
 		"rt_settable":      m.ImportFunc("rt", "rt_settable", iiiiii, i32v),
+		// U10 probes (iii, i32v): the unprotected luaV_fastgeti/
+		// fastseti arms — a hit skips the try_table enter entirely
+		"rt_geti_probe":    m.ImportFunc("rt", "rt_geti_probe", iii, i32v),
+		"rt_seti_probe":    m.ImportFunc("rt", "rt_seti_probe", iii, i32v),
 		"rt_arith":         m.ImportFunc("rt", "rt_arith", iiiiiiii, i32v),
 		"rt_len":           m.ImportFunc("rt", "rt_len", iiiii, i32v),
 		"rt_eq":            m.ImportFunc("rt", "rt_eq", iiii, i32v),
