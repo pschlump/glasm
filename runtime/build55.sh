@@ -95,7 +95,7 @@ RT_EXPORTS="$EXPORTS \
   -Wl,--export=rt_gets_probe -Wl,--export=rt_sets_probe -Wl,--export=rt_len_probe \
   -Wl,--export=rt_stdcall_probe \
   -Wl,--export=rt_concat_probe \
-  -Wl,--export=rt_fmod -Wl,--export=rt_pow \
+  -Wl,--export=rt_fmod -Wl,--export=rt_pow -Wl,--export=rt_globals_cell \
   -Wl,--export=rt_arith -Wl,--export=rt_len -Wl,--export=rt_eq \
   -Wl,--export=rt_lt -Wl,--export=rt_le -Wl,--export=rt_concat \
   -Wl,--export=rt_call -Wl,--export=rt_call_addr \

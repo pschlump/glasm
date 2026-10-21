@@ -618,18 +618,37 @@ func (fe *funcEmitter) emitBlockBody(start, end int) {
 			fe.cellAddr(A)
 			fe.f.Call(fe.b.imp("rt_setupval"))
 		case lua.OP_GETTABUP:
+			// U11e-b: stage the _ENV table into a cell plain (main:
+			// the registry globals — rt_globals_cell; else: upvalue B
+			// via the plain rt_getupval), then the U11a short-string
+			// probe — a per-loop globals read pays no enter. Any miss
+			// (absent slot, long key, metamethod, non-table) re-issues
+			// the cells to the protected path below.
 			if fe.isMain {
 				// main runs cl=0: its _ENV upvalue IS the globals table
 				// (row 53) — lower to the registry read
+				fe.scratchAddr(0)
+				fe.f.Call(fe.b.imp("rt_globals_cell"))
+				fe.scratchAddr(0)
+				fe.kcell(C)
+				fe.cellAddr(A)
+				fe.f.Call(fe.b.imp("rt_gets_probe"))
+				fe.f.I32Eqz().If(wasm.Void)
 				fe.cellAddr(A)
 				fe.kcell(C)
 				fe.f.I32Const(fe.line(pc))
 				fe.f.Call(fe.b.imp("rt_getglobal"))
 				fe.checkStatus()
+				fe.f.End()
 			} else {
 				fe.f.LocalGet(1).I32Const(int32(B))
 				fe.scratchAddr(0)
 				fe.f.Call(fe.b.imp("rt_getupval"))
+				fe.scratchAddr(0)
+				fe.kcell(C)
+				fe.cellAddr(A)
+				fe.f.Call(fe.b.imp("rt_gets_probe"))
+				fe.f.I32Eqz().If(wasm.Void)
 				fe.scratchAddr(0)
 				fe.kcell(C)
 				fe.cellAddr(A)
@@ -640,19 +659,36 @@ func (fe *funcEmitter) emitBlockBody(start, end int) {
 				fe.f.I32Const(int32(fe.hintCallSite(pc)))
 				fe.f.Call(fe.b.imp("rt_gettable"))
 				fe.checkStatus()
+				fe.f.End()
 			}
 			fe.bumpTop(A + 1)
 		case lua.OP_SETTABUP:
+			// U11e-b: the same probe posture on the write side; the
+			// sets probe declines protected globals itself (the U6c
+			// guard — the seam hazard), misses re-issue below
 			if fe.isMain {
+				fe.scratchAddr(0)
+				fe.f.Call(fe.b.imp("rt_globals_cell"))
+				fe.scratchAddr(0)
+				fe.kcell(B)
+				fe.vcCell(C, k)
+				fe.f.Call(fe.b.imp("rt_sets_probe"))
+				fe.f.I32Eqz().If(wasm.Void)
 				fe.kcell(B)
 				fe.vcCell(C, k)
 				fe.f.I32Const(fe.line(pc))
 				fe.f.Call(fe.b.imp("rt_setglobal"))
 				fe.checkStatus()
+				fe.f.End()
 			} else {
 				fe.f.LocalGet(1).I32Const(int32(A))
 				fe.scratchAddr(0)
 				fe.f.Call(fe.b.imp("rt_getupval"))
+				fe.scratchAddr(0)
+				fe.kcell(B)
+				fe.vcCell(C, k)
+				fe.f.Call(fe.b.imp("rt_sets_probe"))
+				fe.f.I32Eqz().If(wasm.Void)
 				fe.scratchAddr(0)
 				fe.kcell(B)
 				fe.vcCell(C, k)
@@ -661,6 +697,7 @@ func (fe *funcEmitter) emitBlockBody(start, end int) {
 				fe.f.I32Const(int32(fe.hintCallSite(pc)))
 				fe.f.Call(fe.b.imp("rt_settable"))
 				fe.checkStatus()
+				fe.f.End()
 			}
 		case lua.OP_GETTABLE:
 			// U10/U11: the VM's own luaV_fastgeti and luaV_fastget

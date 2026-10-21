@@ -2201,6 +2201,25 @@ int32_t rt_setglobal(rt_addr keycell, rt_addr valcell, int32_t line) {
   return rt_run(setglobal_body, line, -1, -1, -1, NULL);
 }
 
+/* ---- U11e-b: the _ENV staging cell for GETTABUP/SETTABUP ----
+**
+** Every per-loop globals access paid a protected _ENV enter. This
+** stages the globals-table TValue into a cell PLAIN: it is stock
+** lua_getglobal's own first step (the rawgetint on the registry,
+** lapi.c) — allocation-free, runs no code, cannot raise. rt_gets_probe
+** / rt_sets_probe (the U11a short-string posture) then do the access
+** against the cell; every miss (absent globals slot, long key, a
+** metamethod, protected globals) re-issues to the protected
+** rt_getglobal/rt_setglobal above. Re-read per access, like stock —
+** lua_getglobal re-reads registry[LUA_RIDX_GLOBALS] on every call. */
+void rt_globals_cell(rt_addr cell) {
+  TValue st;
+  setnilvalue(&st); /* getint writes its out-cell only on hit (U11d) */
+  if (ttistable(&G(curL)->l_registry))
+    luaH_getint(hvalue(&G(curL)->l_registry), LUA_RIDX_GLOBALS, &st);
+  *(TValue *)(size_t)cell = st;
+}
+
 void rt_set_chunkname(rt_addr ptr, int32_t len) {
   int32_t n = len;
   if (n > (int32_t)sizeof chunk_name - 1) n = (int32_t)sizeof chunk_name - 1;

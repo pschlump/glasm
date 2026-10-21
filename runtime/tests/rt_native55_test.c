@@ -2196,6 +2196,41 @@ int main(void) {
     CHECK(rt_pow(1e10, 0.5) == 1e5);
   }
 
+  /* ---- U11e-b: rt_globals_cell — the GETTABUP/SETTABUP _ENV staging --
+  */
+  {
+    TValue env, kk, dst, before, after, vv;
+    /* the staged cell IS the registry globals table */
+    rt_globals_cell(cell_of(&env));
+    CHECK(ttistable(&env));
+    lua_pushglobaltable(L);
+    CHECK(hvalue(&env) == hvalue(s2v(L->top.p - 1)));
+    lua_pop(L, 1);
+    /* gets hit/miss through the staged cell — the GETTABUP probe shape */
+    rt_intern(cell_of(&kk), (rt_addr)(uintptr_t)"string", 6);
+    CHECK(rt_gets_probe(cell_of(&env), cell_of(&kk), cell_of(&dst)) == 1);
+    CHECK(ttistable(&dst));
+    rt_intern(cell_of(&kk), (rt_addr)(uintptr_t)"no_such_global_zz", 18);
+    rt_mkinteger(cell_of(&dst), 0x1234);
+    CHECK(rt_gets_probe(cell_of(&env), cell_of(&kk), cell_of(&dst)) == 0);
+    CHECK(ttisinteger(&dst) && ivalue(&dst) == 0x1234);
+    /* the seam hazard, pinned at the globals surface: under protection
+       the sets probe declines (the guarded psetshortstr would raise out
+       of the unprotected probe) and the value never moves */
+    rt_intern(cell_of(&kk), (rt_addr)(uintptr_t)"string", 6);
+    rt_globals_cell(cell_of(&env));
+    CHECK(rt_gets_probe(cell_of(&env), cell_of(&kk), cell_of(&before)) == 1);
+    CHECK(rt_globals_readonly(1) == 0);
+    rt_globals_cell(cell_of(&env));
+    CHECK(ttistable(&env) && rt_prot_isprotected(hvalue(&env)));
+    rt_mkinteger(cell_of(&vv), 123);
+    CHECK(rt_sets_probe(cell_of(&env), cell_of(&kk), cell_of(&vv)) == 0);
+    CHECK(rt_globals_readonly(0) == 0);
+    rt_globals_cell(cell_of(&env));
+    CHECK(rt_gets_probe(cell_of(&env), cell_of(&kk), cell_of(&after)) == 1);
+    CHECK(hvalue(&after) == hvalue(&before));
+  }
+
   CHECK(rt_wasm_count() == IDX_TAILVA + 1);
   CHECK(rt_wasm_proto(-1, 0, 0, 0, 0) == RT_ERR);
 

@@ -1,4 +1,4 @@
-# U11 — the string lanes (2026-10-20, U11c + U11d; U11e 2026-10-21)
+# U11 — the string lanes (2026-10-20, U11c + U11d; U11e/U11e-b 2026-10-21)
 
 U10 retired the numeric/call/table try_table-enter tax; the residual gap
 was strings: h_strlong ran ~10× interp warm, h_concat ~2×, and the
@@ -185,6 +185,52 @@ testdiff (976.8 s), host plain + `-race -count=2`, the four CLI legs
 (1501/1501, 96/96+3 skips, 1501/1501, 1491/1491+10 skips), and
 `_cli-tests` on both engines — all green.
 
+**U11e-b — the `_ENV` globals probes (2026-10-21):** the U11e top open
+item. Every per-loop globals read (`string.byte`/`string.find`/
+`string.format`/`string.sub` …) paid a protected `_ENV` enter — ~5,400
+of h_strlong's 6,942 residual. GETTABUP/SETTABUP now stage the env
+table into a cell plain, run the U11a short-string probes against it,
+and re-issue to the unchanged protected path on any miss:
+
+- **main** (`cl=0`, row 53): the new plain export **`rt_globals_cell`**
+  stages the globals-table TValue — stock `lua_getglobal`'s own first
+  step, the rawgetint on the registry (`lapi.c`): allocation-free,
+  runs no code, cannot raise. Re-read per access, exactly like stock
+  (`lua_getglobal` re-reads registry[LUA_RIDX_GLOBALS] every call).
+  Then `rt_gets_probe`/`rt_sets_probe` (1 = hit, the U10/U11a
+  convention); miss → the protected `rt_getglobal`/`rt_setglobal`.
+- **non-main**: the existing plain `rt_getupval` staging (upvalue B,
+  fresh per access — `_ENV = t` swaps propagate) plus the same probe
+  nest; miss → the protected `rt_gettable`/`rt_settable` (the row-71
+  hints unchanged).
+
+The miss surface is the U11a one plus the env-specific shapes: an
+absent globals slot (nil into the cell — `getint` writes its out-cell
+only on hit, the U11d lesson), long-string keys, `__index`/`__newindex`
+metamethods (the smoke's `setmetatable(_G, {__index = ...})` reads
+through the protected path), a non-table `_ENV` (the error text is
+byte-identical — `attempt to index a number value (local '_ENV')`),
+and protected globals: the sets probe declines `rt_prot_isprotected`
+itself — the U6c guard-seam hazard, now pinned natively at the globals
+surface (`rt_native55_test.c`'s readonly bracket).
+
+Enter measure (probe-alloc, warm, 10,880-byte allocations = enters):
+byte 4,340 → **5**; find 603 → **3**; a present-key GETTABUP loop and
+a SETTABUP read-modify-write loop sit at the 3-enter process floor;
+h_strlong 6,942 → **706** (−90% — the residual is almost purely the
+gmatch iterator, the next item); h_str 493 → **54**; h_concat 79 →
+**78** (noise — the lane holds almost no global reads). The gtu micro
+(reading an *absent* global in a loop) is unchanged at the protected
+count, by construction — the worst case is the unchanged stock path.
+
+Warm h_strlong 2.87 → **1.02 ms** — 0.73× interp same-day, parity
+crossed (interp 1.39 ms); h_str **110 µs vs 169 — faster than interp**
+(`bench/2026-10-21-u11eb.txt`). No ledger row: no engine diverged.
+Gates: native ×3, short, heavy testdiff (982.5 s), host plain +
+`-race -count=2`, the four CLI legs (matrix 1501/1501, error 96/96
++3 reasoned skips, the wazero and wazero-prod legs green), and
+`_cli-tests` on both engines — all green.
+
 ## The guard-seam hazard (caught by the host gate before anything shipped)
 
 The blob's `luaH_pset{,str,shortstr,int}` are not stock: they are the
@@ -205,11 +251,11 @@ matter for probe work.
 
 ## Enter attribution (wazero, warm; 10,880-byte allocations = enters)
 
-| lane | U10 | U11 | U11c | U11d | U11e | residual |
-|---|---|---|---|---|---|---|
-| h_strlong | 27,439 | 14,371 | 14,366 | 13,801 | **6,942** | GETTABUP globals (~5.4k) + gmatch + misc |
-| h_concat | 12,028 | 6,059 | **139** | 172* | **79** | sub/misc (its ONE format call now rides the probe) |
-| h_str | 1,329 | 533 | 533 | 526 | **493** | misc |
+| lane | U10 | U11 | U11c | U11d | U11e | U11e-b | residual |
+|---|---|---|---|---|---|---|---|
+| h_strlong | 27,439 | 14,371 | 14,366 | 13,801 | 6,942 | **706** | gmatch (~600) + misc |
+| h_concat | 12,028 | 6,059 | 139 | 172* | 79 | **78** | sub/misc (its ONE format call now rides the probe) |
+| h_str | 1,329 | 533 | 533 | 526 | 493 | **54** | misc |
 
 \* cross-blob recount, not a regression signal: the residual was never
 format-dominated (one format call in the lane), and enter counts are
@@ -220,41 +266,38 @@ U11c's (−5,920) takes the `..` fold itself off the protected path —
 under the DEFAULT host posture (no budget), where the v1 pre-flight
 was measuring 6,059 because it gated on the memlimit (see U11c above).
 
-## Benchmarks (same-day, quiet machine — `bench/2026-10-21-u11e.txt`)
+## Benchmarks (same-day, quiet machine — `bench/2026-10-21-u11eb.txt`)
 
 Warm = pooled VM rerun on the production path (`host/` on wazero).
 Columns U10/U11/U11c are the 2026-10-20 runs (`bench/2026-10-20-u10.txt`,
-`bench/2026-10-20-u11.txt`, `bench/2026-10-20-u11c.txt`); U11d and
-U11e + their interp columns are same-day 2026-10-21
-(`bench/2026-10-21-u11d.txt`, `bench/2026-10-21-u11e.txt`) — per the
-bench protocol the same-day/interp ratios are the only comparisons
-that cross columns cleanly (the machine shifts between days; absolute
-cross-day deltas are not meaningful):
+`bench/2026-10-20-u11.txt`, `bench/2026-10-20-u11c.txt`); U11d, U11e,
+and U11e-b + their interp columns are same-day 2026-10-21
+(`bench/2026-10-21-u11d.txt`, `bench/2026-10-21-u11e.txt`,
+`bench/2026-10-21-u11eb.txt`) — per the bench protocol the
+same-day/interp ratios are the only comparisons that cross columns
+cleanly (the machine shifts between days; absolute cross-day deltas
+are not meaningful):
 
-| lane | U10 warm | U11 warm | U11c warm | U11d warm | U11e warm | U11e / interp |
-|---|---|---|---|---|---|---|
-| h_str | 552 µs | 297 µs | 282 µs | 224 µs | **215 µs** | 1.7× (interp 128 µs) |
-| h_strlong | 15.2 ms | 6.01 ms | 5.98 ms | 4.99 ms | **2.87 ms** | **2.2×** (interp 1.32 ms; was 3.8× at U11d) |
-| h_concat | 5.2 ms | 3.20 ms | 1.55 ms | 1.49 ms | **1.45 ms** | 1.7× (interp 875 µs) |
+| lane | U10 warm | U11 warm | U11c warm | U11d warm | U11e warm | U11e-b warm | U11e-b / interp |
+|---|---|---|---|---|---|---|---|
+| h_str | 552 µs | 297 µs | 282 µs | 224 µs | 215 µs | **110 µs** | **0.65× — faster than interp** (interp 169 µs) |
+| h_strlong | 15.2 ms | 6.01 ms | 5.98 ms | 4.99 ms | 2.87 ms | **1.02 ms** | **0.73× — interp parity crossed** (interp 1.39 ms; was 2.2× at U11e, 3.8× at U11d) |
+| h_concat | 5.2 ms | 3.20 ms | 1.55 ms | 1.49 ms | 1.45 ms | **1.59 ms** | 1.7× (interp 922 µs — unchanged, the lane holds no global reads; the cross-day 1.45→1.59 wobble is day noise) |
 
-Non-string lanes are at or past interp parity same-day (numloop
-39.5 ms vs 116.6, fib 131.4 ms, nsieve 41.6 ms, tco 9.07 ms,
-callret 21.5 ms — unchanged within noise, as expected: U11e removes
-enters, not work, and those lanes' arith was already a minor share).
-U11e takes ~43% off h_strlong warm — the arith fallbacks were 43% of
-its enters and the two match. The residual string gap is the
-per-loop `_ENV` global reads and the gmatch iterator (below).
+The non-string lanes are unchanged within noise, as expected (U11e-b
+removes enters, not work): numloop 41.5 ms vs interp 127.1, fib 134.0
+vs 150.9, nsieve 42.5 vs 47.8, tco 9.17 vs 9.84, callret 21.6 vs 19.7,
+tiny 24.0 µs vs 51.4. After U11e-b, every lane except h_concat (1.7×)
+and h_callret (1.10×) is at or faster than interp warm same-day — the
+string lanes crossed parity at U11e-b, and what remains of the string
+gap is the gmatch iterator (below) and h_concat's allocating fold.
 
 ## Open items
 
-- **GETTABUP/SETTABUP globals (the top item now):** every per-loop
-  `string.byte` / `string.find` / `string.format` global read pays a
-  protected `_ENV` enter (~5,400 of h_strlong's 6,942 residual) —
-  the same getshortstr shape as U11a's `rt_gets_probe`, but against
-  the frame function's `_ENV` upvalue cell.
-- The gmatch iterator as the next stdcall target (~600 enters; a C
-  closure with 3 upvalues, not a light C function — it needs its own
-  pin/dispatch shape, not `rt_stdcall_probe`'s `ttislcf` check, plus
-  a TFORCALL-site hook).
+- **The gmatch iterator (the top item now):** ~600 of h_strlong's 706
+  residual enters — `string.gmatch` returns a C closure with 3
+  upvalues, not a light C function, so it needs its own pin/dispatch
+  shape beyond `rt_stdcall_probe`'s `ttislcf` check, plus a
+  TFORCALL-site hook.
 - wazero upstream: the per-enter stack clone is an engine cost the
   probes route around, not fix.

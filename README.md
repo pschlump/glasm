@@ -93,10 +93,10 @@ instruction runs** on the machine below. So:
 - **Scripts run a lot** — pool the VM. A pooled VM compiles once and
   re-runs in place; the per-run cost drops back to microseconds and even a
   trivial script round-trips faster than building a fresh interpreter
-  state (41 µs vs 68 µs below). The `host/` package is built around
+  state (24 µs vs 51 µs below). The `host/` package is built around
   this posture.
 
-### Measured — production path (`host/` on wazero), 2026-10-20
+### Measured — production path (`host/` on wazero), 2026-10-21
 
 Medians on one Apple-silicon Mac (arm64, go1.27); the meaningful column is
 the *ratio* — absolute numbers move with machine and engine version. All
@@ -106,13 +106,13 @@ the by-shape table below, `docs/U9-perf.md`, and `docs/U10-perf.md`.)
 
 | script (shape)                      | interp  | wasm, cold VM | wasm, pooled VM |
 |-------------------------------------|---------|---------------|-----------------|
-| h_tiny (startup only)               | 52.0 µs | 65.1 ms       | **18.3 µs**     |
-| h_str (short string ops)            | 128 µs  | 68.3 ms       | 215 µs          |
-| h_strlong (150 KB text processing)  | 1.32 ms | 82.2 ms       | **2.87 ms**     |
-| h_numloop (4 M-iteration numeric)   | 116.6 ms| 108.9 ms      | **39.5 ms**     |
-| h_tablechurn (table alloc churn)    | 9.5 ms  | 94.8 ms       | **22.7 ms**     |
-| h_concat (concat-heavy)             | 875 µs  | 70.8 ms       | **1.45 ms**     |
-| h_hostfn (3000 Go-call round trips) | 539 µs  | 72.5 ms       | 3.90 ms         |
+| h_tiny (startup only)               | 51.4 µs | 67.0 ms       | **24.0 µs**     |
+| h_str (short string ops)            | 169 µs  | 73.2 ms       | **110 µs**      |
+| h_strlong (150 KB text processing)  | 1.39 ms | 77.5 ms       | **1.02 ms**     |
+| h_numloop (4 M-iteration numeric)   | 127.1 ms| 114.0 ms      | **41.5 ms**     |
+| h_tablechurn (table alloc churn)    | 9.9 ms  | 107.1 ms      | 28.0 ms         |
+| h_concat (concat-heavy)             | 922 µs  | 74.8 ms       | 1.59 ms         |
+| h_hostfn (3000 Go-call round trips) | 584 µs  | 71.6 ms       | 2.96 ms         |
 
 Read the table as: cold = compile + instantiate + run once; pooled =
 already-instantiated VM, run again. The 70 ms column is the "short script
@@ -123,8 +123,9 @@ you run a lot" penalty — pooling removes it.
 Process-time medians (3 runs) over the luabench scripts, re-measured
 2026-10-21 after U9c (direct dispatch), U10 (arith/compare/table fast
 paths), U11 (string-lane probes), U11c (the concat fold probe),
-U11d (the `string.format` probe) and U11e (the in-wasm `// % / ^`
-arith arms) — `bench/2026-10-21-u11e.txt` (the U11/U11c runs:
+U11d (the `string.format` probe), U11e (the in-wasm `// % / ^`
+arith arms) and U11e-b (the `_ENV` GETTABUP/SETTABUP globals probes) —
+`bench/2026-10-21-u11eb.txt` (the U11/U11c runs:
 `bench/2026-10-20-u11*.txt`):
 
 | shape                                | wasm on wasmtime | wasm on wazero | vs interpreter                        |
@@ -144,24 +145,25 @@ are the table above.
 
 One caveat, active work rather than a law of nature:
 
-- **String allocation lanes are the remaining gap.** Numeric, call,
-  and table lanes beat the interpreter on the pooled production path
+- **The string lanes reached interp parity.** Numeric, call, and
+  table lanes beat the interpreter on the pooled production path
   (numloop 3× faster, fib/nsieve/tco at parity or better; tablechurn's
-  alloc churn still pays ~2×), and after U11 the string *scan*
-  lanes run at 1.6–3.9× interp (`docs/U11-perf.md`: short-string
-  table keys, `#`, and `string.byte`/`string.find` run inline, no
-  protected-call enter). U11c took the allocating `..` itself off the
-  protected route (h_concat 1.7× interp, down from 3.4× — one-pass
-  fold with a two-sided memory pre-flight), U11d folded
-  `string.format` in the same posture, and U11e moved the last
-  arith fallbacks in-wasm (`%`/`//` floor semantics, `/`/`^` float
-  arms via plain never-raise helpers — h_strlong 2.2× interp, down
-  from ~10× at U10 — `docs/U11-perf.md`). What still pays the
-  protected C route: the per-loop `_ENV` global reads, gmatch's
-  iterator, and the un-probed stdlib callees (`sub`, `rep`, …).
-  C callees beyond the probed set, `__call` chains and
-  cross-module closures still take the host dispatch seam, and
-  tailcalls ride the staged M5c path.
+  alloc churn still pays ~2.5×), and after U11e-b the string lanes
+  are at or past parity too — short-string table keys, `#`,
+  `string.byte`/`string.find` run inline with no protected-call enter,
+  U11c took the allocating `..` itself off the protected route
+  (one-pass fold with a two-sided memory pre-flight), U11d folded
+  `string.format`, U11e moved the last arith fallbacks in-wasm
+  (`%`/`//` floor semantics, `/`/`^` float arms via plain never-raise
+  helpers), and U11e-b staged the `_ENV` globals cell plain so
+  per-loop global reads ride the short-string probe — h_strlong
+  **0.73× interp** (was ~10× at U10, 2.2× at U11e), h_str 0.65×
+  (`docs/U11-perf.md`). What still pays the protected C route:
+  gmatch's iterator (~600 of h_strlong's 706 residual enters — the
+  next item), h_concat's allocating fold (1.7× interp), and the
+  un-probed stdlib callees (`sub`, `rep`, …). C callees beyond the
+  probed set, `__call` chains and cross-module closures still take
+  the host dispatch seam, and tailcalls ride the staged M5c path.
 
 To reproduce: `go run ./cmd/luabench` (interp vs wasm cold/warm on the
 production engine, output-checked); see also `cmd/luawasmc` +

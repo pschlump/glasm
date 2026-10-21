@@ -295,6 +295,7 @@ func (b *backend) declareImports() {
 		"rt_frame_alloc":   m.ImportFunc("rt", "rt_frame_alloc", i32v, i32v),
 		"rt_getglobal":     m.ImportFunc("rt", "rt_getglobal", iii, i32v),
 		"rt_setglobal":     m.ImportFunc("rt", "rt_setglobal", iii, i32v),
+		"rt_globals_cell":  m.ImportFunc("rt", "rt_globals_cell", i32v, nil),
 		"rt_intern":        m.ImportFunc("rt", "rt_intern", iii, i32v),
 		"rt_mknumber":      m.ImportFunc("rt", "rt_mknumber", i32f64, nil),
 		"rt_mkinteger":     m.ImportFunc("rt", "rt_mkinteger", i32i64, nil),

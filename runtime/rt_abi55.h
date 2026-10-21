@@ -226,6 +226,13 @@ int32_t rt_concat_probe(rt_addr cells, int32_t count, rt_addr dstcell);
 ** Additive; LUA_RT_ABI stays 4. */
 double rt_fmod(double a, double b);
 double rt_pow(double a, double b);
+/* U11e-b: the globals-table TValue (registry[LUA_RIDX_GLOBALS], stock
+** lua_getglobal's own first step) staged into a cell, PLAIN — the
+** GETTABUP/SETTABUP probes' _ENV staging (main runs cl=0; its _ENV is
+** the globals table, ledger row 53). Nil into the cell = every probe
+** declines to the protected rt_getglobal/rt_setglobal. Cannot raise.
+** Additive; LUA_RT_ABI stays 4. */
+void rt_globals_cell(rt_addr cell);
 int32_t rt_arith(int32_t op, rt_addr lhscell, rt_addr rhscell, rt_addr dstcell,
                  int32_t line, int32_t h1, int32_t h2, int32_t hcall);
 int32_t rt_len(rt_addr cell, rt_addr dstcell, int32_t line, int32_t hobj,
