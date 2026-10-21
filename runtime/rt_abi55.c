@@ -30,6 +30,10 @@
 #include <stdio.h>
 #include <string.h>
 #include <limits.h>
+#include <ctype.h>
+#include <float.h>
+#include <locale.h>
+#include <math.h>
 
 #include "rt_abi55.h"
 #include "lua55/src/lauxlib.h"
@@ -618,7 +622,9 @@ int32_t rt_len_probe(rt_addr srccell, rt_addr dstcell) {
 ** return uses rt_call_addr's encoding. 1 = MISS (this probe never
 ** errors): the caller falls through to the protected call. */
 
-static TValue sc_byte, sc_find;
+static TValue sc_byte, sc_find, sc_format;
+static TString *sc_tostring_key; /* "__tostring": 5.5.1 has no TM slot
+                                    (luaL_tolstring rawgets the real mt) */
 static int sc_resolved = 0;
 
 static void sc_resolve(void) {
@@ -627,8 +633,10 @@ static void sc_resolve(void) {
   if (sc_resolved)
     return;
   sc_resolved = 1;
+  sc_tostring_key = luaS_new(curL, "__tostring");
   setnilvalue(&sc_byte);
   setnilvalue(&sc_find);
+  setnilvalue(&sc_format);
   /* raw walk: registry[LUA_RIDX_GLOBALS] -> "string" -> "byte"/"find" —
      no metamethods, no C stack, no ordering hazard against globals
      protection. The short names are interned, so luaS_new finds them
@@ -652,6 +660,10 @@ static void sc_resolve(void) {
   luaH_getshortstr(gt, tsvalue(&key), &sc_find);
   if (!ttislcf(&sc_find))
     setnilvalue(&sc_find);
+  setsvalue(curL, &key, luaS_new(curL, "format"));
+  luaH_getshortstr(gt, tsvalue(&key), &sc_format);
+  if (!ttislcf(&sc_format))
+    setnilvalue(&sc_format);
 }
 
 /* lstrlib.c's index helpers, verbatim (arg coercion removed: the
@@ -727,6 +739,8 @@ static int32_t sc_stage(TValue *dst, int w, const TValue *res, int nres) {
   }
   return w < 0 ? -(nres + 1) : RT_OK;
 }
+
+static int sc_format_arm(TValue *args, int n, TValue *dst, int w);
 
 int32_t rt_stdcall_probe(rt_addr funcaddr, rt_addr argcells, int32_t nargs,
                          int32_t want) {
@@ -811,6 +825,11 @@ int32_t rt_stdcall_probe(rt_addr funcaddr, rt_addr argcells, int32_t nargs,
     }
     setnilvalue(&res[0]);
     return sc_stage(dst, w, res, 1);
+  }
+  if (luaV_rawequalobj(fn, &sc_format)) {
+    /* str_format's fold (U11d): stages its single result via sc_stage,
+       or returns 1 = MISS for every raising/exotic shape */
+    return sc_format_arm(args, n, dst, w);
   }
   return 1; /* not a probe-known function */
 }
@@ -1223,6 +1242,33 @@ void *rt_alloc(void *ud, void *ptr, size_t osize, size_t nsize) {
   return np;
 }
 
+/* The two-sided probe pre-flight (U11c), shared by the concat fold and
+** the string.format fold. 'resultlen' is the result string's byte
+** length; 'mayintern' adds the exact growstrtab peak when a short
+** interning is due. Side 1: a malloc(need) round trip against the real
+** allocator — a following request of at most 'need' bytes cannot fail,
+** so a NULL is exactly the real wall (linear-memory max / dlmalloc
+** fragmentation), which no accounting predicts and the only check
+** under limit==0. Side 2: rt_alloc's own cap arithmetic when budgeted
+** (the emergency cap only adds headroom, so the plain limit is the
+** conservative side). Returns 1 = safe, 0 = decline (never attempt). */
+static int rt_probe_mem_ok(size_t resultlen, int mayintern) {
+  size_t need = sizeof(TString) + resultlen + 1;
+  if (mayintern && resultlen <= LUAI_MAXSHORTLEN) {
+    stringtable *tb = &G(curL)->strt;
+    if (tb->nuse >= tb->size)
+      need += (size_t)tb->size * 2 * sizeof(TString *);
+  }
+  {
+    void *t = malloc(need + 64);
+    if (t == NULL) return 0; /* the real wall: miss, never attempt */
+    free(t);
+  }
+  if (rt_mem_limit > 0 && rt_mem_used + (int64_t)need > rt_mem_limit)
+    return 0; /* the cap refusal: clean catchable raise on the other path */
+  return 1;
+}
+
 /* ---- U11c: concat probe ----
 **
 ** OP_CONCAT's fold as an unprotected probe with an exact memory
@@ -1261,32 +1307,8 @@ int32_t rt_concat_probe(rt_addr cellsaddr, int32_t count, rt_addr dstaddr) {
   }
   if (total >= MAX_SIZE - sizeof(TString))
     return 0; /* would raise "string length overflow" */
-  {
-    stringtable *tb = &G(curL)->strt;
-    /* covers sizestrshr/sizelngstr for the result (header + total + 1) */
-    size_t need = sizeof(TString) + total + 1;
-    if (total <= LUAI_MAXSHORTLEN && tb->nuse >= tb->size)
-      need += (size_t)tb->size * 2 * sizeof(TString *); /* growstrtab peak */
-    /* Serviceability against the REAL allocator, both modes: probe with
-       one contiguous block covering the worst case (all requests summed,
-       plus split headers), then give it back — a following request of
-       at most 'need' bytes cannot fail, so a NULL here is exactly the
-       real wall (linear-memory max / dlmalloc fragmentation), which no
-       accounting can predict (limit==0 has no other check at all).
-       Sum-contiguity is stricter than the 1-2 separate requests ever
-       need, so it only ever declines early — never wrongly hits. */
-    {
-      void *t = malloc(need + 64);
-      if (t == NULL) return 0; /* the real wall: miss, never attempt */
-      free(t);
-    }
-    /* The cap side, when budgeted — rt_alloc's own refusal arithmetic
-       (the emergency cap only adds headroom, so the plain limit is the
-       conservative side). A refusal would be a clean catchable raise:
-       on the protected path, not here. */
-    if (rt_mem_limit > 0 && rt_mem_used + (int64_t)need > rt_mem_limit)
-      return 0;
-  }
+  if (!rt_probe_mem_ok(total, 1))
+    return 0; /* the shared two-sided pre-flight (see it for the law) */
   {
     char sbuff[LUAI_MAXSHORTLEN];
     TString *ts = NULL; /* NULL = building into sbuff (short result) */
@@ -1317,6 +1339,495 @@ int32_t rt_concat_probe(rt_addr cellsaddr, int32_t count, rt_addr dstaddr) {
     setsvalue(curL, dst, ts);
   }
   return 1; /* hit: like the U10/U11a table probes (1 = handled) */
+}
+
+/* ---- U11d: string.format probe ----
+**
+** str_format's fold over cells, same posture as byte/find/concat: the
+** stock success arms verbatim, every raising or exotic shape declines
+** to the protected call (which raises the stock texts), and the one
+** allocation — the result string — goes through the shared two-sided
+** pre-flight. Pass 1 walks the format with stock's own parser
+** (getformat/checkformat/get2digits/addlenmod, verbatim), screening
+** each arg cell (numbers via luaO_tostringbuff, integer-exact floats,
+** raw strings) and formatting numeric pieces into per-piece C buffers,
+** so 'total' is exact; pass 2 emits. The hex float formatter is the
+** tree's own fallback (num2straux — this build has no system %a),
+** ported verbatim for %a/%A and %q-float, like quotefloat and
+** addquoted's count/emit twins. luaL_tolstring's __tostring callmeta
+** arm can re-enter: string/number/boolean metatables with __tostring
+** decline. %p (pointers are engine-specific) and numeral-string
+** coercions (stock coerces "42" in %d; the probe declines string cells
+** for numeric conversions) also decline. Everything declined is
+** byte-identical on the protected path — no ledger row.
+*/
+
+/* lstrlib.c's format constants and flag sets (they are #define'd there,
+   out of this file's reach — pinned here, shapes verbatim) */
+#define SC_FMT_MAX_FORMAT 32 /* MAX_FORMAT */
+#define SC_FMT_ITEM 120      /* MAX_ITEM */
+#define SC_FMT_ITEMF (110 + DBL_MAX_10_EXP) /* MAX_ITEMF; lua_Number = double */
+_Static_assert(sizeof(lua_Number) == sizeof(double),
+               "SC_FMT_ITEMF is derived from DBL_MAX_10_EXP");
+#define SC_FMT_PIECES 24 /* directives + literal runs; beyond = miss */
+#define SC_FMTFLAGSF "-+#0 " /* valid flags overall (getformat's span) */
+#define SC_FMTFLAGSC "-"     /* c, p, s */
+#define SC_FMTFLAGSI "-+0 "  /* d, i */
+#define SC_FMTFLAGSU "-0"    /* u */
+#define SC_FMTFLAGSX "-#0"   /* o, x, X */
+
+typedef struct {
+  int qstr;  /* 1 = p/rl is raw string, emit quoted */
+  int inbuf; /* 1 = bytes in buf */
+  const char *p;
+  size_t rl; /* raw length (qstr) */
+  size_t l;  /* emitted length */
+  char buf[SC_FMT_ITEMF + 1];
+} ScPiece;
+
+/* lstrlib.c helpers, verbatim (errors become declines) */
+static const char *sc_get2digits(const char *s) {
+  if (isdigit(cast_uchar(*s))) {
+    s++;
+    if (isdigit(cast_uchar(*s)))
+      s++; /* (2 digits at most) */
+  }
+  return s;
+}
+
+static int sc_checkformat(const char *form, const char *flags,
+                          int precision) {
+  const char *spec = form + 1; /* skip '%' */
+  spec += strspn(spec, flags); /* skip flags */
+  if (*spec != '0') {          /* a width cannot start with '0' */
+    spec = sc_get2digits(spec); /* skip width */
+    if (*spec == '.' && precision) {
+      spec++;
+      spec = sc_get2digits(spec); /* skip precision */
+    }
+  }
+  return isalpha(cast_uchar(*spec)) != 0; /* reached the end = valid */
+}
+
+static const char *sc_getformat(const char *strfrmt, char *form) {
+  size_t len = strspn(strfrmt, SC_FMTFLAGSF "123456789.");
+  len++; /* adds following character (should be the specifier) */
+  if (len >= SC_FMT_MAX_FORMAT - 10)
+    return NULL; /* "invalid format (too long)": protected path */
+  *(form++) = '%';
+  memcpy(form, strfrmt, len);
+  *(form + len) = '\0';
+  return strfrmt + len - 1;
+}
+
+static void sc_addlenmod(char *form, const char *lenmod) {
+  size_t l = strlen(form);
+  size_t lm = strlen(lenmod);
+  char spec = form[l - 1];
+  strcpy(form + l - 1, lenmod);
+  form[l + lm - 1] = spec;
+  form[l + lm] = '\0';
+}
+
+/* the tree's hexadecimal float formatter (lstrlib.c compiles the
+   fallback — no system %a), verbatim */
+#define SC_NBFD ((DBL_MANT_DIG - 1) % 4 + 1) /* L_NBFD for double */
+
+static lua_Number sc_adddigit(char *buff, unsigned n, lua_Number x) {
+  lua_Number dd = floor(x); /* get integer part from 'x' */
+  int d = (int)dd;
+  buff[n] = cast_char(d < 10 ? d + '0' : d - 10 + 'a');
+  return x - dd; /* return what is left */
+}
+
+static int sc_num2straux(char *buff, unsigned sz, lua_Number x) {
+  if (x != x || x == (lua_Number)HUGE_VAL || x == -(lua_Number)HUGE_VAL)
+    return snprintf(buff, sz, LUA_NUMBER_FMT, (double)x);
+  else if (x == 0) /* can be -0... */
+    return snprintf(buff, sz, LUA_NUMBER_FMT "x0p+0", (double)x);
+  else {
+    int e;
+    lua_Number m = frexp(x, &e);
+    unsigned n = 0;
+    if (m < 0) {
+      buff[n++] = '-';
+      m = -m;
+    }
+    buff[n++] = '0';
+    buff[n++] = 'x';
+    m = sc_adddigit(buff, n++, m * (1 << SC_NBFD));
+    e -= SC_NBFD;
+    if (m > 0) {
+      buff[n++] = lua_getlocaledecpoint(); /* add radix point ("." here) */
+      do {
+        m = sc_adddigit(buff, n++, m * 16);
+      } while (m > 0);
+    }
+    n += (unsigned)snprintf(buff + n, sz - n, "p%+d", e);
+    return (int)n;
+  }
+}
+
+static int sc_number2strx(char *buff, unsigned sz, const char *fmt,
+                          lua_Number x) {
+  int n = sc_num2straux(buff, sz, x);
+  if (fmt[sizeof(LUA_NUMBER_FRMLEN)] == 'A') {
+    int i;
+    for (i = 0; i < n; i++)
+      buff[i] = toupper(cast_uchar(buff[i]));
+  } else if (fmt[sizeof(LUA_NUMBER_FRMLEN)] != 'a')
+    return -1; /* "modifiers for format '%a'/'%A' not implemented" */
+  return n;
+}
+
+/* quotefloat, verbatim (%q on floats) */
+static int sc_quotefloat(char *buff, lua_Number n) {
+  const char *s;
+  if (n == (lua_Number)HUGE_VAL)
+    s = "1e9999";
+  else if (n == -(lua_Number)HUGE_VAL)
+    s = "-1e9999";
+  else if (n != n)
+    s = "(0/0)";
+  else {
+    int nb = sc_number2strx(buff, SC_FMT_ITEM, "%" LUA_NUMBER_FRMLEN "a", n);
+    if (nb < 0)
+      return -1;
+    if (memchr(buff, '.', (size_t)nb) == NULL) { /* no dot? */
+      char point = lua_getlocaledecpoint();
+      char *ppoint = (char *)memchr(buff, point, (size_t)nb);
+      if (ppoint)
+        *ppoint = '.'; /* change it to a dot */
+    }
+    return nb;
+  }
+  return snprintf(buff, SC_FMT_ITEM, "%s", s);
+}
+
+/* addquoted's counting twin (%q on strings): same branches, bytes
+   counted instead of emitted — the emit twin below must stay in lockstep */
+static size_t sc_count_quoted(const char *s, size_t len) {
+  size_t n = 2; /* the quotes */
+  while (len--) {
+    if (*s == '"' || *s == '\\' || *s == '\n')
+      n += 2;
+    else if (iscntrl(cast_uchar(*s))) {
+      unsigned char c = (unsigned char)*s;
+      if (isdigit(cast_uchar(*(s + 1))))
+        n += 4; /* \\%03d */
+      else
+        n += 1 + (c < 10 ? 1 : c < 100 ? 2 : 3); /* \\%d */
+    } else
+      n += 1;
+    s++;
+  }
+  return n;
+}
+
+static void sc_emit_quoted(char **pp, const char *s, size_t len) {
+  char *p = *pp;
+  *p++ = '"';
+  while (len--) {
+    if (*s == '"' || *s == '\\' || *s == '\n') {
+      *p++ = '\\';
+      *p++ = *s;
+    } else if (iscntrl(cast_uchar(*s))) {
+      if (!isdigit(cast_uchar(*(s + 1))))
+        p += sprintf(p, "\\%d", (int)cast_uchar(*s));
+      else
+        p += sprintf(p, "\\%03d", (int)cast_uchar(*s));
+    } else
+      *p++ = *s;
+    s++;
+  }
+  *p++ = '"';
+  *pp = p;
+}
+
+/* luaL_tolstring's callmeta arm can re-enter Lua: if the type carries a
+   __tostring, the probe declines (raw strings/numbers are safe) */
+static int sc_has_tostring_meta(int tt) {
+  Table *mt;
+  TValue v;
+  if (sc_tostring_key == NULL)
+    return 1; /* pin failed: decline everything with a metatable */
+  mt = G(curL)->mt[tt];
+  if (mt == NULL)
+    return 0;
+  setnilvalue(&v); /* finishnodeget writes res only on hit */
+  luaH_getshortstr(mt, sc_tostring_key, &v);
+  return !ttisnil(&v); /* luaL_getmetafield's rawget, verbatim */
+}
+
+/* luaL_checkinteger's acceptance minus numeral-string coercion (stock
+   coerces "42"; the probe declines string cells for numeric formats) */
+static int sc_tointexact(const TValue *o, lua_Integer *out) {
+  if (ttisinteger(o)) {
+    *out = ivalue(o);
+    return 1;
+  }
+  if (ttisfloat(o))
+    return luaV_flttointeger(fltvalue(o), out, F2Ieq);
+  return 0;
+}
+
+static int sc_format_arm(TValue *args, int n, TValue *dst, int w) {
+  ScPiece pcs[SC_FMT_PIECES];
+  int np = 0, arg = 1, i; /* arg counts from 1 = the fmt itself */
+  size_t total = 0;
+  const char *frmt, *end;
+  TValue resv;
+  TString *ts;
+  char *p;
+  char sbuff[LUAI_MAXSHORTLEN];
+
+  if (n < 1 || !ttisstring(&args[0]))
+    return 1; /* luaL_checklstring's coercion shapes: protected path */
+  frmt = getstr(tsvalue(&args[0]));
+  end = frmt + tsslen(tsvalue(&args[0]));
+
+  while (frmt < end) {
+    ScPiece *pc;
+    if (np >= SC_FMT_PIECES)
+      return 1; /* beyond 24 pieces: not a hot-lane shape */
+    pc = &pcs[np];
+    pc->qstr = 0;
+    pc->inbuf = 0;
+    pc->p = NULL;
+    pc->rl = pc->l = 0;
+    pc->buf[0] = '\0';
+    if (*frmt != '%') { /* literal run up to the next '%' */
+      const char *st = frmt;
+      while (frmt < end && *frmt != '%')
+        frmt++;
+      pc->p = st;
+      pc->l = (size_t)(frmt - st);
+      total += pc->l;
+      np++;
+      continue;
+    }
+    if (*++frmt == '%') { /* %% */
+      pc->p = frmt++;
+      pc->l = 1;
+      total += 1;
+      np++;
+      continue;
+    }
+    { /* format item */
+      char form[SC_FMT_MAX_FORMAT];
+      unsigned maxitem = SC_FMT_ITEM;
+      const char *flags;
+      int nb = 0;
+      const TValue *av;
+      if (++arg > n)
+        return 1; /* "no value" */
+      av = &args[arg - 1];
+      frmt = sc_getformat(frmt, form);
+      if (frmt == NULL)
+        return 1;
+      switch (*frmt++) {
+        case 'c': {
+          lua_Integer nv;
+          if (!sc_checkformat(form, SC_FMTFLAGSC, 0))
+            return 1;
+          if (!sc_tointexact(av, &nv))
+            return 1;
+          nb = snprintf(pc->buf, maxitem, form, (int)nv);
+          pc->inbuf = 1;
+          break;
+        }
+        case 'd':
+        case 'i':
+          flags = SC_FMTFLAGSI;
+          goto intcase;
+        case 'u':
+          flags = SC_FMTFLAGSU;
+          goto intcase;
+        case 'o':
+        case 'x':
+        case 'X':
+          flags = SC_FMTFLAGSX;
+        intcase : {
+          lua_Integer nv;
+          if (!sc_tointexact(av, &nv))
+            return 1;
+          if (!sc_checkformat(form, flags, 1))
+            return 1;
+          sc_addlenmod(form, LUA_INTEGER_FRMLEN);
+          nb = snprintf(pc->buf, maxitem, form, (LUAI_UACINT)nv);
+          pc->inbuf = 1;
+          break;
+        }
+        case 'a':
+        case 'A': {
+          if (!ttisnumber(av))
+            return 1;
+          if (!sc_checkformat(form, SC_FMTFLAGSF, 1))
+            return 1;
+          sc_addlenmod(form, LUA_NUMBER_FRMLEN);
+          nb = sc_number2strx(pc->buf, maxitem, form, nvalue(av));
+          if (nb < 0)
+            return 1;
+          pc->inbuf = 1;
+          break;
+        }
+        case 'f':
+          maxitem = SC_FMT_ITEMF; /* extra space for '%f' */
+          /* FALLTHROUGH */
+        case 'e':
+        case 'E':
+        case 'g':
+        case 'G': {
+          if (!ttisnumber(av))
+            return 1;
+          if (!sc_checkformat(form, SC_FMTFLAGSF, 1))
+            return 1;
+          sc_addlenmod(form, LUA_NUMBER_FRMLEN);
+          nb = snprintf(pc->buf, maxitem, form, (LUAI_UACNUMBER)nvalue(av));
+          pc->inbuf = 1;
+          break;
+        }
+        case 'q': {
+          if (form[2] != '\0')
+            return 1; /* "specifier '%%q' cannot have modifiers" */
+          if (ttisstring(av)) { /* addliteral's raw string arm */
+            pc->p = getstr(tsvalue(av));
+            pc->rl = tsslen(tsvalue(av));
+            pc->qstr = 1;
+            pc->l = sc_count_quoted(pc->p, pc->rl);
+          } else if (ttisinteger(av)) {
+            lua_Integer nv = ivalue(av);
+            nb = snprintf(pc->buf, SC_FMT_ITEM,
+                          nv == LUA_MININTEGER
+                              ? "0x%" LUA_INTEGER_FRMLEN "x"
+                              : LUA_INTEGER_FMT,
+                          (LUAI_UACINT)nv);
+            pc->inbuf = 1;
+          } else if (ttisfloat(av)) {
+            nb = sc_quotefloat(pc->buf, fltvalue(av));
+            if (nb < 0)
+              return 1;
+            pc->inbuf = 1;
+          } else if (ttisnil(av) || ttisboolean(av)) {
+            if (sc_has_tostring_meta(ttype(av)))
+              return 1; /* addliteral goes through luaL_tolstring here */
+            if (ttisnil(av)) {
+              pc->p = "nil";
+              pc->l = 3;
+            } else if (l_isfalse(av)) {
+              pc->p = "false";
+              pc->l = 5;
+            } else {
+              pc->p = "true";
+              pc->l = 4;
+            }
+          } else {
+            return 1; /* "value has no literal form" */
+          }
+          break;
+        }
+        case 's': {
+          const char *sv;
+          size_t sl;
+          char nbuf[LUA_N2SBUFFSZ];
+          int numsrc = 0;
+          if (ttisstring(av)) {
+            if (sc_has_tostring_meta(LUA_TSTRING))
+              return 1; /* callmeta would re-enter */
+            sv = getstr(tsvalue(av));
+            sl = tsslen(tsvalue(av));
+          } else if (ttisnumber(av)) {
+            if (sc_has_tostring_meta(LUA_TNUMBER))
+              return 1; /* callmeta would re-enter */
+            sl = luaO_tostringbuff(av, nbuf); /* lua_numbertocstring */
+            sv = nbuf;
+            numsrc = 1;
+          } else if (ttisnil(av)) {
+            if (sc_has_tostring_meta(LUA_TNIL))
+              return 1;
+            sv = "nil";
+            sl = 3;
+          } else if (ttisboolean(av)) {
+            if (sc_has_tostring_meta(LUA_TBOOLEAN))
+              return 1;
+            if (l_isfalse(av)) {
+              sv = "false";
+              sl = 5;
+            } else {
+              sv = "true";
+              sl = 4;
+            }
+          } else {
+            return 1; /* __tostring/__name on tables etc.: protected path */
+          }
+          if (form[2] == '\0') { /* no modifiers: keep entire string */
+            if (numsrc) {
+              memcpy(pc->buf, nbuf, sl);
+              pc->inbuf = 1;
+              nb = (int)sl; /* the shared tail re-reads nb for inbuf */
+            } else {
+              pc->p = sv;
+            }
+            pc->l = sl;
+          } else {
+            if (ttisstring(av) && sl != strlen(sv))
+              return 1; /* "string contains zeros" */
+            if (!sc_checkformat(form, SC_FMTFLAGSC, 1))
+              return 1;
+            if (strchr(form, '.') == NULL && sl >= 100) {
+              if (numsrc) { /* too long to be formatted: keep it all */
+                memcpy(pc->buf, nbuf, sl);
+                pc->inbuf = 1;
+                nb = (int)sl; /* the shared tail re-reads nb for inbuf */
+              } else {
+                pc->p = sv;
+              }
+              pc->l = sl;
+            } else { /* format the string into 'buff' */
+              nb = snprintf(pc->buf, maxitem, form, sv);
+              pc->inbuf = 1;
+            }
+          }
+          break;
+        }
+        default:
+          return 1; /* invalid conversion (also p, n, L, l, h) */
+      }
+      if (pc->inbuf)
+        pc->l = (size_t)nb;
+      total += pc->l;
+      np++;
+    }
+  }
+
+  if (total >= MAX_SIZE - sizeof(TString))
+    return 1; /* would raise "string length overflow" */
+  if (!rt_probe_mem_ok(total, 1))
+    return 1; /* the shared two-sided pre-flight (U11c's law) */
+
+  if (total > LUAI_MAXSHORTLEN) {
+    ts = luaS_createlngstrobj(curL, total);
+    p = getlngstr(ts);
+  } else
+    p = sbuff;
+  for (i = 0; i < np; i++) {
+    ScPiece *pc = &pcs[i];
+    if (pc->qstr) {
+      char *p0 = p;
+      sc_emit_quoted(&p, pc->p, pc->rl);
+      lua_assert((size_t)(p - p0) == pc->l); /* count/emit twins agree */
+    } else if (pc->inbuf) {
+      memcpy(p, pc->buf, pc->l);
+      p += pc->l;
+    } else {
+      memcpy(p, pc->p, pc->l);
+      p += pc->l;
+    }
+  }
+  if (total <= LUAI_MAXSHORTLEN)
+    ts = luaS_newlstr(curL, sbuff, total);
+  setsvalue(curL, &resv, ts);
+  return sc_stage(dst, w, &resv, 1);
 }
 
 /* ---- U6b (row 37): the deadline control block ----

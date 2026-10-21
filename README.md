@@ -106,13 +106,13 @@ the by-shape table below, `docs/U9-perf.md`, and `docs/U10-perf.md`.)
 
 | script (shape)                      | interp  | wasm, cold VM | wasm, pooled VM |
 |-------------------------------------|---------|---------------|-----------------|
-| h_tiny (startup only)               | 67.6 µs | 71.2 ms       | **40.8 µs**     |
-| h_str (short string ops)            | 181 µs  | 72.9 ms       | 297 µs          |
-| h_strlong (150 KB text processing)  | 1.54 ms | 89.7 ms       | 6.01 ms         |
-| h_numloop (4 M-iteration numeric)   | 126.7 ms| 113.6 ms      | **41.7 ms**     |
-| h_tablechurn (table alloc churn)    | 10.2 ms | 120.7 ms      | **40.3 ms**     |
-| h_concat (concat-heavy)             | 935 µs  | 73.7 ms       | **1.55 ms**     |
-| h_hostfn (3000 Go-call round trips) | 622 µs  | 77.4 ms       | 5.21 ms         |
+| h_tiny (startup only)               | 51.5 µs | 65.7 ms       | **17.5 µs**     |
+| h_str (short string ops)            | 131 µs  | 68.3 ms       | 224 µs          |
+| h_strlong (150 KB text processing)  | 1.33 ms | 82.2 ms       | 4.99 ms         |
+| h_numloop (4 M-iteration numeric)   | 117.7 ms| 108.9 ms      | **39.0 ms**     |
+| h_tablechurn (table alloc churn)    | 9.5 ms  | 94.8 ms       | **22.7 ms**     |
+| h_concat (concat-heavy)             | 877 µs  | 70.8 ms       | **1.49 ms**     |
+| h_hostfn (3000 Go-call round trips) | 539 µs  | 72.5 ms       | 3.90 ms         |
 
 Read the table as: cold = compile + instantiate + run once; pooled =
 already-instantiated VM, run again. The 70 ms column is the "short script
@@ -121,9 +121,10 @@ you run a lot" penalty — pooling removes it.
 ### By shape — compiler vs interpreter
 
 Process-time medians (3 runs) over the luabench scripts, re-measured
-2026-10-20 after U9c (direct dispatch), U10 (arith/compare/table fast
-paths) U11 (string-lane probes) and U11c (the concat fold probe) —
-`bench/2026-10-20-u11.txt` and `bench/2026-10-20-u11c.txt`:
+2026-10-21 after U9c (direct dispatch), U10 (arith/compare/table fast
+paths), U11 (string-lane probes), U11c (the concat fold probe) and
+U11d (the `string.format` probe) — `bench/2026-10-21-u11d.txt` (the
+U11/U11c runs: `bench/2026-10-20-u11*.txt`):
 
 | shape                                | wasm on wasmtime | wasm on wazero | vs interpreter                        |
 |--------------------------------------|------------------|----------------|---------------------------------------|
@@ -144,18 +145,20 @@ One caveat, active work rather than a law of nature:
 
 - **String allocation lanes are the remaining gap.** Numeric, call,
   and table lanes beat the interpreter on the pooled production path
-  (numloop 3×, tablechurn 4×, fib/nsieve/tco ~1.1–1.5×), and after
-  U11 the string *scan* lanes run at 1.6–3.9× interp
-  (`docs/U11-perf.md`: short-string table keys, `#`, and
-  `string.byte`/`string.find` run inline, no protected-call enter),
-  and U11c took the allocating `..` itself off the protected route
-  (h_concat 1.66× interp, down from 3.4× — one-pass fold with a
-  two-sided memory pre-flight, `docs/U11-perf.md`). What still pays
-  the protected C route: `string.format` and gmatch's iterator
-  (h_strlong, ~4× interp) — the next stdcall-probe targets.
-  C callees beyond the two probed, `__call` chains and cross-module
-  closures still take the host dispatch seam, and tailcalls ride the
-  staged M5c path.
+  (numloop 3× faster, fib/nsieve/tco at parity or better; tablechurn's
+  alloc churn still pays ~2×), and after U11 the string *scan*
+  lanes run at 1.6–3.9× interp (`docs/U11-perf.md`: short-string
+  table keys, `#`, and `string.byte`/`string.find` run inline, no
+  protected-call enter). U11c took the allocating `..` itself off the
+  protected route (h_concat 1.7× interp, down from 3.4× — one-pass
+  fold with a two-sided memory pre-flight), and U11d folded
+  `string.format` in the same posture (h_strlong 3.8× interp, down
+  from ~10× at U10 — the fold, pre-flight and decline shapes in
+  `docs/U11-perf.md`). What still pays the protected C route:
+  gmatch's iterator and the un-probed stdlib callees (`sub`, `rep`,
+  …). C callees beyond the probed set, `__call` chains and
+  cross-module closures still take the host dispatch seam, and
+  tailcalls ride the staged M5c path.
 
 To reproduce: `go run ./cmd/luabench` (interp vs wasm cold/warm on the
 production engine, output-checked); see also `cmd/luawasmc` +

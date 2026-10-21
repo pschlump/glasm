@@ -199,8 +199,9 @@ int32_t rt_gets_probe(rt_addr tblcell, rt_addr keycell, rt_addr dstcell);
 int32_t rt_sets_probe(rt_addr tblcell, rt_addr keycell, rt_addr valcell);
 int32_t rt_len_probe(rt_addr srccell, rt_addr dstcell);
 /* U11b: pure stdlib callee probe — string.byte and string.find's
-** plain search, run inline at OP_CALL when the callee IS the stock
-** function (pinned once per process from the pristine globals).
+** plain search, and (U11d) string.format's fold, run inline at OP_CALL
+** when the callee IS the stock function (pinned once per process from
+** the pristine globals).
 ** Returns 1 = MISS (never an error: miss shapes fall to the protected
 ** call); handled results use rt_call_addr's success encoding
 ** (0 for fixed want, -(nret+1) for multret), staged at the callee

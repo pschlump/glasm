@@ -875,6 +875,236 @@ int main(void) {
       CHECK(rt_concat_probe(cell_of(&blk[0]), 2, cell_of(&blk[0])) == 1);
     }
 
+    /* ---- U11d: the string.format probe ---- */
+    {
+      static const char longstr[] = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+      TValue fformat, blk[8];
+      int r;
+      lua_getglobal(L, "string");
+      lua_getfield(L, -1, "format");
+      fformat = *s2v(L->top.p - 1);
+      L->top.p -= 2;
+      CHECK(ttislcf(&fformat));
+      blk[0] = fformat; /* the callee cell: probe dispatch + dst */
+
+      /* the byte-exactness law: for hit shapes, the probe's output must
+         equal the stock function's own output, taken from a real call */
+#define FMTCHK(NARGS, WANT)                                                    \
+      do {                                                                     \
+        char *got, *want;                                                      \
+        blk[0] = fformat; /* dst aliases it: re-stage every call */            \
+        r = rt_stdcall_probe(cell_of(&blk[0]), cell_of(&blk[1]), NARGS, WANT); \
+        CHECK(r == (WANT < 0 ? -2 : 0));                                       \
+        CHECK(ttisstring(&blk[0]));                                            \
+        got = getstr(tsvalue(&blk[0]));                                        \
+        setobj2s(L, L->top.p, &fformat);                                       \
+        L->top.p++;                                                            \
+        setobj2s(L, L->top.p, &blk[1]);                                        \
+        L->top.p++;                                                            \
+        {                                                                      \
+          int ai_;                                                             \
+          for (ai_ = 2; ai_ < 1 + (NARGS); ai_++) {                            \
+            setobj2s(L, L->top.p, &blk[ai_]);                                  \
+            L->top.p++;                                                        \
+          }                                                                    \
+        }                                                                      \
+        lua_call(L, NARGS, 1);                                                 \
+        want = (char *)lua_tostring(L, -1);                                    \
+        if (strcmp(got, want) != 0) {                                          \
+          fprintf(stderr, "FMT mismatch: got \"%s\" want \"%s\"\n", got,       \
+                  want);                                                       \
+        }                                                                      \
+        CHECK(strcmp(got, want) == 0);                                         \
+        L->top.p--;                                                            \
+      } while (0)
+      /* intern the fmt literal (args[0]) without hand-counted lengths */
+#define FMTC(FMT)                                                              \
+      rt_intern(cell_of(&blk[1]), (rt_addr)(uintptr_t)(FMT),                   \
+                (int32_t)(sizeof(FMT) - 1))
+
+      /* the hot-lane shape itself */
+      FMTC("%04d %s %s %s");
+      rt_mkinteger(cell_of(&blk[2]), 7);
+      rt_intern(cell_of(&blk[3]), (rt_addr)(uintptr_t)"alpha", 5);
+      rt_intern(cell_of(&blk[4]), (rt_addr)(uintptr_t)"bravo", 5);
+      rt_intern(cell_of(&blk[5]), (rt_addr)(uintptr_t)"charlie", 7);
+      FMTCHK(5, 1);
+      /* integers: d/i/u/x/X/o incl. negative (two's complement hex) */
+      FMTC("%d|%i|%u");
+      rt_mkinteger(cell_of(&blk[2]), -1);
+      rt_mkinteger(cell_of(&blk[3]), -1);
+      rt_mkinteger(cell_of(&blk[4]), -1);
+      FMTCHK(4, 1);
+      FMTC("%x|%X|%#o");
+      FMTCHK(4, 1);
+      /* width/precision/flags */
+      FMTC("[%5d|%-5d|%05d]");
+      rt_mkinteger(cell_of(&blk[2]), 42);
+      rt_mkinteger(cell_of(&blk[3]), 42);
+      rt_mkinteger(cell_of(&blk[4]), 42);
+      FMTCHK(4, 1);
+      FMTC("[%5.3d|%.2d]");
+      rt_mkinteger(cell_of(&blk[3]), 42);
+      FMTCHK(3, 1);
+      /* floats: e/f/g, the %.14g no-fixup rule (%g 3.0 = "3") */
+      FMTC("%g|%e|%.3f");
+      rt_mknumber(cell_of(&blk[2]), 3.0);
+      rt_mknumber(cell_of(&blk[3]), 3.0);
+      rt_mknumber(cell_of(&blk[4]), 3.0);
+      FMTCHK(4, 1);
+      rt_mknumber(cell_of(&blk[2]), 0.1);
+      FMTCHK(4, 1);
+      /* the MAX_ITEMF lane: %f of 1e300 is ~308 digits (lngstr result) */
+      FMTC("%f");
+      rt_mknumber(cell_of(&blk[2]), 1e300);
+      FMTCHK(2, 1);
+      /* %a/%A: the tree's own fallback hex formatter */
+      FMTC("%a|%A");
+      rt_mknumber(cell_of(&blk[2]), 0.5);
+      rt_mknumber(cell_of(&blk[3]), 0.5);
+      FMTCHK(3, 1);
+      rt_mknumber(cell_of(&blk[2]), 3.0);
+      FMTCHK(3, 1);
+      /* %c */
+      FMTC("%c%c");
+      rt_mkinteger(cell_of(&blk[2]), 65);
+      rt_mkinteger(cell_of(&blk[3]), 122);
+      FMTCHK(3, 1);
+      /* %s: strings, numbers (%s 3.0 = "3.0" — the tostringbuff fixup),
+         nil/bool, width/precision, %-5s, whole-string when >= 100 */
+      FMTC("%s");
+      rt_mknumber(cell_of(&blk[2]), 3.0);
+      FMTCHK(2, 1);
+      rt_mkinteger(cell_of(&blk[2]), 42);
+      FMTCHK(2, 1);
+      rt_mknil(cell_of(&blk[2]));
+      FMTCHK(2, 1);
+      rt_mkbool(cell_of(&blk[2]), 1);
+      FMTCHK(2, 1);
+      FMTC("[%10s|%-10s]");
+      rt_intern(cell_of(&blk[2]), (rt_addr)(uintptr_t)"abc", 3);
+      rt_intern(cell_of(&blk[3]), (rt_addr)(uintptr_t)"abc", 3);
+      FMTCHK(3, 1);
+      FMTC("[%.2s|%5.2s]");
+      rt_intern(cell_of(&blk[3]), (rt_addr)(uintptr_t)"abc", 3);
+      FMTCHK(3, 1);
+      FMTC("x%sy");
+      rt_intern(cell_of(&blk[2]), (rt_addr)(uintptr_t)longstr,
+                (int32_t)(sizeof(longstr) - 1));
+      FMTCHK(2, 1); /* >= 100, no precision: the keep-it-all arm */
+      /* %% and literal-only formats */
+      FMTC("100%% sure");
+      FMTCHK(1, 1);
+      FMTC("no directives");
+      FMTCHK(1, 1);
+      /* %q: strings (quotes, backslash, newline, controls), ints
+         (MININTEGER corner), floats (hex float), nil/bool */
+      FMTC("%q");
+      rt_intern(cell_of(&blk[2]), (rt_addr)(uintptr_t)"a\"b\\c\nd\te", 9);
+      FMTCHK(2, 1);
+      rt_intern(cell_of(&blk[2]), (rt_addr)(uintptr_t)"\1\2", 2);
+      FMTCHK(2, 1);
+      rt_intern(cell_of(&blk[2]), (rt_addr)(uintptr_t)"\1a", 2);
+      FMTCHK(2, 1); /* \1 followed by a letter: the \d arm */
+      rt_intern(cell_of(&blk[2]), (rt_addr)(uintptr_t)"\1""5", 2);
+      FMTCHK(2, 1); /* \1 followed by a digit: the \03d arm */
+      rt_mkinteger(cell_of(&blk[2]), LUA_MININTEGER);
+      FMTCHK(2, 1);
+      rt_mkinteger(cell_of(&blk[2]), 42);
+      FMTCHK(2, 1);
+      rt_mknumber(cell_of(&blk[2]), 3.5);
+      FMTCHK(2, 1);
+      rt_mknumber(cell_of(&blk[2]), (lua_Number)INFINITY);
+      FMTCHK(2, 1);
+      rt_mknil(cell_of(&blk[2]));
+      FMTCHK(2, 1);
+      rt_mkbool(cell_of(&blk[2]), 0);
+      FMTCHK(2, 1);
+      /* exact-float ints coerce in numeric formats */
+      FMTC("%d");
+      rt_mknumber(cell_of(&blk[2]), 3.0);
+      FMTCHK(2, 1);
+      /* multret want = -1 */
+      FMTC("%d-%d");
+      rt_mkinteger(cell_of(&blk[2]), 1);
+      rt_mkinteger(cell_of(&blk[3]), 2);
+      FMTCHK(3, -1);
+      /* want = 0: nothing staged, still success */
+      {
+        blk[0] = fformat; /* re-stage: the multret result sits there */
+        r = rt_stdcall_probe(cell_of(&blk[0]), cell_of(&blk[1]), 3, 0);
+        CHECK(r == 0); /* dst untouched content-wise; 0 results staged */
+      }
+#undef FMTC
+#undef FMTCHK
+
+      /* the miss shapes — each takes the protected call (which raises
+         the stock text); only the miss code is checked here */
+      blk[0] = fformat; /* the last hit's result still sits there */
+      rt_intern(cell_of(&blk[1]), (rt_addr)(uintptr_t)"%z", 2);
+      CHECK(rt_stdcall_probe(cell_of(&blk[0]), cell_of(&blk[1]), 1, 1) == 1);
+      rt_intern(cell_of(&blk[1]), (rt_addr)(uintptr_t)"%d %d", 5);
+      rt_mkinteger(cell_of(&blk[2]), 1);
+      CHECK(rt_stdcall_probe(cell_of(&blk[0]), cell_of(&blk[1]), 2, 1) == 1);
+      rt_intern(cell_of(&blk[1]), (rt_addr)(uintptr_t)"%d", 2);
+      rt_mknumber(cell_of(&blk[2]), 0.5); /* not integer-exact */
+      CHECK(rt_stdcall_probe(cell_of(&blk[0]), cell_of(&blk[1]), 2, 1) == 1);
+      rt_intern(cell_of(&blk[2]), (rt_addr)(uintptr_t)"42", 2);
+      CHECK(rt_stdcall_probe(cell_of(&blk[0]), cell_of(&blk[1]), 2, 1) ==
+            1); /* numeral string: stock coerces, the probe declines */
+      rt_newtable(cell_of(&blk[2]), 0, 0);
+      CHECK(rt_stdcall_probe(cell_of(&blk[0]), cell_of(&blk[1]), 2, 1) == 1);
+      rt_intern(cell_of(&blk[1]), (rt_addr)(uintptr_t)"%s", 2);
+      CHECK(rt_stdcall_probe(cell_of(&blk[0]), cell_of(&blk[1]), 2, 1) == 1);
+      rt_intern(cell_of(&blk[1]), (rt_addr)(uintptr_t)"%p", 2);
+      rt_newtable(cell_of(&blk[2]), 0, 0);
+      CHECK(rt_stdcall_probe(cell_of(&blk[0]), cell_of(&blk[1]), 2, 1) == 1);
+      rt_intern(cell_of(&blk[1]), (rt_addr)(uintptr_t)"%10q", 4);
+      CHECK(rt_stdcall_probe(cell_of(&blk[0]), cell_of(&blk[1]), 2, 1) ==
+            1); /* %q with modifiers */
+      rt_intern(cell_of(&blk[1]), (rt_addr)(uintptr_t)"%100d", 5);
+      rt_mkinteger(cell_of(&blk[2]), 1);
+      CHECK(rt_stdcall_probe(cell_of(&blk[0]), cell_of(&blk[1]), 2, 1) ==
+            1); /* width > 2 digits: invalid conversion specification */
+      rt_mkinteger(cell_of(&blk[1]), 7); /* fmt not a string */
+      CHECK(rt_stdcall_probe(cell_of(&blk[0]), cell_of(&blk[1]), 1, 1) == 1);
+      /* a different stdlib C function never matches */
+      {
+        TValue frep;
+        lua_getglobal(L, "string");
+        lua_getfield(L, -1, "rep");
+        frep = *s2v(L->top.p - 1);
+        L->top.p -= 2;
+        blk[0] = frep;
+        rt_intern(cell_of(&blk[1]), (rt_addr)(uintptr_t)"ab", 2);
+        CHECK(rt_stdcall_probe(cell_of(&blk[0]), cell_of(&blk[1]), 2, 1) ==
+              1);
+      }
+      /* the pin is the ORIGINAL: after string.format = 1 the saved value
+         still hits, the new value misses (the pooled-VM guarantee) */
+      blk[0] = fformat;
+      rt_intern(cell_of(&blk[1]), (rt_addr)(uintptr_t)"%d", 2);
+      rt_mkinteger(cell_of(&blk[2]), 5);
+      lua_getglobal(L, "string");
+      lua_pushinteger(L, 1);
+      lua_setfield(L, -2, "format");
+      L->top.p--;
+      r = rt_stdcall_probe(cell_of(&blk[0]), cell_of(&blk[1]), 2, 1);
+      CHECK(r == 0 && ttisstring(&blk[0]) &&
+            strcmp(getstr(tsvalue(&blk[0])), "5") == 0);
+      lua_getglobal(L, "string");
+      lua_getfield(L, -1, "format");
+      blk[5] = *s2v(L->top.p - 1);
+      L->top.p -= 2;
+      CHECK(rt_stdcall_probe(cell_of(&blk[5]), cell_of(&blk[1]), 2, 1) == 1);
+      /* restore the stock function before anything else looks */
+      lua_getglobal(L, "string");
+      setobj2s(L, L->top.p, &fformat);
+      L->top.p++;
+      lua_setfield(L, -2, "format");
+      L->top.p--;
+    }
+
     /* __index metamethod through the seam (a Lua closure runs under
        rt_run's protect — the metamethod body is real Lua) */
     {

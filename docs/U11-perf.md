@@ -1,4 +1,4 @@
-# U11 — the string lanes (2026-10-20)
+# U11 — the string lanes (2026-10-20, U11c + U11d same program)
 
 U10 retired the numeric/call/table try_table-enter tax; the residual gap
 was strings: h_strlong ran ~10× interp warm, h_concat ~2×, and the
@@ -91,6 +91,46 @@ items). No ledger row: no engine diverged; every miss shape takes the
 byte-identical protected path, proven by the matrix, error suite,
 oracles, and host gates.
 
+**U11d — `string.format` as a stdcall probe target (2026-10-21):** the
+top open item above. `str_format`'s fold rides `rt_stdcall_probe`
+(the U11b pin/dispatch/staging are reused verbatim — pin `"format"`
+at first `rt_set_state`, `sc_format_arm` in `rt_abi55.c`), so no new
+export, no backend change, no blob-interface change. Pass 1 walks the
+format string with stock's own parser (`getformat`/`checkformat`/
+`get2digits`/`addlenmod`, verbatim), screening each arg cell and
+formatting numeric pieces into per-piece C buffers so `total` is
+exact; pass 2 emits into the single result (`luaS_newlstr` ≤ 40 /
+`luaS_createlngstrobj` > 40) behind the shared two-sided pre-flight
+(`rt_probe_mem_ok`, factored out of the concat probe at U11d so the
+two cannot drift). The hex-float formatter is the tree's own fallback
+(`num2straux` — this build has no system `%a`), ported verbatim for
+`%a`/`%A` and `%q`-float; `addquoted` became count/emit twins with a
+`lua_assert` that they agree. Misses: every raising shape (bad
+conversion, missing arg, modifiers on `%q`), numeral-string coercion
+(stock coerces `"42"` in `%d`; the probe declines string cells), `%p`,
+formats beyond 24 pieces, and — the re-entrancy guard — any
+string/number/boolean/nil type whose metatable defines `__tostring`
+(stock's `luaL_tolstring` calls it; the probe declines and the
+protected path runs it). Two 5.5.1 facts the guard work surfaced:
+
+- **5.5.1 has no `TM_TOSTRING` slot** — the TM enum ends at
+  `TM_CLOSE`; `__tostring` is `luaL_getmetafield`'s rawget of the
+  string on the *real* metatable. The probe pins the `"__tostring"`
+  short string at `sc_resolve` and rawgets exactly that.
+- **`luaH_getshortstr` writes its out-cell only on hit**
+  (`finishnodeget` copies only non-nil results) — an absent key
+  leaves the caller's TValue untouched, so the guard must pre-nil the
+  cell or it reads stale stack and declines everything. This is also
+  why `sc_resolve` pre-nils its pin cells.
+
+Enter measure (probe-alloc, warm, 10,880-byte allocations = enters):
+h_strlong 14,366 → **13,801** — the ~600 `string.format` calls are
+off the protected path; the residual is the gmatch iterator (a C
+closure, next open item) plus the per-line `string.sub`-shaped stdlib
+calls. h_concat/h_str move only within noise (h_concat holds a
+single format call; the U11c-era "139 = format" attribution was
+loose — that residual was never format-dominated).
+
 ## The guard-seam hazard (caught by the host gate before anything shipped)
 
 The blob's `luaH_pset{,str,shortstr,int}` are not stock: they are the
@@ -111,42 +151,52 @@ matter for probe work.
 
 ## Enter attribution (wazero, warm; 10,880-byte allocations = enters)
 
-| lane | U10 | U11 | U11c | residual |
-|---|---|---|---|---|
-| h_strlong | 27,439 | 14,371 | 14,366 | string.format + the gmatch iterator |
-| h_concat | 12,028 | 6,059 | **139** | the 139 = the lane's string.format calls |
-| h_str | 1,329 | 533 | 533 | format/misc |
+| lane | U10 | U11 | U11c | U11d | residual |
+|---|---|---|---|---|---|
+| h_strlong | 27,439 | 14,371 | 14,366 | **13,801** | gmatch iterator + per-line sub/misc |
+| h_concat | 12,028 | 6,059 | **139** | 172* | sub/misc (its ONE format call now rides the probe) |
+| h_str | 1,329 | 533 | 533 | 526 | misc |
+
+\* cross-blob recount, not a regression signal: the residual was never
+format-dominated (one format call in the lane), and enter counts are
+only comparable same-binary.
 
 U11's h_concat drop (−5,920) matched the U10-era decomposition exactly;
 U11c's (−5,920) takes the `..` fold itself off the protected path —
 under the DEFAULT host posture (no budget), where the v1 pre-flight
 was measuring 6,059 because it gated on the memlimit (see U11c above).
 
-## Benchmarks (same-day, quiet machine — `bench/2026-10-20-u11.txt`)
+## Benchmarks (same-day, quiet machine — `bench/2026-10-21-u11d.txt`)
 
-Medians, warm = pooled VM rerun on the production path (`host/` on
-wazero); the U10/U11 columns are the same-day runs (`bench/
-2026-10-20-u10.txt`, `bench/2026-10-20-u11.txt`), the U11c column and
-the interp re-measure are `bench/2026-10-20-u11c.txt`:
+Warm = pooled VM rerun on the production path (`host/` on wazero).
+Columns U10/U11/U11c are the 2026-10-20 runs (`bench/2026-10-20-u10.txt`,
+`bench/2026-10-20-u11.txt`, `bench/2026-10-20-u11c.txt`); U11d and its
+interp column are same-day 2026-10-21 (`bench/2026-10-21-u11d.txt`) —
+per the bench protocol the U11d/interp ratio is the only comparison
+that crosses columns cleanly (the machine shifted again overnight;
+absolute cross-day deltas are not meaningful):
 
-| lane | interp | U10 warm | U11 warm | U11c warm | U11c / interp |
+| lane | U10 warm | U11 warm | U11c warm | U11d warm | U11d / interp |
 |---|---|---|---|---|---|
-| h_str | 181 µs | 552 µs | 297 µs | **282 µs** | 1.6× (was 3.1×) |
-| h_strlong | 1.54 ms | 15.2 ms | 6.01 ms | **5.98 ms** | 4.2× (was ~10×) |
-| h_concat | 946 µs | 5.2 ms | 3.20 ms | **1.55 ms** | 1.66× (was 5.5×) |
+| h_str | 552 µs | 297 µs | 282 µs | **224 µs** | 1.7× (interp 131 µs) |
+| h_strlong | 15.2 ms | 6.01 ms | 5.98 ms | **4.99 ms** | **3.8×** (interp 1.33 ms; was 4.2×) |
+| h_concat | 5.2 ms | 3.20 ms | 1.55 ms | **1.49 ms** | 1.7× (interp 877 µs) |
 
-Non-string lanes unchanged within noise (h_numloop 41.7 ms,
-h_tablechurn 40.3 ms, h_hostfn 5.2 ms warm — same-day re-measures of
-the U10 numbers). U11c halves h_concat again (3.20 → 1.55 ms warm, 1.66× interp);
-h_str/h_strlong are unchanged within noise, as the probe predicts.
-The residual string gap is now only the C-call shapes:
-format/gmatch (h_strlong, h_str).
+Non-string lanes are at or past interp parity same-day (numloop
+39.0 ms vs 117.7, fib 133.8 ms vs 151.2, nsieve 42.3 ms vs 47.5,
+tco 9.13 ms vs 10.2, callret 21.5 ms vs 19.8). U11d takes ~17% off
+h_strlong warm — the format probe's predicted effect; h_str/h_concat
+are unchanged within noise, as predicted. The residual string gap is
+the gmatch iterator and the un-probed stdlib callees (`sub`, `rep`,
+format's siblings).
 
 ## Open items
 
-- `string.format` and the gmatch iterator as stdcall targets
-  (format allocates its result — U11c's two-sided pre-flight is the
-  template; h_strlong's ~14.4k residual enters are format + gmatch).
+- The gmatch iterator as the next stdcall target (a C closure, not a
+  light C function — it needs its own pin/dispatch shape, not
+  `rt_stdcall_probe`'s `ttislcf` check; h_strlong's 13.8k residual
+  enters are the ~600 iterator calls plus ~13.2k per-line `sub`-shaped
+  stdlib calls).
 - GETTABUP/SETTABUP: globals reads/writes still pay the protected
   `_ENV` route (the `t["k"..i]` shape rides the probes once the concat
   is constant-folded).
