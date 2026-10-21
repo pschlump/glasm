@@ -280,6 +280,8 @@ func (b *backend) declareImports() {
 		"rt_lt":            m.ImportFunc("rt", "rt_lt", iiii, i32v),
 		"rt_le":            m.ImportFunc("rt", "rt_le", iiii, i32v),
 		"rt_concat":        m.ImportFunc("rt", "rt_concat", iiiiii, i32v),
+		// U11c: concat fold probe — one-pass, memlimit pre-flighted
+		"rt_concat_probe":  m.ImportFunc("rt", "rt_concat_probe", iii, i32v),
 		"rt_call":          m.ImportFunc("rt", "rt_call", iiiiii, i32v),
 		"rt_call_addr":     m.ImportFunc("rt", "rt_call_addr", iiiiii, i32v),
 		"rt_call_count":    m.ImportFunc("rt", "rt_call_count", i32v, i32v),

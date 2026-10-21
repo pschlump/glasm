@@ -786,6 +786,95 @@ int main(void) {
       L->top.p--;
     }
 
+    /* ---- U11c: the concat fold probe ---- */
+    {
+      TValue blk[4];
+      int r;
+      /* rt_mem_limit defaults to 0 = unlimited, and the probe declines
+         unlimited (rt_alloc cannot predict a real malloc failure there).
+         Give this block a generous limit; rt_set_memlimit zeroes the
+         used counter, which only makes the limit MORE generous for the
+         probe's bounded little allocations. Restored to 0 at the end. */
+      rt_set_memlimit(rt_mem_used_bytes() + (8 << 20));
+
+      /* dst aliases cells[0] — the contract at every OP_CONCAT site */
+      rt_intern(cell_of(&blk[0]), (rt_addr)(uintptr_t)"x=", 2);
+      rt_mkinteger(cell_of(&blk[1]), 3);
+      r = rt_concat_probe(cell_of(&blk[0]), 2, cell_of(&blk[0]));
+      CHECK(r == 1 && ttisstring(&blk[0]) &&
+            strcmp(getstr(tsvalue(&blk[0])), "x=3") == 0);
+      /* float formatting = stock's own luaO_tostringbuff ("3.0" fixup);
+         blk[0] holds the previous RESULT (dst aliases it) — re-stage */
+      rt_intern(cell_of(&blk[0]), (rt_addr)(uintptr_t)"x=", 2);
+      rt_mknumber(cell_of(&blk[1]), 3.0);
+      r = rt_concat_probe(cell_of(&blk[0]), 2, cell_of(&blk[0]));
+      CHECK(r == 1 && ttisstring(&blk[0]) &&
+            strcmp(getstr(tsvalue(&blk[0])), "x=3.0") == 0);
+      rt_intern(cell_of(&blk[0]), (rt_addr)(uintptr_t)"x=", 2);
+      rt_mknumber(cell_of(&blk[1]), 0.1);
+      r = rt_concat_probe(cell_of(&blk[0]), 2, cell_of(&blk[0]));
+      CHECK(r == 1 && ttisstring(&blk[0]) &&
+            strcmp(getstr(tsvalue(&blk[0])), "x=0.1") == 0);
+      /* integers concatenate exactly; two number cells, no strings */
+      rt_mkinteger(cell_of(&blk[0]), 9007199254740993LL);
+      rt_mkinteger(cell_of(&blk[1]), 7);
+      r = rt_concat_probe(cell_of(&blk[0]), 2, cell_of(&blk[0]));
+      CHECK(r == 1 && ttisstring(&blk[0]) &&
+            strcmp(getstr(tsvalue(&blk[0])), "90071992547409937") == 0);
+      /* three operands, empty strings included: "" .. "a" .. "" -> "a" */
+      rt_intern(cell_of(&blk[0]), (rt_addr)(uintptr_t)"", 0);
+      rt_intern(cell_of(&blk[1]), (rt_addr)(uintptr_t)"a", 1);
+      rt_intern(cell_of(&blk[2]), (rt_addr)(uintptr_t)"", 0);
+      r = rt_concat_probe(cell_of(&blk[0]), 3, cell_of(&blk[0]));
+      CHECK(r == 1 && ttisstring(&blk[0]) &&
+            strcmp(getstr(tsvalue(&blk[0])), "a") == 0);
+      /* the 40 boundary: exactly LUAI_MAXSHORTLEN is the short path,
+         41 takes luaS_createlngstrobj (tsslen covers both flavors);
+         blk[0] holds the previous result — re-stage all four */
+      for (r = 0; r < 4; r++)
+        rt_intern(cell_of(&blk[r]), (rt_addr)(uintptr_t)"0123456789", 10);
+      r = rt_concat_probe(cell_of(&blk[0]), 3, cell_of(&blk[0]));
+      CHECK(r == 1 && ttisstring(&blk[0]) && tsslen(tsvalue(&blk[0])) == 30);
+      for (r = 0; r < 4; r++)
+        rt_intern(cell_of(&blk[r]), (rt_addr)(uintptr_t)"0123456789", 10);
+      r = rt_concat_probe(cell_of(&blk[0]), 4, cell_of(&blk[0]));
+      CHECK(r == 1 && ttisstring(&blk[0]) && tsslen(tsvalue(&blk[0])) == 40);
+      for (r = 0; r < 3; r++)
+        rt_intern(cell_of(&blk[r]), (rt_addr)(uintptr_t)"0123456789", 10);
+      rt_intern(cell_of(&blk[3]), (rt_addr)(uintptr_t)"0123456789A", 11);
+      r = rt_concat_probe(cell_of(&blk[0]), 4, cell_of(&blk[0]));
+      CHECK(r == 1 && ttisstring(&blk[0]) &&
+            tsslen(tsvalue(&blk[0])) == 41 &&
+            getstr(tsvalue(&blk[0]))[40] == 'A');
+      /* a long-string OPERAND (rt_intern over 40 makes a lngstr) */
+      rt_intern(cell_of(&blk[0]),
+                (rt_addr)(uintptr_t)"0123456789012345678901234567890123456789X",
+                41);
+      rt_intern(cell_of(&blk[1]), (rt_addr)(uintptr_t)"tail", 4);
+      r = rt_concat_probe(cell_of(&blk[0]), 2, cell_of(&blk[0]));
+      CHECK(r == 1 && ttisstring(&blk[0]) &&
+            tsslen(tsvalue(&blk[0])) == 45 &&
+            getstr(tsvalue(&blk[0]))[44] == 'l');
+      /* the miss shapes: metamethod/error operands, n<2 */
+      rt_mknil(cell_of(&blk[0]));
+      CHECK(rt_concat_probe(cell_of(&blk[0]), 2, cell_of(&blk[1])) == 0);
+      rt_mkbool(cell_of(&blk[0]), 1);
+      CHECK(rt_concat_probe(cell_of(&blk[0]), 2, cell_of(&blk[1])) == 0);
+      rt_newtable(cell_of(&blk[0]), 0, 0);
+      CHECK(rt_concat_probe(cell_of(&blk[0]), 2, cell_of(&blk[1])) == 0);
+      rt_intern(cell_of(&blk[0]), (rt_addr)(uintptr_t)"only", 4);
+      CHECK(rt_concat_probe(cell_of(&blk[0]), 1, cell_of(&blk[0])) == 0);
+      CHECK(rt_concat_probe(cell_of(&blk[0]), 0, cell_of(&blk[0])) == 0);
+      /* no headroom under the cap: decline, never attempt the alloc */
+      rt_intern(cell_of(&blk[1]), (rt_addr)(uintptr_t)" and more", 9);
+      rt_set_memlimit(rt_mem_used_bytes() + 8);
+      CHECK(rt_concat_probe(cell_of(&blk[0]), 2, cell_of(&blk[0])) == 0);
+      rt_set_memlimit(0); /* unlimited: the default posture after */
+      /* unlimited: no cap to check, the malloc probe is the only wall —
+         the default host posture, and the probe must fire there */
+      CHECK(rt_concat_probe(cell_of(&blk[0]), 2, cell_of(&blk[0])) == 1);
+    }
+
     /* __index metamethod through the seam (a Lua closure runs under
        rt_run's protect — the metamethod body is real Lua) */
     {

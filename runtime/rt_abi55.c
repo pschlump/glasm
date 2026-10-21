@@ -1223,6 +1223,102 @@ void *rt_alloc(void *ud, void *ptr, size_t osize, size_t nsize) {
   return np;
 }
 
+/* ---- U11c: concat probe ----
+**
+** OP_CONCAT's fold as an unprotected probe with an exact memory
+** pre-flight against the machinery above. Stock luaV_concat converts
+** number operands in place and, for each pass, may allocate interned
+** temps; this seam never did that to the CELLS anyway (concat_body
+** copies them onto the stack and converts the stack copies), so the
+** probe formats numbers into a C stack buffer via stock's own
+** luaO_tostringbuff — strictly fewer allocations, same bytes (the
+** frozen-GC posture makes the savings invisible). The result is one
+** allocation exactly like stock's last pass: luaS_newlstr (<=40,
+** interned — a repeat returns the existing object, no alloc) or
+** luaS_createlngstrobj (>40, never interned). Everything that can
+** raise — metamethod operands, "string length overflow", the OOM
+** refusal — declines to the protected rt_concat. The pre-flight is
+** two-sided: a malloc(need) round trip against the real allocator
+** (the only wall under limit==0, and unpredictable fragmentation under
+** a limit), plus rt_alloc's own cap arithmetic when budgeted — which
+** makes every refusal unreachable here by construction.
+*/
+int32_t rt_concat_probe(rt_addr cellsaddr, int32_t count, rt_addr dstaddr) {
+  char nbuf[LUA_N2SBUFFSZ];
+  TValue *cells = (TValue *)(size_t)cellsaddr;
+  TValue *dst = (TValue *)(size_t)dstaddr;
+  int i;
+  size_t total = 0;
+  if (count < 2) return 0; /* the n==1 move stays on the protected path */
+  for (i = 0; i < count; i++) {
+    const TValue *o = &cells[i];
+    if (ttisstring(o))
+      total += tsslen(tsvalue(o));
+    else if (ttisnumber(o))
+      total += luaO_tostringbuff(o, nbuf); /* no alloc, cells stay as-is */
+    else
+      return 0; /* metamethod / concat-error shape: the protected path */
+  }
+  if (total >= MAX_SIZE - sizeof(TString))
+    return 0; /* would raise "string length overflow" */
+  {
+    stringtable *tb = &G(curL)->strt;
+    /* covers sizestrshr/sizelngstr for the result (header + total + 1) */
+    size_t need = sizeof(TString) + total + 1;
+    if (total <= LUAI_MAXSHORTLEN && tb->nuse >= tb->size)
+      need += (size_t)tb->size * 2 * sizeof(TString *); /* growstrtab peak */
+    /* Serviceability against the REAL allocator, both modes: probe with
+       one contiguous block covering the worst case (all requests summed,
+       plus split headers), then give it back — a following request of
+       at most 'need' bytes cannot fail, so a NULL here is exactly the
+       real wall (linear-memory max / dlmalloc fragmentation), which no
+       accounting can predict (limit==0 has no other check at all).
+       Sum-contiguity is stricter than the 1-2 separate requests ever
+       need, so it only ever declines early — never wrongly hits. */
+    {
+      void *t = malloc(need + 64);
+      if (t == NULL) return 0; /* the real wall: miss, never attempt */
+      free(t);
+    }
+    /* The cap side, when budgeted — rt_alloc's own refusal arithmetic
+       (the emergency cap only adds headroom, so the plain limit is the
+       conservative side). A refusal would be a clean catchable raise:
+       on the protected path, not here. */
+    if (rt_mem_limit > 0 && rt_mem_used + (int64_t)need > rt_mem_limit)
+      return 0;
+  }
+  {
+    char sbuff[LUAI_MAXSHORTLEN];
+    TString *ts = NULL; /* NULL = building into sbuff (short result) */
+    char *p;
+    if (total > LUAI_MAXSHORTLEN) {
+      ts = luaS_createlngstrobj(curL, total);
+      p = getlngstr(ts);
+    } else
+      p = sbuff;
+    for (i = 0; i < count; i++) {
+      const TValue *o = &cells[i];
+      const char *src;
+      size_t l;
+      if (ttisstring(o)) {
+        src = getstr(tsvalue(o));
+        l = tsslen(tsvalue(o));
+      } else {
+        l = luaO_tostringbuff(o, nbuf);
+        src = nbuf;
+      }
+      memcpy(p, src, l);
+      p += l;
+    }
+    if (ts == NULL) /* intern the short result (a hit: no alloc at all) */
+      ts = luaS_newlstr(curL, sbuff, total);
+    /* dst aliases cells[0] at every OP_CONCAT site — written last, by
+       the protected path's own contract */
+    setsvalue(curL, dst, ts);
+  }
+  return 1; /* hit: like the U10/U11a table probes (1 = handled) */
+}
+
 /* ---- U6b (row 37): the deadline control block ----
 **
 ** g_deadline_flag is host-written and guest-polled. The host arms it

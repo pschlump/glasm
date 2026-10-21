@@ -856,7 +856,17 @@ func (fe *funcEmitter) emitBlockBody(start, end int) {
 		case lua.OP_CONCAT:
 			// R[A] := R[A] .. ... .. R[A+B-1] — cells base R(A), count B;
 			// the hint run covers every operand (the seam maps the faulty
-			// slot back to its index by stack position, row 71)
+			// slot back to its index by stack position, row 71).
+			// U11c: the fold probe first — string/number operands fold in
+			// one unprotected pass, pre-flighted against the real
+			// allocator and the rt memlimit; every miss (metamethod
+			// shape, overflow, no headroom) takes the protected path
+			// unchanged
+			fe.cellAddr(A)
+			fe.f.I32Const(int32(B))
+			fe.cellAddr(A)
+			fe.f.Call(fe.b.imp("rt_concat_probe"))
+			fe.f.I32Eqz().If(wasm.Void)
 			fe.cellAddr(A)
 			fe.f.I32Const(int32(B))
 			fe.cellAddr(A)
@@ -865,6 +875,7 @@ func (fe *funcEmitter) emitBlockBody(start, end int) {
 			fe.f.I32Const(int32(fe.hintCallSite(pc)))
 			fe.f.Call(fe.b.imp("rt_concat"))
 			fe.checkStatus()
+			fe.f.End()
 			fe.bumpTop(A + 1)
 		case lua.OP_TBC:
 			// U4f: register the variable's cell in the rt tbc registry

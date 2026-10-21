@@ -40,6 +40,57 @@ stock texts. Two tree facts the port had to match: `svalue()` no longer
 exists in 5.5 (`getstr(tsvalue(o))`), and `luaL_pushfail` is **nil**
 in this build (`LUA_FAILISFALSE` unset) — find's miss value is nil.
 
+**U11c — the concat fold (`rt_concat_probe`):** the allocating `..`
+itself. One unprotected pass over OP_CONCAT's operand cells: strings
+read directly, numbers formatted into a C stack buffer via stock's own
+`luaO_tostringbuff` (allocation-free — and the cells stay unconverted,
+which is what the protected path already did to them: `concat_body`
+copies to the Lua stack and converts the *copies*), then exactly one
+result allocation like stock's last pass — `luaS_newlstr` (≤40,
+interned; a repeat returns the existing object) or
+`luaS_createlngstrobj` (>40, never interned). Numbers formatted to
+buffers instead of interned temps is strictly fewer allocations, same
+bytes; the frozen-GC posture makes the difference invisible.
+
+The design's crux is the **two-sided memory pre-flight**, because an
+allocation inside an unprotected probe can raise (OOM → `luaM_realloc_`
+longjmps), and a raise with no catch is a wasm trap:
+
+- **The real allocator side** — a `malloc(need)` round trip (give it
+  back immediately): if the worst-case contiguous block is servable, a
+  following request of at most `need` bytes cannot fail; a NULL is
+  exactly the real wall (linear-memory max, dlmalloc fragmentation),
+  which no accounting predicts — and the *only* check there is under
+  `limit == 0`. Sum-contiguity is stricter than the 1–2 separate
+  requests ever need, so it only declines early.
+- **The cap side** — `rt_alloc`'s own refusal arithmetic
+  (`rt_mem_used + need > rt_mem_limit`) when a budget is set, plus the
+  exact `growstrtab` prediction (`nuse >= size` → the doubled array's
+  peak) for the short-interning path.
+
+Two lessons the lane itself caught:
+
+- **v1 gated on the rt memlimit and was completely inert**: the host's
+  default posture is `maxMem == 0` = unlimited, so the probe declined
+  every concat on every default-configured engine — the enter
+  re-measure showed h_concat unchanged at 6,059 until the pre-flight
+  was made two-sided. Any probe that conditions on the budget must be
+  measured under the *default* configuration, not just the budgeted
+  test surfaces.
+- **The seam's probe families disagree on return codes**: the U10/U11a
+  table probes return **1 = hit** (`I32Eqz → protected`), the U11b
+  stdcall probe **0 = hit** (`== 1 → miss`). The concat probe follows
+  its opcode neighbors (1 = hit); writing the arm against the wrong
+  convention silently runs the protected path on every hit — the first
+  differential smoke catches it (the fold never accumulates), but only
+  if you look at content, not just exit codes.
+
+h_concat's residual 139 enters are its `string.format` calls
+(h_strlong's unchanged ~14.4k are format + gmatch — the next open
+items). No ledger row: no engine diverged; every miss shape takes the
+byte-identical protected path, proven by the matrix, error suite,
+oracles, and host gates.
+
 ## The guard-seam hazard (caught by the host gate before anything shipped)
 
 The blob's `luaH_pset{,str,shortstr,int}` are not stock: they are the
@@ -60,42 +111,44 @@ matter for probe work.
 
 ## Enter attribution (wazero, warm; 10,880-byte allocations = enters)
 
-| lane | U10 | U11 | residual |
-|---|---|---|---|
-| h_strlong | 27,439 | 14,371 | string.format ~600, gmatch-iterator ~600, misc |
-| h_concat | 12,028 | 6,059 | the `..` concats (~5,920: 1,920 `acc..i` + 4,000 `"k"..i`) |
-| h_str | 1,329 | 533 | format/misc |
+| lane | U10 | U11 | U11c | residual |
+|---|---|---|---|---|
+| h_strlong | 27,439 | 14,371 | 14,366 | string.format + the gmatch iterator |
+| h_concat | 12,028 | 6,059 | **139** | the 139 = the lane's string.format calls |
+| h_str | 1,329 | 533 | 533 | format/misc |
 
-h_concat's drop (−5,920) matches the U10-era decomposition exactly.
+U11's h_concat drop (−5,920) matched the U10-era decomposition exactly;
+U11c's (−5,920) takes the `..` fold itself off the protected path —
+under the DEFAULT host posture (no budget), where the v1 pre-flight
+was measuring 6,059 because it gated on the memlimit (see U11c above).
 
 ## Benchmarks (same-day, quiet machine — `bench/2026-10-20-u11.txt`)
 
 Medians, warm = pooled VM rerun on the production path (`host/` on
-wazero); the U10 column is the same-day U10 run (`bench/
-2026-10-20-u10.txt`):
+wazero); the U10/U11 columns are the same-day runs (`bench/
+2026-10-20-u10.txt`, `bench/2026-10-20-u11.txt`), the U11c column and
+the interp re-measure are `bench/2026-10-20-u11c.txt`:
 
-| lane | interp | U10 warm | U11 warm | U11 / interp |
-|---|---|---|---|---|
-| h_str | 181 µs | 552 µs | **297 µs** | 1.6× (was 3.1×) |
-| h_strlong | 1.54 ms | 15.2 ms | **6.01 ms** | 3.9× (was ~10×) |
-| h_concat | 946 µs | 5.2 ms | **3.20 ms** | 3.4× (was 5.5×) |
+| lane | interp | U10 warm | U11 warm | U11c warm | U11c / interp |
+|---|---|---|---|---|---|
+| h_str | 181 µs | 552 µs | 297 µs | **282 µs** | 1.6× (was 3.1×) |
+| h_strlong | 1.54 ms | 15.2 ms | 6.01 ms | **5.98 ms** | 4.2× (was ~10×) |
+| h_concat | 946 µs | 5.2 ms | 3.20 ms | **1.55 ms** | 1.66× (was 5.5×) |
 
 Non-string lanes unchanged within noise (h_numloop 41.7 ms,
 h_tablechurn 40.3 ms, h_hostfn 5.2 ms warm — same-day re-measures of
-the U10 numbers). The residual string gap is now the two shapes the
-probes deliberately leave alone: allocating `..` (h_concat, U11c) and
-format/gmatch C calls (h_strlong).
+the U10 numbers). U11c halves h_concat again (3.20 → 1.55 ms warm, 1.66× interp);
+h_str/h_strlong are unchanged within noise, as the probe predicts.
+The residual string gap is now only the C-call shapes:
+format/gmatch (h_strlong, h_str).
 
 ## Open items
 
-- U11c (stretch, not started): concat memory pre-flight — the
-  allocating `..` itself. Needs an rt memlimit-headroom check so the
-  probe can decline the OOM/raise shapes; h_concat's ~5,920 residual
-  enters are all this.
 - `string.format` and the gmatch iterator as stdcall targets
-  (format allocates — it needs U11c's pre-flight first).
+  (format allocates its result — U11c's two-sided pre-flight is the
+  template; h_strlong's ~14.4k residual enters are format + gmatch).
 - GETTABUP/SETTABUP: globals reads/writes still pay the protected
-  `_ENV` route (the `t["k"..i]` shape now rides the probes only once
-  the concat is constant-folded).
+  `_ENV` route (the `t["k"..i]` shape rides the probes once the concat
+  is constant-folded).
 - wazero upstream: the per-enter stack clone is an engine cost the
   probes route around, not fix.

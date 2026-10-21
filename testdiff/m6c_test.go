@@ -35,7 +35,7 @@ import (
 // Rebuild runtime/build55.sh → update this constant (the artifact test
 // is the self-check that forces the bump). Brittle by design (A8:
 // checksummed artifact).
-const lua55ProdSHA256 = "f26793954d8ef1d535575ed8cd27378fc1d582ea0ee098b7f9d6552909c4ddd7"
+const lua55ProdSHA256 = "af90f8d9d823b67f570caaeba7b441fab500116713700a5c6c9e53325f99a78c"
 
 // TestM6cProdBlobArtifact (U6d edition, ledger row 95): lua55_prod.wasm
 // — the 5.5 production flavor of the rt blob. The build's output is

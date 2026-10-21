@@ -111,7 +111,7 @@ the by-shape table below, `docs/U9-perf.md`, and `docs/U10-perf.md`.)
 | h_strlong (150 KB text processing)  | 1.54 ms | 89.7 ms       | 6.01 ms         |
 | h_numloop (4 M-iteration numeric)   | 126.7 ms| 113.6 ms      | **41.7 ms**     |
 | h_tablechurn (table alloc churn)    | 10.2 ms | 120.7 ms      | **40.3 ms**     |
-| h_concat (concat-heavy)             | 946 µs  | 76.0 ms       | 3.20 ms         |
+| h_concat (concat-heavy)             | 935 µs  | 73.7 ms       | **1.55 ms**     |
 | h_hostfn (3000 Go-call round trips) | 622 µs  | 77.4 ms       | 5.21 ms         |
 
 Read the table as: cold = compile + instantiate + run once; pooled =
@@ -122,7 +122,8 @@ you run a lot" penalty — pooling removes it.
 
 Process-time medians (3 runs) over the luabench scripts, re-measured
 2026-10-20 after U9c (direct dispatch), U10 (arith/compare/table fast
-paths) and U11 (string-lane probes) — `bench/2026-10-20-u11.txt`:
+paths) U11 (string-lane probes) and U11c (the concat fold probe) —
+`bench/2026-10-20-u11.txt` and `bench/2026-10-20-u11c.txt`:
 
 | shape                                | wasm on wasmtime | wasm on wazero | vs interpreter                        |
 |--------------------------------------|------------------|----------------|---------------------------------------|
@@ -146,11 +147,12 @@ One caveat, active work rather than a law of nature:
   (numloop 3×, tablechurn 4×, fib/nsieve/tco ~1.1–1.5×), and after
   U11 the string *scan* lanes run at 1.6–3.9× interp
   (`docs/U11-perf.md`: short-string table keys, `#`, and
-  `string.byte`/`string.find` run inline, no protected-call enter).
-  What still pays the protected C route: the allocating `..` itself
-  (h_concat, ~3.4× interp) and `string.format`/gmatch's iterator
-  (h_strlong, ~3.9×) — both need a memory pre-flight to probe
-  (U11c, open).
+  `string.byte`/`string.find` run inline, no protected-call enter),
+  and U11c took the allocating `..` itself off the protected route
+  (h_concat 1.66× interp, down from 3.4× — one-pass fold with a
+  two-sided memory pre-flight, `docs/U11-perf.md`). What still pays
+  the protected C route: `string.format` and gmatch's iterator
+  (h_strlong, ~4× interp) — the next stdcall-probe targets.
   C callees beyond the two probed, `__call` chains and cross-module
   closures still take the host dispatch seam, and tailcalls ride the
   staged M5c path.

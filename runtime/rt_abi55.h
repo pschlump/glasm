@@ -208,6 +208,18 @@ int32_t rt_len_probe(rt_addr srccell, rt_addr dstcell);
 ** Additive; LUA_RT_ABI stays 4. */
 int32_t rt_stdcall_probe(rt_addr funcaddr, rt_addr argcells, int32_t nargs,
                          int32_t want);
+/* U11c: concat fold probe — one-pass OP_CONCAT over string/number
+** cells (numbers formatted via stock's own luaO_tostringbuff; the
+** cells stay unconverted, as on the protected path). The result is
+** exactly one allocation (luaS_newlstr <=40 interned /
+** luaS_createlngstrobj >40), pre-flighted two-sided — a malloc(need)
+** round trip against the real allocator (the wall in BOTH modes) plus
+** the rt memlimit cap arithmetic when budgeted — so every OOM refusal
+** is unreachable here. Returns 1 = handled (like the U10/U11a table
+** probes), 0 = MISS (never an error: metamethod/overflow/no-headroom
+** shapes fall to the protected rt_concat). Additive; LUA_RT_ABI
+** stays 4. */
+int32_t rt_concat_probe(rt_addr cells, int32_t count, rt_addr dstcell);
 int32_t rt_arith(int32_t op, rt_addr lhscell, rt_addr rhscell, rt_addr dstcell,
                  int32_t line, int32_t h1, int32_t h2, int32_t hcall);
 int32_t rt_len(rt_addr cell, rt_addr dstcell, int32_t line, int32_t hobj,
