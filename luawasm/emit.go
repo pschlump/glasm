@@ -663,14 +663,20 @@ func (fe *funcEmitter) emitBlockBody(start, end int) {
 				fe.checkStatus()
 			}
 		case lua.OP_GETTABLE:
-			// U10: the VM's own luaV_fastgeti arm as an unprotected
-			// probe (int key, table present, slot non-empty) — a hit
-			// writes A with no try_table enter; any miss re-issues the
-			// cells to the protected rt_gettable (metamethods, errors)
+			// U10/U11: the VM's own luaV_fastgeti and luaV_fastget
+			// arms as unprotected probes (int keys, then short-string
+			// keys) — a hit writes A with no try_table enter; any miss
+			// re-issues the cells to the protected rt_gettable
+			// (metamethods, errors)
 			fe.cellAddr(B)
 			fe.cellAddr(C)
 			fe.cellAddr(A)
 			fe.f.Call(fe.b.imp("rt_geti_probe"))
+			fe.f.I32Eqz().If(wasm.Void)
+			fe.cellAddr(B)
+			fe.cellAddr(C)
+			fe.cellAddr(A)
+			fe.f.Call(fe.b.imp("rt_gets_probe"))
 			fe.f.I32Eqz().If(wasm.Void)
 			fe.cellAddr(B)
 			fe.cellAddr(C)
@@ -680,6 +686,7 @@ func (fe *funcEmitter) emitBlockBody(start, end int) {
 			fe.f.I32Const(int32(fe.hintCallSite(pc)))
 			fe.f.Call(fe.b.imp("rt_gettable"))
 			fe.checkStatus()
+			fe.f.End()
 			fe.f.End()
 			fe.bumpTop(A + 1)
 		case lua.OP_GETI:
@@ -700,6 +707,13 @@ func (fe *funcEmitter) emitBlockBody(start, end int) {
 			fe.f.End()
 			fe.bumpTop(A + 1)
 		case lua.OP_GETFIELD:
+			// U11: const short-string key — the luaV_fastget arm; miss
+			// (absent field, non-table, metamethod) -> protected path
+			fe.cellAddr(B)
+			fe.kcell(C)
+			fe.cellAddr(A)
+			fe.f.Call(fe.b.imp("rt_gets_probe"))
+			fe.f.I32Eqz().If(wasm.Void)
 			fe.cellAddr(B)
 			fe.kcell(C)
 			fe.cellAddr(A)
@@ -708,14 +722,21 @@ func (fe *funcEmitter) emitBlockBody(start, end int) {
 			fe.f.I32Const(int32(fe.hintCallSite(pc)))
 			fe.f.Call(fe.b.imp("rt_gettable"))
 			fe.checkStatus()
+			fe.f.End()
 			fe.bumpTop(A + 1)
 		case lua.OP_SETTABLE:
-			// U10: rt_seti_probe first (luaV_fastseti: int key, in-place
-			// write, no NEWINDEX); the protected rt_settable on a miss
+			// U10/U11: rt_seti_probe then rt_sets_probe (int keys,
+			// then short-string keys — luaV_fastseti/fastset); the
+			// protected rt_settable on a miss
 			fe.cellAddr(A)
 			fe.cellAddr(B)
 			fe.vcCell(C, k)
 			fe.f.Call(fe.b.imp("rt_seti_probe"))
+			fe.f.I32Eqz().If(wasm.Void)
+			fe.cellAddr(A)
+			fe.cellAddr(B)
+			fe.vcCell(C, k)
+			fe.f.Call(fe.b.imp("rt_sets_probe"))
 			fe.f.I32Eqz().If(wasm.Void)
 			fe.cellAddr(A)
 			fe.cellAddr(B)
@@ -725,6 +746,7 @@ func (fe *funcEmitter) emitBlockBody(start, end int) {
 			fe.f.I32Const(int32(fe.hintCallSite(pc)))
 			fe.f.Call(fe.b.imp("rt_settable"))
 			fe.checkStatus()
+			fe.f.End()
 			fe.f.End()
 		case lua.OP_SETI:
 			fe.mkIntScratch(1, int64(B))
@@ -743,6 +765,13 @@ func (fe *funcEmitter) emitBlockBody(start, end int) {
 			fe.checkStatus()
 			fe.f.End()
 		case lua.OP_SETFIELD:
+			// U11: const short-string key — the luaV_fastset arm; miss
+			// (absent key needing a rehash, NEWINDEX) -> protected path
+			fe.cellAddr(A)
+			fe.kcell(B)
+			fe.vcCell(C, k)
+			fe.f.Call(fe.b.imp("rt_sets_probe"))
+			fe.f.I32Eqz().If(wasm.Void)
 			fe.cellAddr(A)
 			fe.kcell(B)
 			fe.vcCell(C, k)
@@ -751,6 +780,7 @@ func (fe *funcEmitter) emitBlockBody(start, end int) {
 			fe.f.I32Const(int32(fe.hintCallSite(pc)))
 			fe.f.Call(fe.b.imp("rt_settable"))
 			fe.checkStatus()
+			fe.f.End()
 		case lua.OP_NEWTABLE:
 			narr := lua.OpGetArgvC(inst)
 			if k != 0 {
@@ -808,6 +838,12 @@ func (fe *funcEmitter) emitBlockBody(start, end int) {
 			})
 			fe.bumpTop(A + 1)
 		case lua.OP_LEN:
+			// U11: luaV_objlen's primitive arms (string lengths, table
+			// len without __len) as an unprotected probe
+			fe.cellAddr(B)
+			fe.cellAddr(A)
+			fe.f.Call(fe.b.imp("rt_len_probe"))
+			fe.f.I32Eqz().If(wasm.Void)
 			fe.cellAddr(B)
 			fe.cellAddr(A)
 			fe.f.I32Const(fe.line(pc))
@@ -815,6 +851,7 @@ func (fe *funcEmitter) emitBlockBody(start, end int) {
 			fe.f.I32Const(int32(fe.hintCallSite(pc)))
 			fe.f.Call(fe.b.imp("rt_len"))
 			fe.checkStatus()
+			fe.f.End()
 			fe.bumpTop(A + 1)
 		case lua.OP_CONCAT:
 			// R[A] := R[A] .. ... .. R[A+B-1] — cells base R(A), count B;

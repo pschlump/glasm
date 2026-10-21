@@ -943,6 +943,23 @@ func (fe *funcEmitter) emitCall(A, B, C, pc int, tail bool) {
 		f.Else()
 	}
 
+	// U11b: the pure-stdlib callee probe — string.byte and string.find's
+	// plain search run inline (no protected call, no try_table enter, no
+	// trampoline) when the callee IS the stock function pinned once per
+	// process at rt_set_state. The probe stages want-shaped results at
+	// R(A) with rt_call_addr's own success encoding, so the top-adjust
+	// below is reused verbatim; miss = 1 simply falls into the protected
+	// call below (the probe never errors — the ==1 error check only ever
+	// sees rt_call_addr's result, which overwrites lSt first).
+	if !tail {
+		fe.cellAddr(A)
+		fe.cellAddr(A + 1)
+		f.LocalGet(fe.lT0) // nargs
+		f.LocalGet(fe.lT1) // want
+		f.Call(fe.b.imp("rt_stdcall_probe")).LocalSet(fe.lSt)
+		f.LocalGet(fe.lSt).I32Const(1).I32Eq().If(wasm.Void)
+	}
+
 	// rt_call_addr(&R(A), &R(A+1), nargs, want, line, hcallee)
 	fe.cellAddr(A)
 	fe.cellAddr(A + 1)
@@ -959,6 +976,7 @@ func (fe *funcEmitter) emitCall(A, B, C, pc int, tail bool) {
 	f.End()
 
 	if !tail {
+		f.End() // close the stdcall-probe miss If (U11b)
 		f.End() // close the direct/fallback If
 	}
 

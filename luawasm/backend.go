@@ -267,6 +267,13 @@ func (b *backend) declareImports() {
 		// fastseti arms — a hit skips the try_table enter entirely
 		"rt_geti_probe":    m.ImportFunc("rt", "rt_geti_probe", iii, i32v),
 		"rt_seti_probe":    m.ImportFunc("rt", "rt_seti_probe", iii, i32v),
+		// U11 probes: short-string keys (same iii shape) and length
+		"rt_gets_probe":    m.ImportFunc("rt", "rt_gets_probe", iii, i32v),
+		"rt_sets_probe":    m.ImportFunc("rt", "rt_sets_probe", iii, i32v),
+		"rt_len_probe":     m.ImportFunc("rt", "rt_len_probe", ii, i32v),
+		// U11b: pure stdlib callee probe (string.byte / string.find's
+		// plain search) — (funcaddr, argcells, nargs, want)
+		"rt_stdcall_probe": m.ImportFunc("rt", "rt_stdcall_probe", iiii, i32v),
 		"rt_arith":         m.ImportFunc("rt", "rt_arith", iiiiiiii, i32v),
 		"rt_len":           m.ImportFunc("rt", "rt_len", iiiii, i32v),
 		"rt_eq":            m.ImportFunc("rt", "rt_eq", iiii, i32v),

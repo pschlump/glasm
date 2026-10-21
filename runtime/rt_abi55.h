@@ -191,6 +191,23 @@ int32_t rt_settable(rt_addr tblcell, rt_addr keycell, rt_addr valcell,
 ** stays 4 (blob and backend evolve together in-tree). */
 int32_t rt_geti_probe(rt_addr tblcell, rt_addr keycell, rt_addr dstcell);
 int32_t rt_seti_probe(rt_addr tblcell, rt_addr keycell, rt_addr valcell);
+/* U11 probes: short-string keys (getshortstr/psetshortstr) and the
+** OP_LEN primitive arms (luaV_objlen's string/table cases). Same
+** can-never-raise contract as the U10 probes; miss = protected path.
+** Additive; LUA_RT_ABI stays 4. */
+int32_t rt_gets_probe(rt_addr tblcell, rt_addr keycell, rt_addr dstcell);
+int32_t rt_sets_probe(rt_addr tblcell, rt_addr keycell, rt_addr valcell);
+int32_t rt_len_probe(rt_addr srccell, rt_addr dstcell);
+/* U11b: pure stdlib callee probe — string.byte and string.find's
+** plain search, run inline at OP_CALL when the callee IS the stock
+** function (pinned once per process from the pristine globals).
+** Returns 1 = MISS (never an error: miss shapes fall to the protected
+** call); handled results use rt_call_addr's success encoding
+** (0 for fixed want, -(nret+1) for multret), staged at the callee
+** cell and nil-padded/truncated to want. Cannot raise — no rt_run.
+** Additive; LUA_RT_ABI stays 4. */
+int32_t rt_stdcall_probe(rt_addr funcaddr, rt_addr argcells, int32_t nargs,
+                         int32_t want);
 int32_t rt_arith(int32_t op, rt_addr lhscell, rt_addr rhscell, rt_addr dstcell,
                  int32_t line, int32_t h1, int32_t h2, int32_t hcall);
 int32_t rt_len(rt_addr cell, rt_addr dstcell, int32_t line, int32_t hobj,

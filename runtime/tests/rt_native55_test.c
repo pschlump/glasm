@@ -555,6 +555,237 @@ int main(void) {
       CHECK(rt_seti_probe(rv, cell_of(&kk), cell_of(&vv)) == 0);
     }
 
+    /* ---- U11 probes: short-string keys + length (same discipline) ---- */
+    {
+      TValue kk, vv, dst;
+      /* gets hit: t.x = 42 was written above via the protected path */
+      rt_intern(cell_of(&kk), (rt_addr)(uintptr_t)"x", 1);
+      CHECK(rt_gets_probe(rt_, cell_of(&kk), cell_of(&dst)) == 1);
+      CHECK(ttisinteger(&dst) && ivalue(&dst) == 42);
+      /* gets miss: absent string key leaves dst alone */
+      rt_intern(cell_of(&kk), (rt_addr)(uintptr_t)"zz", 2);
+      rt_mkinteger(cell_of(&dst), 0x5678);
+      CHECK(rt_gets_probe(rt_, cell_of(&kk), cell_of(&dst)) == 0);
+      CHECK(ttisinteger(&dst) && ivalue(&dst) == 0x5678);
+      /* gets miss: integer key (the int probe's domain) */
+      rt_mkinteger(cell_of(&kk), 2);
+      CHECK(rt_gets_probe(rt_, cell_of(&kk), cell_of(&dst)) == 0);
+      CHECK(rt_gets_probe(rv, cell_of(&kk), cell_of(&dst)) == 0);
+
+      /* sets hit: overwrites the present t.x, read back via probe */
+      rt_intern(cell_of(&kk), (rt_addr)(uintptr_t)"x", 1);
+      rt_mkinteger(cell_of(&vv), 4242);
+      CHECK(rt_sets_probe(rt_, cell_of(&kk), cell_of(&vv)) == 1);
+      CHECK(rt_gets_probe(rt_, cell_of(&kk), cell_of(&dst)) == 1);
+      CHECK(ttisinteger(&dst) && ivalue(&dst) == 4242);
+      /* sets miss on a key the hash part must grow for -> the
+         protected path creates it, then both probes hit */
+      {
+        TValue nt;
+        CHECK(rt_newtable(cell_of(&nt), 0, 0) == RT_OK);
+        rt_intern(cell_of(&kk), (rt_addr)(uintptr_t)"new", 3);
+        rt_mkinteger(cell_of(&vv), 7);
+        CHECK(rt_sets_probe(cell_of(&nt), cell_of(&kk), cell_of(&vv)) == 0);
+        CHECK(rt_settable(cell_of(&nt), cell_of(&kk), cell_of(&vv), 29,
+                          -1, -1) == RT_OK);
+        CHECK(rt_sets_probe(cell_of(&nt), cell_of(&kk), cell_of(&vv)) == 1);
+        CHECK(rt_gets_probe(cell_of(&nt), cell_of(&kk), cell_of(&dst)) == 1);
+        CHECK(ttisinteger(&dst) && ivalue(&dst) == 7);
+      }
+      /* sets miss: integer key / non-table receiver */
+      rt_mkinteger(cell_of(&kk), 1);
+      CHECK(rt_sets_probe(rt_, cell_of(&kk), cell_of(&vv)) == 0);
+      CHECK(rt_sets_probe(rv, cell_of(&kk), cell_of(&vv)) == 0);
+
+      /* len: short string, long string, table (any legal border —
+         assert equality with stock luaH_getn, not a specific one) */
+      rt_intern(cell_of(&vv), (rt_addr)(uintptr_t)"hello", 5);
+      CHECK(rt_len_probe(cell_of(&vv), cell_of(&dst)) == 1);
+      CHECK(ttisinteger(&dst) && ivalue(&dst) == 5);
+      rt_intern(cell_of(&vv),
+                (rt_addr)(uintptr_t)
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", 45);
+      CHECK(rt_len_probe(cell_of(&vv), cell_of(&dst)) == 1);
+      CHECK(ttisinteger(&dst) && ivalue(&dst) == 45);
+      CHECK(rt_len_probe(rt_, cell_of(&dst)) == 1);
+      CHECK(ivalue(&dst) ==
+            (lua_Integer)luaH_getn(rt_curL(), hvalue(&t)));
+      /* len miss: a number has no primitive length */
+      rt_mknumber(cell_of(&vv), 3.5);
+      CHECK(rt_len_probe(cell_of(&vv), cell_of(&dst)) == 0);
+      /* len miss on a __len table -> the protected path runs the
+         metamethod (probe declines, semantics preserved) */
+      {
+        TValue lt, mt, fn;
+        CHECK(rt_newtable(cell_of(&lt), 0, 0) == RT_OK);
+        CHECK(rt_newtable(cell_of(&mt), 0, 1) == RT_OK);
+        {
+          const char *src = "return function(_) return 99 end";
+          CHECK(luaL_loadbuffer(L, src, strlen(src), "=lenmt") == 0);
+          CHECK(lua_pcall(L, 0, 1, 0) == 0);
+          fn = *s2v(L->top.p - 1);
+          L->top.p--;
+        }
+        rt_intern(cell_of(&kk), (rt_addr)(uintptr_t)"__len", 5);
+        CHECK(rt_settable(cell_of(&mt), cell_of(&kk), cell_of(&fn), 30,
+                          -1, -1) == RT_OK);
+        luaD_checkstack(L, 2);
+        setobj2s(L, L->top.p, &lt);
+        L->top.p++;
+        setobj2s(L, L->top.p, &mt);
+        L->top.p++;
+        lua_setmetatable(L, -2);
+        L->top.p--;
+        CHECK(rt_len_probe(cell_of(&lt), cell_of(&dst)) == 0);
+        CHECK(rt_len(cell_of(&lt), cell_of(&dst), 31, -1, -1) == RT_OK);
+        CHECK(ttisinteger(&dst) && ivalue(&dst) == 99);
+      }
+    }
+
+    /* ---- U11b: the pure stdlib callee probe (string.byte / find) ---- */
+    {
+      TValue fbyte, ffind, frep;
+      lua_getglobal(L, "string");
+      lua_getfield(L, -1, "byte");
+      fbyte = *s2v(L->top.p - 1);
+      lua_getfield(L, -2, "find");
+      ffind = *s2v(L->top.p - 1);
+      lua_getfield(L, -3, "rep"); /* -3 = the string table */
+      frep = *s2v(L->top.p - 1);
+      L->top.p -= 4;
+      /* blk[0] = the callee cell (results stage there), blk[1..] = the
+         args — the probe derives dst as argcells-16, the ABI's layout */
+      TValue blk[6];
+      int32_t r;
+
+      /* byte, fixed want 2 of 3 results: ("hello", 2, 4) = 101,108,108
+         -> truncated and staged as 101,108 */
+      blk[0] = fbyte;
+      rt_intern(cell_of(&blk[1]), (rt_addr)(uintptr_t)"hello", 5);
+      rt_mkinteger(cell_of(&blk[2]), 2);
+      rt_mkinteger(cell_of(&blk[3]), 4);
+      r = rt_stdcall_probe(cell_of(&blk[0]), cell_of(&blk[1]), 3, 2);
+      CHECK(r == 0);
+      CHECK(ttisinteger(&blk[0]) && ivalue(&blk[0]) == 101);
+      CHECK(ttisinteger(&blk[1]) && ivalue(&blk[1]) == 108);
+      /* byte, multret want -1: nres = 3 -> -(3+1). Re-stage first: the
+         call above staged its results over the callee and arg cells
+         (dst = argcells-16 — the ABI's own layout) */
+      blk[0] = fbyte;
+      rt_intern(cell_of(&blk[1]), (rt_addr)(uintptr_t)"hello", 5);
+      rt_mkinteger(cell_of(&blk[2]), 2);
+      rt_mkinteger(cell_of(&blk[3]), 4);
+      r = rt_stdcall_probe(cell_of(&blk[0]), cell_of(&blk[1]), 3, -1);
+      CHECK(r == -4);
+      CHECK(ivalue(&blk[2]) == 108);
+      /* byte, default i/j: ("hi") -> 104 */
+      blk[0] = fbyte;
+      rt_intern(cell_of(&blk[1]), (rt_addr)(uintptr_t)"hi", 2);
+      r = rt_stdcall_probe(cell_of(&blk[0]), cell_of(&blk[1]), 1, 1);
+      CHECK(r == 0 && ttisinteger(&blk[0]) && ivalue(&blk[0]) == 104);
+      /* byte, negative i: ("hello", -3) -> 'l' (108) */
+      blk[0] = fbyte;
+      rt_intern(cell_of(&blk[1]), (rt_addr)(uintptr_t)"hello", 5);
+      rt_mkinteger(cell_of(&blk[2]), -3);
+      r = rt_stdcall_probe(cell_of(&blk[0]), cell_of(&blk[1]), 2, 1);
+      CHECK(r == 0 && ivalue(&blk[0]) == 108);
+      /* byte, empty interval ("hello", 4, 2): no values, nil-padded */
+      blk[0] = fbyte;
+      rt_mkinteger(cell_of(&blk[2]), 4);
+      rt_mkinteger(cell_of(&blk[3]), 2);
+      r = rt_stdcall_probe(cell_of(&blk[0]), cell_of(&blk[1]), 3, 2);
+      CHECK(r == 0);
+      CHECK(ttisnil(&blk[0]) && ttisnil(&blk[1]));
+      /* byte, misses: float i; multret slice > 8; non-string subject */
+      blk[0] = fbyte;
+      rt_intern(cell_of(&blk[1]), (rt_addr)(uintptr_t)"hello", 5);
+      rt_mknumber(cell_of(&blk[2]), 1.5);
+      CHECK(rt_stdcall_probe(cell_of(&blk[0]), cell_of(&blk[1]), 2, 1) == 1);
+      rt_intern(cell_of(&blk[1]), (rt_addr)(uintptr_t)"0123456789A", 11);
+      rt_mkinteger(cell_of(&blk[2]), 1);
+      rt_mkinteger(cell_of(&blk[3]), 11);
+      CHECK(rt_stdcall_probe(cell_of(&blk[0]), cell_of(&blk[1]), 3, -1) == 1);
+      rt_mkinteger(cell_of(&blk[1]), 42);
+      rt_mkinteger(cell_of(&blk[2]), 1);
+      CHECK(rt_stdcall_probe(cell_of(&blk[0]), cell_of(&blk[1]), 2, 1) == 1);
+
+      /* find, plain hit with init: ("hello world", "world", 1) -> 7,11 */
+      blk[0] = ffind;
+      rt_intern(cell_of(&blk[1]), (rt_addr)(uintptr_t)"hello world", 11);
+      rt_intern(cell_of(&blk[2]), (rt_addr)(uintptr_t)"world", 5);
+      rt_mkinteger(cell_of(&blk[3]), 1);
+      r = rt_stdcall_probe(cell_of(&blk[0]), cell_of(&blk[1]), 3, 2);
+      CHECK(r == 0 && ivalue(&blk[0]) == 7 && ivalue(&blk[1]) == 11);
+      /* multret: -(2+1); re-stage (results clobbered the cells above) */
+      blk[0] = ffind;
+      rt_intern(cell_of(&blk[1]), (rt_addr)(uintptr_t)"hello world", 11);
+      rt_intern(cell_of(&blk[2]), (rt_addr)(uintptr_t)"world", 5);
+      rt_mkinteger(cell_of(&blk[3]), 1);
+      r = rt_stdcall_probe(cell_of(&blk[0]), cell_of(&blk[1]), 3, -1);
+      CHECK(r == -3 && ivalue(&blk[0]) == 7 && ivalue(&blk[1]) == 11);
+      /* find, nospecials with no init: ("hello world", "lo wo") -> 4,8 */
+      blk[0] = ffind;
+      rt_intern(cell_of(&blk[1]), (rt_addr)(uintptr_t)"hello world", 11);
+      rt_intern(cell_of(&blk[2]), (rt_addr)(uintptr_t)"lo wo", 5);
+      r = rt_stdcall_probe(cell_of(&blk[0]), cell_of(&blk[1]), 2, 2);
+      CHECK(r == 0 && ivalue(&blk[0]) == 4 && ivalue(&blk[1]) == 8);
+      /* find, empty pattern ("hello", "", 2) -> 2, 1 */
+      blk[0] = ffind;
+      rt_intern(cell_of(&blk[1]), (rt_addr)(uintptr_t)"hello", 5);
+      rt_intern(cell_of(&blk[2]), (rt_addr)(uintptr_t)"", 0);
+      rt_mkinteger(cell_of(&blk[3]), 2);
+      r = rt_stdcall_probe(cell_of(&blk[0]), cell_of(&blk[1]), 3, 2);
+      CHECK(r == 0 && ivalue(&blk[0]) == 2 && ivalue(&blk[1]) == 1);
+      /* find, not found -> one nil (luaL_pushfail = nil in this tree);
+         re-stage the subject (clobbered by the call above) */
+      blk[0] = ffind;
+      rt_intern(cell_of(&blk[1]), (rt_addr)(uintptr_t)"hello", 5);
+      rt_intern(cell_of(&blk[2]), (rt_addr)(uintptr_t)"zz", 2);
+      r = rt_stdcall_probe(cell_of(&blk[0]), cell_of(&blk[1]), 2, 2);
+      CHECK(r == 0 && ttisnil(&blk[0]) && ttisnil(&blk[1]));
+      /* find, init past the end ("hi", "x", 5) -> nil */
+      blk[0] = ffind;
+      rt_intern(cell_of(&blk[1]), (rt_addr)(uintptr_t)"hi", 2);
+      rt_intern(cell_of(&blk[2]), (rt_addr)(uintptr_t)"x", 1);
+      rt_mkinteger(cell_of(&blk[3]), 5);
+      r = rt_stdcall_probe(cell_of(&blk[0]), cell_of(&blk[1]), 3, 1);
+      CHECK(r == 0 && ttisnil(&blk[0]));
+      /* find, pattern specials without plain -> miss; with plain=true
+         the plain search runs on the "pattern" as a literal */
+      blk[0] = ffind;
+      rt_intern(cell_of(&blk[1]), (rt_addr)(uintptr_t)"hello", 5);
+      rt_intern(cell_of(&blk[2]), (rt_addr)(uintptr_t)"l+o", 3);
+      CHECK(rt_stdcall_probe(cell_of(&blk[0]), cell_of(&blk[1]), 2, 2) == 1);
+      rt_mkbool(cell_of(&blk[4]), 1); /* args[3] = the plain flag */
+      r = rt_stdcall_probe(cell_of(&blk[0]), cell_of(&blk[1]), 4, 2);
+      CHECK(r == 0 && ttisnil(&blk[0]) && ttisnil(&blk[1]));
+      /* a different stdlib C function never matches */
+      blk[0] = frep;
+      CHECK(rt_stdcall_probe(cell_of(&blk[0]), cell_of(&blk[1]), 2, 2) == 1);
+
+      /* the pin is the ORIGINAL: after string.byte = 1 the saved value
+         still hits (the pooled-VM guarantee) and the new value misses */
+      blk[0] = fbyte;
+      rt_intern(cell_of(&blk[1]), (rt_addr)(uintptr_t)"hi", 2);
+      lua_getglobal(L, "string");
+      lua_pushinteger(L, 1);
+      lua_setfield(L, -2, "byte");
+      L->top.p--;
+      r = rt_stdcall_probe(cell_of(&blk[0]), cell_of(&blk[1]), 1, 1);
+      CHECK(r == 0 && ivalue(&blk[0]) == 104);
+      lua_getglobal(L, "string");
+      lua_getfield(L, -1, "byte");
+      blk[5] = *s2v(L->top.p - 1);
+      L->top.p -= 2;
+      CHECK(rt_stdcall_probe(cell_of(&blk[5]), cell_of(&blk[1]), 1, 1) == 1);
+      /* restore the stock function before anything else looks */
+      lua_getglobal(L, "string");
+      setobj2s(L, L->top.p, &fbyte);
+      L->top.p++;
+      lua_setfield(L, -2, "byte");
+      L->top.p--;
+    }
+
     /* __index metamethod through the seam (a Lua closure runs under
        rt_run's protect — the metamethod body is real Lua) */
     {

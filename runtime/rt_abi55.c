@@ -29,6 +29,7 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
+#include <limits.h>
 
 #include "rt_abi55.h"
 #include "lua55/src/lauxlib.h"
@@ -351,6 +352,8 @@ static int rt_run(body_fn fn, int32_t line, int32_t h1, int32_t h2,
 
 int32_t rt_abi_version(void) { return LUA_RT_ABI; }
 
+static void sc_resolve(void); /* U11b: defined with the probe, below */
+
 void rt_set_state(rt_addr p) {
   curL = (lua_State *)(size_t)p;
   err_pending = 0;
@@ -395,6 +398,7 @@ void rt_set_state(rt_addr p) {
                  (fresh VMs only — the set's Table* belong to the dead
                  state; sandbox/protect re-run per activation) */
   rt_rp_n = 0; /* row 85: no protects of ours survive a state reset */
+  sc_resolve(); /* U11b: pin the pure stdlib probe targets (once) */
 }
 
 /* ---- value construction ---- */
@@ -514,6 +518,12 @@ int32_t rt_seti_probe(rt_addr tblcell, rt_addr keycell, rt_addr valcell) {
   TValue *v = (TValue *)(size_t)valcell;
   if (ttisinteger(k)) {
     int hres;
+    /* the blob's pset family is the U6c-guarded seam (rt_seam55.c):
+       a protected table RAISES from inside the writer, which an
+       unprotected probe cannot let fly — decline, and the protected
+       path raises cleanly under rt_run */
+    if (ttistable(t) && rt_prot_isprotected(hvalue(t)))
+      return 0;
     luaV_fastseti(t, ivalue(k), v, hres);
     if (hres == HOK) {
       luaV_finishfastset(curL, t, v); /* the write barrier */
@@ -521,6 +531,288 @@ int32_t rt_seti_probe(rt_addr tblcell, rt_addr keycell, rt_addr valcell) {
     }
   }
   return 0;
+}
+
+/* ---- U11: short-string-key and length probes (U10 posture) ----
+**
+** Same construction as above: the VM's own fast arms lifted verbatim
+** (OP_GETFIELD/SETFIELD via luaV_fastget/fastset over getshortstr/
+** psetshortstr, OP_LEN via luaV_objlen's primitive arms). psetshortstr
+** declines every raise-shaped case itself (no space for the key, the
+** black/white barrier, any NEWINDEX metamethod) — rehash and barrier
+** misses take the protected path. luaH_getn is search plus lenhint
+** write; the __len and non-primitive arms miss. */
+
+int32_t rt_gets_probe(rt_addr tblcell, rt_addr keycell, rt_addr dstcell) {
+  TValue *t = (TValue *)(size_t)tblcell;
+  const TValue *k = (const TValue *)(size_t)keycell;
+  TValue *dst = (TValue *)(size_t)dstcell;
+  if (ttisshrstring(k)) { /* long-string keys: the protected path */
+    lu_byte tag;
+    luaV_fastget(t, tsvalue(k), dst, luaH_getshortstr, tag);
+    if (!tagisempty(tag))
+      return 1; /* dst holds the value */
+  }
+  return 0;
+}
+
+int32_t rt_sets_probe(rt_addr tblcell, rt_addr keycell, rt_addr valcell) {
+  TValue *t = (TValue *)(size_t)tblcell;
+  const TValue *k = (const TValue *)(size_t)keycell;
+  TValue *v = (TValue *)(size_t)valcell;
+  if (ttisshrstring(k)) {
+    int hres;
+    /* same U6c-guard reason as rt_seti_probe: the guarded
+       luaH_psetshortstr would raise out of this unprotected probe */
+    if (ttistable(t) && rt_prot_isprotected(hvalue(t)))
+      return 0;
+    luaV_fastset(t, tsvalue(k), v, hres, luaH_psetshortstr);
+    if (hres == HOK) {
+      luaV_finishfastset(curL, t, v);
+      return 1;
+    }
+  }
+  return 0;
+}
+
+int32_t rt_len_probe(rt_addr srccell, rt_addr dstcell) {
+  TValue *o = (TValue *)(size_t)srccell;
+  TValue *dst = (TValue *)(size_t)dstcell;
+  switch (ttypetag(o)) { /* luaV_objlen's primitive arms, verbatim */
+    case LUA_VTABLE: {
+      Table *h = hvalue(o);
+      if (fasttm(curL, h->metatable, TM_LEN) == NULL) { /* no __len */
+        setivalue(dst, l_castU2S(luaH_getn(curL, h)));
+        return 1;
+      }
+      break;
+    }
+    case LUA_VSHRSTR:
+      setivalue(dst, tsvalue(o)->shrlen);
+      return 1;
+    case LUA_VLNGSTR:
+      setivalue(dst, cast_st2S(tsvalue(o)->u.lnglen));
+      return 1;
+    default:
+      break; /* __len metamethod or typeerror: the protected path */
+  }
+  return 0;
+}
+
+/* ---- U11b: pure stdlib callee probe (string.byte / string.find) ----
+**
+** Both are pure: reads and integer staging only, no allocation, and
+** they raise only on argument shapes the probe declines (non-string
+** subjects, coercion-needed indices, the INT_MAX slice guard). The
+** callee is compared against the stock functions resolved ONCE PER
+** PROCESS, at the first rt_set_state (the globals are pristine then:
+** the driver opens libraries before any script runs; light C
+** functions carry their pointer inline, so the pinned values are
+** state-independent). A pooled VM's later runs keep matching only the
+** ORIGINAL functions: a script that swaps string.byte — any value,
+** closure or C function — stops matching and takes the protected
+** call; a saved original restored under the name matches because it
+** IS the original.
+** Results stage at the callee cell exactly as rt_call_addr's
+** luaD_poscall would — truncated and nil-padded to want — and the
+** return uses rt_call_addr's encoding. 1 = MISS (this probe never
+** errors): the caller falls through to the protected call. */
+
+static TValue sc_byte, sc_find;
+static int sc_resolved = 0;
+
+static void sc_resolve(void) {
+  TValue st, key;
+  Table *gt;
+  if (sc_resolved)
+    return;
+  sc_resolved = 1;
+  setnilvalue(&sc_byte);
+  setnilvalue(&sc_find);
+  /* raw walk: registry[LUA_RIDX_GLOBALS] -> "string" -> "byte"/"find" —
+     no metamethods, no C stack, no ordering hazard against globals
+     protection. The short names are interned, so luaS_new finds them
+     without allocating. */
+  if (!ttistable(&G(curL)->l_registry))
+    return;
+  luaH_getint(hvalue(&G(curL)->l_registry), LUA_RIDX_GLOBALS, &st);
+  if (!ttistable(&st))
+    return;
+  gt = hvalue(&st);
+  setsvalue(curL, &key, luaS_new(curL, "string"));
+  luaH_getshortstr(gt, tsvalue(&key), &st);
+  if (!ttistable(&st))
+    return; /* no string library: the probe simply never matches */
+  gt = hvalue(&st);
+  setsvalue(curL, &key, luaS_new(curL, "byte"));
+  luaH_getshortstr(gt, tsvalue(&key), &sc_byte);
+  if (!ttislcf(&sc_byte))
+    setnilvalue(&sc_byte); /* only the stock light-C shape matches */
+  setsvalue(curL, &key, luaS_new(curL, "find"));
+  luaH_getshortstr(gt, tsvalue(&key), &sc_find);
+  if (!ttislcf(&sc_find))
+    setnilvalue(&sc_find);
+}
+
+/* lstrlib.c's index helpers, verbatim (arg coercion removed: the
+   probe declines non-integer indices before calling these) */
+static size_t sc_posrelatI(lua_Integer pos, size_t len) {
+  if (pos > 0)
+    return (size_t)pos;
+  else if (pos == 0)
+    return 1;
+  else if (pos < -(lua_Integer)len) /* inverted comparison */
+    return 1; /* clip to 1 */
+  else
+    return len + (size_t)pos + 1;
+}
+
+static size_t sc_getendpos(lua_Integer pos, size_t len) {
+  /* stock's getendpos, verbatim, minus luaL_optinteger (the caller
+     resolved the default; stock: clip result to [0, len]) */
+  if (pos > (lua_Integer)len)
+    return len;
+  else if (pos >= 0)
+    return (size_t)pos;
+  else if (pos < -(lua_Integer)len)
+    return 0;
+  else
+    return len + (size_t)pos + 1;
+}
+
+static const char *sc_lmemfind(const char *s1, size_t l1, const char *s2,
+                               size_t l2) { /* lstrlib.c, verbatim */
+  if (l2 == 0)
+    return s1;
+  else if (l2 > l1)
+    return NULL;
+  else {
+    const char *init;
+    l2--;
+    l1 = l1 - l2;
+    while (l1 > 0 && (init = (const char *)memchr(s1, *s2, l1)) != NULL) {
+      init++;
+      if (memcmp(init, s2 + 1, l2) == 0)
+        return init - 1;
+      else {
+        l1 -= ct_diff2sz(init - s1);
+        s1 = init;
+      }
+    }
+    return NULL;
+  }
+}
+
+static const char sc_specials[] = "^$*+?.([%-";
+
+static int sc_nospecials(const char *p, size_t l) { /* verbatim */
+  size_t upto = 0;
+  do {
+    if (strpbrk(p + upto, sc_specials))
+      return 0;
+    upto += strlen(p + upto) + 1;
+  } while (upto <= l);
+  return 1;
+}
+
+/* stage nres results (nil-padded/truncated to the caller's want) with
+   rt_call_addr's success encoding */
+static int32_t sc_stage(TValue *dst, int w, const TValue *res, int nres) {
+  int i, lim = (w < 0) ? nres : w;
+  for (i = 0; i < lim; i++) {
+    if (i < nres)
+      dst[i] = res[i];
+    else
+      setnilvalue(&dst[i]);
+  }
+  return w < 0 ? -(nres + 1) : RT_OK;
+}
+
+int32_t rt_stdcall_probe(rt_addr funcaddr, rt_addr argcells, int32_t nargs,
+                         int32_t want) {
+  const TValue *fn = (const TValue *)(size_t)funcaddr;
+  TValue *args = (TValue *)(size_t)argcells;
+  TValue *dst = (TValue *)(size_t)(argcells - (rt_addr)sizeof(TValue));
+  int w = (int)want, n = (int)nargs;
+  TValue res[2];
+  if (luaV_rawequalobj(fn, &sc_byte)) {
+    /* str_byte's arithmetic, verbatim; only the raise shapes differ */
+    size_t l;
+    const char *sp;
+    lua_Integer pi = 1, pj;
+    size_t posi, pose;
+    int i, nres, lim;
+    if (n < 1 || !ttisstring(&args[0]))
+      return 1; /* coercion/metamethod/error shapes: protected path */
+    sp = getstr(tsvalue(&args[0]));
+    l = tsslen(tsvalue(&args[0]));
+    if (n >= 2) {
+      if (!ttisinteger(&args[1]))
+        return 1;
+      pi = ivalue(&args[1]);
+    }
+    pj = pi; /* luaL_optinteger(L, 3, pi): absent j defaults to i */
+    if (n >= 3) {
+      if (!ttisinteger(&args[2]))
+        return 1;
+      pj = ivalue(&args[2]);
+    }
+    posi = sc_posrelatI(pi, l);
+    pose = sc_getendpos(pj, l);
+    if (posi > pose)
+      return sc_stage(dst, w, res, 0); /* empty interval, no values */
+    if (pose - posi >= (size_t)INT_MAX)
+      return 1; /* "string slice too long": the protected path raises */
+    nres = (int)(pose - posi) + 1;
+    if (w < 0 && nres > 8)
+      return 1; /* big multret slices: the fallback stages them */
+    lim = (w < 0) ? nres : w;
+    for (i = 0; i < lim; i++) {
+      if (i < nres) {
+        setivalue(&dst[i], cast_uchar(sp[posi + (size_t)i - 1]));
+      } else { /* braces: setivalue expands to a bare block */
+        setnilvalue(&dst[i]);
+      }
+    }
+    return w < 0 ? -(nres + 1) : RT_OK;
+  }
+  if (luaV_rawequalobj(fn, &sc_find)) {
+    /* str_find_aux's plain-search branch (explicit plain flag or a
+       pattern with no special characters), verbatim */
+    size_t ls, lp, init;
+    const char *sp, *pp, *s2;
+    lua_Integer ii = 1;
+    int plain;
+    if (n < 2 || !ttisstring(&args[0]) || !ttisstring(&args[1]))
+      return 1;
+    sp = getstr(tsvalue(&args[0]));
+    ls = tsslen(tsvalue(&args[0]));
+    pp = getstr(tsvalue(&args[1]));
+    lp = tsslen(tsvalue(&args[1]));
+    if (n >= 3) {
+      if (!ttisinteger(&args[2]))
+        return 1;
+      ii = ivalue(&args[2]);
+    }
+    init = sc_posrelatI(ii, ls) - 1;
+    plain = (n >= 4 && !l_isfalse(&args[3])) || sc_nospecials(pp, lp);
+    if (!plain)
+      return 1; /* the pattern engine: protected path */
+    if (init > ls) { /* start after string's end */
+      setnilvalue(&res[0]); /* luaL_pushfail = nil in this build
+                               (LUA_FAILISFALSE unset) */
+      return sc_stage(dst, w, res, 1);
+    }
+    s2 = sc_lmemfind(sp + init, ls - init, pp, lp);
+    if (s2 != NULL) {
+      setivalue(&res[0], ct_diff2S(s2 - sp) + 1);
+      setivalue(&res[1], cast_st2S(ct_diff2sz(s2 - sp) + lp));
+      return sc_stage(dst, w, res, 2);
+    }
+    setnilvalue(&res[0]);
+    return sc_stage(dst, w, res, 1);
+  }
+  return 1; /* not a probe-known function */
 }
 
 /* ---- arithmetic: 5.5's own engine, stock texts ----
