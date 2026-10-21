@@ -834,6 +834,22 @@ int32_t rt_stdcall_probe(rt_addr funcaddr, rt_addr argcells, int32_t nargs,
   return 1; /* not a probe-known function */
 }
 
+/* rt_fmod / rt_pow: luai_nummod and luai_numpow (llimits.h) verbatim,
+   as plain calls. Neither can raise — NaN/inf are the stock results —
+   so the U11e in-wasm float MOD/POW arms pay no try_table enter for
+   them (same posture as the probes; byte-exact with the protected
+   path by construction: same macros, same libc). */
+double rt_fmod(lua_Number a, lua_Number b) {
+  lua_Number m = fmod(a, b);
+  if (((m) > 0) ? (b) < 0 : ((m) < 0 && (b) > 0))
+    m += (b);
+  return m;
+}
+
+double rt_pow(lua_Number a, lua_Number b) {
+  return ((b == 2) ? (a) * (a) : pow(a, b));
+}
+
 /* ---- arithmetic: 5.5's own engine, stock texts ----
 **
 ** luaO_arith (lobject.c) is the complete stock dispatcher: raw int/float

@@ -251,6 +251,8 @@ func (b *backend) declareImports() {
 	i32f64 := []wasm.ValueType{wasm.I32, wasm.F64}
 	i32i64 := []wasm.ValueType{wasm.I32, wasm.I64}
 	i64v := []wasm.ValueType{wasm.I64}
+	dd := []wasm.ValueType{wasm.F64, wasm.F64}
+	f64v := []wasm.ValueType{wasm.F64}
 
 	// ABI v4 (runtime/rt_abi55.h). Dropped vs v3: rt_compat_arg (a
 	// 5.1-ism), the dialect layer (U3), and rt_mknil (inline tag store).
@@ -260,17 +262,17 @@ func (b *backend) declareImports() {
 	// module every engine already defines for the blob serves it too
 	// (row 100's STW-proof backstop — see emitDeadlinePoll).
 	b.imports = map[string]uint32{
-		"rt_newtable":      m.ImportFunc("rt", "rt_newtable", iii, i32v),
-		"rt_gettable":      m.ImportFunc("rt", "rt_gettable", iiiiii, i32v),
-		"rt_settable":      m.ImportFunc("rt", "rt_settable", iiiiii, i32v),
+		"rt_newtable": m.ImportFunc("rt", "rt_newtable", iii, i32v),
+		"rt_gettable": m.ImportFunc("rt", "rt_gettable", iiiiii, i32v),
+		"rt_settable": m.ImportFunc("rt", "rt_settable", iiiiii, i32v),
 		// U10 probes (iii, i32v): the unprotected luaV_fastgeti/
 		// fastseti arms — a hit skips the try_table enter entirely
-		"rt_geti_probe":    m.ImportFunc("rt", "rt_geti_probe", iii, i32v),
-		"rt_seti_probe":    m.ImportFunc("rt", "rt_seti_probe", iii, i32v),
+		"rt_geti_probe": m.ImportFunc("rt", "rt_geti_probe", iii, i32v),
+		"rt_seti_probe": m.ImportFunc("rt", "rt_seti_probe", iii, i32v),
 		// U11 probes: short-string keys (same iii shape) and length
-		"rt_gets_probe":    m.ImportFunc("rt", "rt_gets_probe", iii, i32v),
-		"rt_sets_probe":    m.ImportFunc("rt", "rt_sets_probe", iii, i32v),
-		"rt_len_probe":     m.ImportFunc("rt", "rt_len_probe", ii, i32v),
+		"rt_gets_probe": m.ImportFunc("rt", "rt_gets_probe", iii, i32v),
+		"rt_sets_probe": m.ImportFunc("rt", "rt_sets_probe", iii, i32v),
+		"rt_len_probe":  m.ImportFunc("rt", "rt_len_probe", ii, i32v),
 		// U11b: pure stdlib callee probe (string.byte / string.find's
 		// plain search) — (funcaddr, argcells, nargs, want)
 		"rt_stdcall_probe": m.ImportFunc("rt", "rt_stdcall_probe", iiii, i32v),
@@ -281,7 +283,11 @@ func (b *backend) declareImports() {
 		"rt_le":            m.ImportFunc("rt", "rt_le", iiii, i32v),
 		"rt_concat":        m.ImportFunc("rt", "rt_concat", iiiiii, i32v),
 		// U11c: concat fold probe — one-pass, memlimit pre-flighted
-		"rt_concat_probe":  m.ImportFunc("rt", "rt_concat_probe", iii, i32v),
+		"rt_concat_probe": m.ImportFunc("rt", "rt_concat_probe", iii, i32v),
+		// U11e: float MOD/POW as plain calls (luai_nummod/luai_numpow
+		// verbatim — cannot raise, so no enter)
+		"rt_fmod":          m.ImportFunc("rt", "rt_fmod", dd, f64v),
+		"rt_pow":           m.ImportFunc("rt", "rt_pow", dd, f64v),
 		"rt_call":          m.ImportFunc("rt", "rt_call", iiiiii, i32v),
 		"rt_call_addr":     m.ImportFunc("rt", "rt_call_addr", iiiiii, i32v),
 		"rt_call_count":    m.ImportFunc("rt", "rt_call_count", i32v, i32v),

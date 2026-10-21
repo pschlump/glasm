@@ -123,11 +123,52 @@ func (fe *funcEmitter) i64Op(op int) {
 	}
 }
 
+// emitIntModIdiv: the int×int MOD/IDIV body — luaV_mod/luaV_idiv
+// verbatim. mI64/nI64 push the operands. n ∈ {0,-1} declines to the
+// MMBIN slot (n==0 is the protected raise; n==-1 is luaV's overflow-
+// avoid arm — rare, and the rt path computes it correctly, and a
+// decline is always correct). wasm's i64.rem_s/div_s carry C99's
+// trunc semantics; the fixups below finish stock's floor.
+func (fe *funcEmitter) emitIntModIdiv(op, A, pc int, mI64, nI64 func()) {
+	f := fe.f
+	nI64()
+	f.LocalSet(fe.lVhi)
+	f.LocalGet(fe.lVhi).I64Const(0).I64Eq()
+	f.LocalGet(fe.lVhi).I64Const(-1).I64Eq()
+	f.I32Or().If(wasm.Void)
+	fe.mmbinFallback(A, pc)
+	f.Else()
+	mI64()
+	f.LocalSet(fe.lVlo)
+	if op == lua.OP_MOD {
+		// r = m % n; if (r != 0 && (r ^ n) < 0) r += n
+		f.LocalGet(fe.lVlo).LocalGet(fe.lVhi).I64RemS().LocalSet(fe.lV2)
+		f.LocalGet(fe.lV2).I64Const(0).I64Ne()
+		f.LocalGet(fe.lV2).LocalGet(fe.lVhi).I64Xor().I64Const(0).I64LtS()
+		f.I32And().If(wasm.Void)
+		f.LocalGet(fe.lV2).LocalGet(fe.lVhi).I64Add().LocalSet(fe.lV2)
+		f.End()
+	} else {
+		// q = m / n; if ((m ^ n) < 0 && m % n != 0) q -= 1
+		f.LocalGet(fe.lVlo).LocalGet(fe.lVhi).I64DivS().LocalSet(fe.lV2)
+		f.LocalGet(fe.lVlo).LocalGet(fe.lVhi).I64Xor().I64Const(0).I64LtS()
+		f.LocalGet(fe.lVlo).LocalGet(fe.lVhi).I64RemS().I64Const(0).I64Ne()
+		f.I32And().If(wasm.Void)
+		f.LocalGet(fe.lV2).I64Const(1).I64Sub().LocalSet(fe.lV2)
+		f.End()
+	}
+	fe.setIntCell(A, func() { fe.f.LocalGet(fe.lV2) })
+	fe.bumpTop(A + 1)
+	f.End()
+}
+
 // emitArithReg: R[A] := R[B] <op> R[C] (OP_ADD..OP_SHR). Fast paths:
 // int×int for the wrap-around arithmetic and bitwise family (the two
 // i64 operands make int semantics exact), float×float for + − *;
-// everything else — mixed int/float (promotion), // % / ^ (float or
-// error semantics), string coercion, metamethods — falls to the MMBIN
+// mixed int/float (promotion) and (U11e) // % / ^ — int×int floor
+// semantics in-wasm, every numeric mix through the float op (inline
+// f64 or the plain rt_fmod/rt_pow helpers); string coercion,
+// metamethods, and the raise corners (n%0, n//0) fall to the MMBIN
 // slot's rt_arith.
 func (fe *funcEmitter) emitArithReg(op, A, B, C, pc int) {
 	f := fe.f
@@ -222,14 +263,61 @@ func (fe *funcEmitter) emitArithReg(op, A, B, C, pc int) {
 		fe.mmbinFallback(A, pc)
 		f.End()
 	default:
-		// MOD/POW/DIV/IDIV: always the runtime (floor semantics, the
-		// 'attempt to divide by zero' family, float promotion)
+		// MOD/IDIV/DIV/POW (U11e): int×int MOD/IDIV in-wasm
+		// (emitIntModIdiv); every other numeric mix runs the float op
+		// (op_arithf's law: tonumberns both operands, result always
+		// float) — DIV/IDIV inline f64 (+floor), MOD/POW via the
+		// plain rt_fmod/rt_pow (no enter: they cannot raise).
+		fe.tagIs(B, rtTagInt)
+		fe.tagIs(C, rtTagInt)
+		f.I32And().If(wasm.Void)
+		if op == lua.OP_MOD || op == lua.OP_IDIV {
+			fe.emitIntModIdiv(op, A, pc,
+				func() { fe.cellAddr(B).I64Load(0) },
+				func() { fe.cellAddr(C).I64Load(0) })
+		} else {
+			// DIV/POW int×int: convert both — the result is always float
+			fe.fltArm(op, A,
+				func() { fe.cellAddr(B).I64Load(0).F64ConvertI64S() },
+				func() { fe.cellAddr(C).I64Load(0).F64ConvertI64S() })
+		}
+		f.Else()
+		fe.tagIs(B, rtTagFloat)
+		fe.tagIs(C, rtTagFloat)
+		f.I32And().If(wasm.Void)
+		fe.fltArm(op, A,
+			func() { fe.cellAddr(B).F64Load(0) },
+			func() { fe.cellAddr(C).F64Load(0) })
+		f.Else()
+		// float reg × int reg: promote the int side
+		fe.tagIs(B, rtTagFloat)
+		fe.tagIs(C, rtTagInt)
+		f.I32And().If(wasm.Void)
+		fe.fltArm(op, A,
+			func() { fe.cellAddr(B).F64Load(0) },
+			func() { fe.cellAddr(C).I64Load(0).F64ConvertI64S() })
+		f.Else()
+		// int reg × float reg
+		fe.tagIs(B, rtTagInt)
+		fe.tagIs(C, rtTagFloat)
+		f.I32And().If(wasm.Void)
+		fe.fltArm(op, A,
+			func() { fe.cellAddr(B).I64Load(0).F64ConvertI64S() },
+			func() { fe.cellAddr(C).F64Load(0) })
+		f.Else()
 		fe.mmbinFallback(A, pc)
+		f.End()
+		f.End()
+		f.End()
+		f.End()
 	}
 }
 
-// fltArm: store A := lhs op rhs as a float cell — the shared f64
-// ADD/SUB/MUL arm body for emitArithReg's three float shapes.
+// fltArm: store A := lhs op rhs as a float cell — the shared f64 arm
+// body for emitArithReg's/emitArithK's float shapes. ADD/SUB/MUL/DIV/
+// IDIV are bare f64 ops (IDIV = luai_numidiv's floor(a/b)); MOD and
+// POW call the plain rt_fmod/rt_pow helpers (luai_nummod/luai_numpow
+// verbatim — cannot raise, so no try_table enter, U11e).
 func (fe *funcEmitter) fltArm(op, A int, lhs, rhs func()) {
 	f := fe.f
 	fe.cellAddr(A)
@@ -242,6 +330,14 @@ func (fe *funcEmitter) fltArm(op, A int, lhs, rhs func()) {
 		f.F64Sub()
 	case lua.OP_MUL:
 		f.F64Mul()
+	case lua.OP_DIV:
+		f.F64Div()
+	case lua.OP_IDIV:
+		f.F64Div().F64Floor()
+	case lua.OP_MOD:
+		f.Call(fe.b.imp("rt_fmod"))
+	case lua.OP_POW:
+		f.Call(fe.b.imp("rt_pow"))
 	}
 	f.F64Store(0)
 	fe.cellAddr(A)
@@ -352,6 +448,54 @@ func (fe *funcEmitter) emitArithK(op, A, B, C, pc int) {
 			f.End()
 			return
 		}
+		switch op {
+		case lua.OP_MODK, lua.OP_IDIVK:
+			// n is a compile-time integer: n ∈ {0,-1} goes straight
+			// to the MMBINK slot (n==0 raises there; n==-1 is
+			// luaV's overflow-avoid arm); otherwise luaV_mod/luaV_idiv
+			// in-wasm (emitIntModIdiv). A float register runs the
+			// float op (luaV_modf / luai_numidiv) — the K promotes.
+			// (fltArm/emitIntModIdiv key on the reg opcodes; the K
+			// family mirrors ADD..SHR at a fixed offset.)
+			rop := op - lua.OP_ADDK + lua.OP_ADD
+			n := int64(kv)
+			fe.tagIs(B, rtTagInt).If(wasm.Void)
+			if n == 0 || n == -1 {
+				fe.mmbinFallback(A, pc)
+			} else {
+				fe.emitIntModIdiv(rop, A, pc,
+					func() { fe.cellAddr(B).I64Load(0) },
+					func() { fe.f.I64Const(n) })
+			}
+			f.Else()
+			fe.tagIs(B, rtTagFloat).If(wasm.Void)
+			fe.fltArm(rop, A,
+				func() { fe.cellAddr(B).F64Load(0) },
+				func() { fe.kcell(C).I64Load(0).F64ConvertI64S() })
+			f.Else()
+			fe.mmbinFallback(A, pc)
+			f.End()
+			f.End()
+			return
+		case lua.OP_POWK, lua.OP_DIVK:
+			// op_arithfK: both numeric, result always float (op_arithf
+			// on the reg side). The int K promotes.
+			rop := op - lua.OP_ADDK + lua.OP_ADD
+			fe.tagIs(B, rtTagFloat).If(wasm.Void)
+			fe.fltArm(rop, A,
+				func() { fe.cellAddr(B).F64Load(0) },
+				func() { fe.kcell(C).I64Load(0).F64ConvertI64S() })
+			f.Else()
+			fe.tagIs(B, rtTagInt).If(wasm.Void)
+			fe.fltArm(rop, A,
+				func() { fe.cellAddr(B).I64Load(0).F64ConvertI64S() },
+				func() { fe.kcell(C).I64Load(0).F64ConvertI64S() })
+			f.Else()
+			fe.mmbinFallback(A, pc)
+			f.End()
+			f.End()
+			return
+		}
 	case lua.LNumber:
 		switch op {
 		case lua.OP_ADDK, lua.OP_SUBK, lua.OP_MULK:
@@ -394,9 +538,31 @@ func (fe *funcEmitter) emitArithK(op, A, B, C, pc int) {
 			f.End()
 			f.End()
 			return
+		case lua.OP_MODK, lua.OP_IDIVK, lua.OP_POWK, lua.OP_DIVK:
+			// float K: every numeric mix runs the float op (MODK/
+			// IDIVK are luaV_modf/luai_numidiv on a float operand —
+			// op_arithK's float arm; POWK/DIVK are op_arithfK, always
+			// float) — the int register promotes (fltArm, U11e; the
+			// reg-opcode mapping as above)
+			rop := op - lua.OP_ADDK + lua.OP_ADD
+			fe.tagIs(B, rtTagFloat).If(wasm.Void)
+			fe.fltArm(rop, A,
+				func() { fe.cellAddr(B).F64Load(0) },
+				func() { fe.kcell(C).F64Load(0) })
+			f.Else()
+			fe.tagIs(B, rtTagInt).If(wasm.Void)
+			fe.fltArm(rop, A,
+				func() { fe.cellAddr(B).I64Load(0).F64ConvertI64S() },
+				func() { fe.kcell(C).F64Load(0) })
+			f.Else()
+			fe.mmbinFallback(A, pc)
+			f.End()
+			f.End()
+			return
 		}
 	}
-	// MODK/POWK/DIVK/IDIVK (and defensive K-type surprises): runtime
+	// defensive K-type surprises (a non-number K here would mean the
+	// pool staging diverged — keep the MMBINK slot)
 	fe.mmbinFallback(A, pc)
 }
 

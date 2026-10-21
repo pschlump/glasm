@@ -106,12 +106,12 @@ the by-shape table below, `docs/U9-perf.md`, and `docs/U10-perf.md`.)
 
 | script (shape)                      | interp  | wasm, cold VM | wasm, pooled VM |
 |-------------------------------------|---------|---------------|-----------------|
-| h_tiny (startup only)               | 51.5 µs | 65.7 ms       | **17.5 µs**     |
-| h_str (short string ops)            | 131 µs  | 68.3 ms       | 224 µs          |
-| h_strlong (150 KB text processing)  | 1.33 ms | 82.2 ms       | 4.99 ms         |
-| h_numloop (4 M-iteration numeric)   | 117.7 ms| 108.9 ms      | **39.0 ms**     |
+| h_tiny (startup only)               | 52.0 µs | 65.1 ms       | **18.3 µs**     |
+| h_str (short string ops)            | 128 µs  | 68.3 ms       | 215 µs          |
+| h_strlong (150 KB text processing)  | 1.32 ms | 82.2 ms       | **2.87 ms**     |
+| h_numloop (4 M-iteration numeric)   | 116.6 ms| 108.9 ms      | **39.5 ms**     |
 | h_tablechurn (table alloc churn)    | 9.5 ms  | 94.8 ms       | **22.7 ms**     |
-| h_concat (concat-heavy)             | 877 µs  | 70.8 ms       | **1.49 ms**     |
+| h_concat (concat-heavy)             | 875 µs  | 70.8 ms       | **1.45 ms**     |
 | h_hostfn (3000 Go-call round trips) | 539 µs  | 72.5 ms       | 3.90 ms         |
 
 Read the table as: cold = compile + instantiate + run once; pooled =
@@ -122,9 +122,10 @@ you run a lot" penalty — pooling removes it.
 
 Process-time medians (3 runs) over the luabench scripts, re-measured
 2026-10-21 after U9c (direct dispatch), U10 (arith/compare/table fast
-paths), U11 (string-lane probes), U11c (the concat fold probe) and
-U11d (the `string.format` probe) — `bench/2026-10-21-u11d.txt` (the
-U11/U11c runs: `bench/2026-10-20-u11*.txt`):
+paths), U11 (string-lane probes), U11c (the concat fold probe),
+U11d (the `string.format` probe) and U11e (the in-wasm `// % / ^`
+arith arms) — `bench/2026-10-21-u11e.txt` (the U11/U11c runs:
+`bench/2026-10-20-u11*.txt`):
 
 | shape                                | wasm on wasmtime | wasm on wazero | vs interpreter                        |
 |--------------------------------------|------------------|----------------|---------------------------------------|
@@ -151,12 +152,14 @@ One caveat, active work rather than a law of nature:
   table keys, `#`, and `string.byte`/`string.find` run inline, no
   protected-call enter). U11c took the allocating `..` itself off the
   protected route (h_concat 1.7× interp, down from 3.4× — one-pass
-  fold with a two-sided memory pre-flight), and U11d folded
-  `string.format` in the same posture (h_strlong 3.8× interp, down
-  from ~10× at U10 — the fold, pre-flight and decline shapes in
-  `docs/U11-perf.md`). What still pays the protected C route:
-  gmatch's iterator and the un-probed stdlib callees (`sub`, `rep`,
-  …). C callees beyond the probed set, `__call` chains and
+  fold with a two-sided memory pre-flight), U11d folded
+  `string.format` in the same posture, and U11e moved the last
+  arith fallbacks in-wasm (`%`/`//` floor semantics, `/`/`^` float
+  arms via plain never-raise helpers — h_strlong 2.2× interp, down
+  from ~10× at U10 — `docs/U11-perf.md`). What still pays the
+  protected C route: the per-loop `_ENV` global reads, gmatch's
+  iterator, and the un-probed stdlib callees (`sub`, `rep`, …).
+  C callees beyond the probed set, `__call` chains and
   cross-module closures still take the host dispatch seam, and
   tailcalls ride the staged M5c path.
 

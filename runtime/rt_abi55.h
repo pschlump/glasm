@@ -221,6 +221,11 @@ int32_t rt_stdcall_probe(rt_addr funcaddr, rt_addr argcells, int32_t nargs,
 ** shapes fall to the protected rt_concat). Additive; LUA_RT_ABI
 ** stays 4. */
 int32_t rt_concat_probe(rt_addr cells, int32_t count, rt_addr dstcell);
+/* U11e: luai_nummod / luai_numpow verbatim as plain calls — neither
+** can raise, so the in-wasm float MOD/POW arms pay no enter for them.
+** Additive; LUA_RT_ABI stays 4. */
+double rt_fmod(double a, double b);
+double rt_pow(double a, double b);
 int32_t rt_arith(int32_t op, rt_addr lhscell, rt_addr rhscell, rt_addr dstcell,
                  int32_t line, int32_t h1, int32_t h2, int32_t hcall);
 int32_t rt_len(rt_addr cell, rt_addr dstcell, int32_t line, int32_t hobj,

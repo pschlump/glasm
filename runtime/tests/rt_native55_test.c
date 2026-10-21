@@ -2174,6 +2174,28 @@ int main(void) {
     lua_pop(L, 1);
   }
 
+  /* ---- U11e: rt_fmod / rt_pow (luai_nummod / luai_numpow verbatim) ----
+  */
+  {
+    /* floor-mod: the fixup makes the result's sign follow the divisor
+       (C's fmod only truncates toward zero) */
+    CHECK(rt_fmod(5.0, 3.0) == 2.0);
+    CHECK(rt_fmod(-5.0, 3.0) == 1.0);  /* -2, fixed up by +n */
+    CHECK(rt_fmod(5.0, -3.0) == -1.0); /* +2, fixed up by +n */
+    CHECK(rt_fmod(-5.0, -3.0) == -2.0);
+    CHECK(rt_fmod(6.0, 3.0) == 0.0);
+    /* -0.0 survives (the macro's guards are strict comparisons) */
+    CHECK(rt_fmod(-6.0, 3.0) == 0.0 && signbit(rt_fmod(-6.0, 3.0)) != 0);
+    CHECK(isnan(rt_fmod(5.0, 0.0))); /* the stock no-raise result */
+    CHECK(isnan(rt_fmod(HUGE_VAL, 3.0)));
+    /* pow: the b==2 branch (exact square), then the libc arm */
+    CHECK(rt_pow(3.0, 2.0) == 9.0);
+    CHECK(rt_pow(0.5, 2.0) == 0.25);
+    CHECK(rt_pow(2.0, 10.0) == 1024.0);
+    CHECK(rt_pow(2.0, -1.0) == 0.5);
+    CHECK(rt_pow(1e10, 0.5) == 1e5);
+  }
+
   CHECK(rt_wasm_count() == IDX_TAILVA + 1);
   CHECK(rt_wasm_proto(-1, 0, 0, 0, 0) == RT_ERR);
 
