@@ -346,14 +346,10 @@ callees.
 
 ## Open items
 
-- **The interp's `string.gmatch` constructs eagerly** (found while
-  smoking U11e-c, pre-existing): the interp's `strGmatch` runs the
-  pattern match at construction, so `pcall(string.gmatch, s, "a(")`
-  raises "unfinished capture" immediately, where stock (and the wasm
-  path) construct lazily and raise at the first iteration. Un-ruled in
-  the ledger — needs the lazy fix in `strGmatchIter`'s first call plus
-  a covering corpus case. The wasm engines are byte-stock on the shape
-  (the probe declines; the protected `gmatch_aux` raises).
+- ~~The interp's `string.gmatch` constructs eagerly~~ **FIXED** (row
+  105, same day): `strGmatchIter` now compiles the pattern on its
+  first call — stock's lazy construction, raise at the iteration site
+  (`_u1/gm01.lua` pins it byte-exact against the oracle).
 - h_strlong's 105 residual enters: the un-probed stdlib callees
   (`math.min`, `table.concat` …) — the same pin-by-name shape as
   `rt_stdcall_probe`'s targets, extendable callee by callee.

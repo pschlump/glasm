@@ -372,6 +372,8 @@ func strGsubFunc(L *LState, str string, repl *LFunction, matches []*pm.MatchData
 
 type strMatchData struct {
 	str     string
+	pattern string // lazy: compiled by the first iterator call, like stock
+	init    int
 	pos     int
 	matches []*pm.MatchData
 }
@@ -384,6 +386,16 @@ func strGmatchIter(L *LState) int {
 	md, _ := L.Get(UpvalueIndex(1)).(*LUserData)
 	state := md.Value.(*strMatchData)
 	str := state.str
+	if state.matches == nil {
+		// stock constructs lazily: a malformed pattern raises at the
+		// FIRST iterator call (gmatch_aux), from this call site's
+		// position — not at construction (the ledger row for this fix)
+		mds, err := pm.Find(state.pattern, []byte(str), state.init, -1)
+		if err != nil {
+			L.RaiseError("%s", err.Error())
+		}
+		state.matches = mds
+	}
 	matches := state.matches
 	idx := state.pos
 	state.pos++
@@ -424,12 +436,11 @@ func strGmatch(L *LState) int {
 	if init < 0 {
 		init = 0
 	}
-	mds, err := pm.Find(pattern, []byte(str), init, -1)
-	if err != nil {
-		L.RaiseError("%s", err.Error())
-	}
+	// only the arguments are checked here — the pattern itself is
+	// compiled by the first iterator call (stock gmatch_aux; a
+	// malformed pattern raises there, pcall-catchable like stock)
 	ud := L.NewUserData()
-	ud.Value = &strMatchData{str, 0, mds}
+	ud.Value = &strMatchData{str: str, pattern: pattern, init: init}
 	L.Push(L.NewClosure(strGmatchIter, ud))
 	return 1
 }
