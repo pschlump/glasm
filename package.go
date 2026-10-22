@@ -3,6 +3,6 @@
 package lua
 
 const PackageName = "glasm"
-const PackageVersion = "1.1.1"
+const PackageVersion = "1.1.2"
 const PackageAuthors = "Yusuke Inuzuka"
 const PackageCopyRight = PackageName + " " + PackageVersion + " (fork of GopherLua) Copyright (C) 2015 -2017 " + PackageAuthors
