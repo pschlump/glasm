@@ -308,6 +308,8 @@ rt_addr rt_ctrl_addr(void);
    first bump on. rt_layout_num is the blob-side truth for the layout
    offsets the arms bake in (the drift lock). */
 rt_addr rt_protgen_addr(void);
+rt_addr rt_next_pin_addr(void);
+rt_addr rt_ipaux_pin_addr(void);
 int32_t rt_layout_num(int32_t which);
 void rt_set_deadline(int32_t on);
 int32_t rt_deadline_flag(void);

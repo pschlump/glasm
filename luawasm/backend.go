@@ -109,6 +109,8 @@ type backend struct {
 	gDeadlinePollCtr uint32 // mutable global: the row-100 backstop's back-edge counter (U7a)
 	gDispFrame       uint32 // mutable global: lua_dispatch's EXIT frame (U9c, row 104)
 	gProtGen         uint32 // mutable global: &g_prot_gen (U12 — the arms' protection screen)
+	gNextF           uint32 // mutable global: &pin_next (U14 — the pairs/next arm)
+	gIpairF          uint32 // mutable global: &pin_ipairsaux (U14 — the ipairs arm)
 	protos           []protoInfo
 	protoIdx         map[*lua.FunctionProto]int // proto → dispatch index
 	protoFuncs       []*wasm.Function           // dispatch idx → wasm function
@@ -328,10 +330,12 @@ func (b *backend) declareImports() {
 		// U9c: the direct arm saves the frame region itself — the first
 		// backend consumer of the cursor (imp() is a silent map lookup; a
 		// missing name would emit call 0)
-		"rt_frame_cursor": m.ImportFunc("rt", "rt_frame_cursor", nil, i32v),
-		"rt_ctrl_addr":    m.ImportFunc("rt", "rt_ctrl_addr", nil, i32v),
-		"rt_protgen_addr": m.ImportFunc("rt", "rt_protgen_addr", nil, i32v),
-		"rt_deadline":     m.ImportFunc("rt", "rt_deadline", nil, i32v),
+		"rt_frame_cursor":   m.ImportFunc("rt", "rt_frame_cursor", nil, i32v),
+		"rt_ctrl_addr":      m.ImportFunc("rt", "rt_ctrl_addr", nil, i32v),
+		"rt_protgen_addr":   m.ImportFunc("rt", "rt_protgen_addr", nil, i32v),
+		"rt_next_pin_addr":  m.ImportFunc("rt", "rt_next_pin_addr", nil, i32v),
+		"rt_ipaux_pin_addr": m.ImportFunc("rt", "rt_ipaux_pin_addr", nil, i32v),
+		"rt_deadline":       m.ImportFunc("rt", "rt_deadline", nil, i32v),
 		// U9c (row 104): the direct-dispatch helpers — a compiled-callee
 		// OP_CALL/TFORCALL runs lua_dispatch in-module (probe -> push frame
 		// -> wasm call -> retire); everything else declines to rt_call_addr.
@@ -348,6 +352,8 @@ func (b *backend) declareImports() {
 	b.gDeadlinePollCtr = m.GlobalI32(deadlinePollInterval, true)
 	b.gDispFrame = m.GlobalI32(0, true)
 	b.gProtGen = m.GlobalI32(0, true)
+	b.gNextF = m.GlobalI32(0, true)
+	b.gIpairF = m.GlobalI32(0, true)
 	m.ImportMemory("rt", "memory", 1, 0)
 }
 
@@ -450,6 +456,13 @@ func (b *backend) emitInit() {
 	// been protected the arms decline forever, and the probe chain's
 	// per-write rt_prot_isprotected screen takes over)
 	f.Call(b.imp("rt_protgen_addr")).GlobalSet(b.gProtGen)
+	// U14: the pairs/next + ipairs iterator pins (light-C function
+	// pointers — zero when the base library was absent at init, and the
+	// arms then decline forever). The getters return the ADDRESS of the
+	// rt statics; load the pointed-to f value (unlike gProtGen above,
+	// which deliberately keeps the address for per-store polling)
+	f.Call(b.imp("rt_next_pin_addr")).I32Load(0).GlobalSet(b.gNextF)
+	f.Call(b.imp("rt_ipaux_pin_addr")).I32Load(0).GlobalSet(b.gIpairF)
 	f.I32Const(0).LocalSet(lC)
 
 	// staged by the step parameter (0 = allocs only, 1 = +chunkname,

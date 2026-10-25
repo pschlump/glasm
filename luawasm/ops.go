@@ -1309,6 +1309,15 @@ func (fe *funcEmitter) emitTForcall(A, C, pc int) {
 	fe.copyCell(fe.cell(A+5), fe.cell(A+3)) // control → arg slot
 	fe.copyCell(fe.cell(A+4), fe.cell(A+1)) // state
 	fe.copyCell(fe.cell(A+3), fe.cell(A))   // iterator (callee)
+	// U14: the pairs/next + ipairs arms — the stock iterator step
+	// in-wasm (the callee is pinned by its light-C f pointer); a hit
+	// stages exactly C results at R(A+3..) — poscall's fixed-want
+	// convention, missing results nil — and jumps to the TFORLOOP
+	// test; a decline falls through to the paths below
+	f.Block(wasm.Void) // A: arm hit exit
+	f.Block(wasm.Void) // B: arm decline exit
+	fe.armNext(A, C)
+	fe.armIpairs(A, C)
 	// U11e-c: the gmatch iterator probe — the callee is a stock
 	// string.gmatch iterator (a CClosure pinned by construction at
 	// rt_set_state); one step runs in-wasm over the shared userdata,
@@ -1377,6 +1386,8 @@ func (fe *funcEmitter) emitTForcall(A, C, pc int) {
 		f.End() // close the direct/fallback If
 	}
 	f.End() // close the gmatch-probe miss If
+	f.End() // B (U14: arm decline)
+	f.End() // A (U14: arm hit)
 	f.I32Const(int32(A + 3 + C)).LocalSet(fe.lTop)
 	// TFORLOOP (at pc+1): continue iff R(A+3) ~= nil (byte-wide tag load —
 	// the iterator cell is C-written)

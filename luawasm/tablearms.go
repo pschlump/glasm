@@ -49,6 +49,7 @@ const (
 
 	rtTagTable  = 0x45 // ctb(LUA_VTABLE)  — ttistable's exact byte
 	rtTagShrstr = 0x44 // ctb(LUA_VSHRSTR) — keyisshrstr's exact byte
+	rtTagLCF    = 0x16 // LUA_VLCF raw — light C funcs are not collectable
 )
 
 // LayoutPins (the U12 drift lock): rt_layout_num(which) on the rt side
@@ -312,4 +313,206 @@ func (fe *funcEmitter) armSets(tblCell, keyCell, valCell func() *wasm.Function, 
 	f.End() // B
 	fallback()
 	f.End() // A
+}
+
+// stageNilFill stages nil (variant-0) into cells A+3+from .. A+3+C-1 —
+// poscall's missing-results adjustment for a fixed want (C results,
+// the callee returned fewer).
+func (fe *funcEmitter) stageNilFill(A, C, from int) {
+	for s := from; s < C; s++ {
+		fe.cellAddr(A + 3 + s)
+		fe.f.I32Const(rtTagNil).I32Store(8)
+	}
+}
+
+// armNext lowers luaB_next + luaH_next inline at a TFORCALL. It runs
+// inside the caller's A/B wrapper (emitTForcall) and opens its own
+// body block on top: BrIf(0)/Br(0) = decline out of THIS arm (fall
+// through to armIpairs / the gmatch probe — never br to B, that skips
+// them), Br(4) = the hit (A's end — the TFORLOOP test); each nested
+// If/Loop adds one.
+//
+// The callee must be the pinned stock next — a LIGHT C function (zero
+// upvalues): the cell's value word IS the f pointer, raw LUA_VLCF tag
+// (no closure object to walk). The state must be a table (luaB_next's
+// checktype raise belongs to C). Control shapes armed, per findindex:
+// nil (first iteration, i=0), an integer key inside [1,asize] (resume
+// at k — the slot after the key's own k-1), and a short string (the
+// bucket-chain walk; a DELETED key's node still anchors the resume —
+// getgeneric's deadok=1 — so the match is on the key alone, value
+// liveness never checked). Everything else declines: integer keys in
+// the hash part (hashint is C's), any other key type, a key not in
+// the table (C raises "invalid key to 'next'"), a custom iterator
+// (different f — pairs pushes the STATIC luaB_next, same f as the
+// pin, so a shadowed global next still arms; a replaced pairs or a
+// hand-rolled iterator declines), a state that is not a table.
+//
+// The scan is stock luaH_next verbatim: array part first (tag row at
+// array+4+i, variant-0 = empty), then the hash part SLOT-SEQUENTIAL
+// (chains are irrelevant to order — pairs order is observable) with
+// sizenode = 1<<lsizenode even for dummy tables (the shared dummy
+// node's VEMPTY gval just never hits). Locals: lT0=t, lT1=hashN,
+// lDd0=array, lDd1=asize, lTop=i (array index, then hash index),
+// lSt=node cursor, lVlo=i64 temp.
+func (fe *funcEmitter) armNext(A, C int) {
+	f := fe.f
+	f.Block(wasm.Void) // arm body: BrIf(0) = decline -> armIpairs/probe
+	fe.cellAddr(A + 3).I32Load8U(8).I32Const(rtTagLCF).I32Ne().BrIf(0)
+	fe.cellAddr(A + 3).I32Load(0).GlobalGet(fe.b.gNextF).I32Ne().BrIf(0)
+	fe.cellAddr(A + 4).I32Load(0).LocalSet(fe.lT0)
+	fe.cellAddr(A + 4).I32Load8U(8).I32Const(rtTagTable).I32Ne().BrIf(0)
+	f.LocalGet(fe.lT0).I32Load(tblOffAsize).LocalSet(fe.lDd1)
+	f.I32Const(1).LocalGet(fe.lT0).I32Load8U(tblOffLsizenode).I32Shl().LocalSet(fe.lT1)
+	f.LocalGet(fe.lT0).I32Load(tblOffArray).LocalSet(fe.lDd0)
+	// ---- findindex ----
+	fe.cellAddr(A + 5).I32Load8U(8).I32Const(rtTagNil).I32Eq().If(wasm.Void)
+	f.I32Const(0).LocalSet(fe.lTop)
+	f.Else()
+	fe.cellAddr(A + 5).I32Load8U(8).I32Const(rtTagInt).I32Eq().If(wasm.Void)
+	// checkrange: (u64)(k-1) <u asize ⟺ 1 <= k <= asize; resume AT k
+	fe.cellAddr(A + 5).I64Load(0).LocalSet(fe.lVlo)
+	f.LocalGet(fe.lVlo).I64Const(1).I64Sub()
+	f.LocalGet(fe.lDd1).I64ExtendI32U()
+	f.I64GeU().BrIf(2) // decline: If_int(0) If_nil(1) N(2)
+	f.LocalGet(fe.lVlo).I32WrapI64().LocalSet(fe.lTop)
+	f.Else()
+	fe.cellAddr(A + 5).I32Load8U(8).I32Const(rtTagShrstr).I32Eq().If(wasm.Void)
+	// bucket = s->hash & (hashN-1) — NOTE: left operand (hashN-1)
+	// first would compute (hashN-1)&hash; the And's rhs-then-lhs pop
+	// order needs the HASH pushed first, mask second
+	f.LocalGet(fe.lT0).I32Load(tblOffNode)
+	fe.cellAddr(A + 5).I32Load(0).I32Load(strOffHash)
+	f.LocalGet(fe.lT1).I32Const(1).I32Sub()
+	f.I32And().I32Const(nodeSz).I32Mul().I32Add().LocalSet(fe.lSt)
+	f.Loop(wasm.Void)
+	f.LocalGet(fe.lSt).I32Load8U(nodeOffKeyTT).I32Const(rtTagShrstr).I32Eq()
+	f.LocalGet(fe.lSt).I32Load(nodeOffKeyVal)
+	fe.cellAddr(A + 5).I32Load(0)
+	f.I32Eq().I32And().If(wasm.Void)
+	// found (dead or live — deadok): i = asize + nodeIdx + 1
+	f.LocalGet(fe.lDd1)
+	f.LocalGet(fe.lSt)
+	f.LocalGet(fe.lT0).I32Load(tblOffNode)
+	f.I32Sub().I32Const(nodeSz).I32DivS()
+	f.I32Const(1).I32Add().I32Add().LocalSet(fe.lTop)
+	f.Br(4) // to the scans: If_found(0) Loop(1) If_str(2) If_nil(3) N(4)
+	f.End()
+	f.LocalGet(fe.lSt).I32Load(nodeOffNext).I32Eqz().BrIf(3) // decline: Loop(0) If_str(1) If_nil(2) N(3)
+	f.LocalGet(fe.lSt)
+	f.LocalGet(fe.lSt).I32Load(nodeOffNext).I32Const(nodeSz).I32Mul().I32Add()
+	f.LocalSet(fe.lSt)
+	f.Br(0)
+	f.End() // walk loop
+	f.Else()
+	f.Br(2) // any other control key type: If_str(0) If_nil(1) N(2)
+	f.End()
+	f.End()
+	f.End() // close the findindex If/Else chain
+	// ---- array scan (stock's first loop) ----
+	f.Block(wasm.Void) // SARR: natural exit = fall into the hash phase
+	f.Loop(wasm.Void)
+	f.LocalGet(fe.lTop).LocalGet(fe.lDd1).I32GeU().BrIf(1)
+	f.LocalGet(fe.lDd0).I32Const(arrTagRowOff).I32Add()
+	f.LocalGet(fe.lTop).I32Add().I32Load8U(0).I32Const(0x0F).I32And().I32Eqz().If(wasm.Void)
+	f.LocalGet(fe.lTop).I32Const(1).I32Add().LocalSet(fe.lTop)
+	f.Br(1) // If(0) -> Loop(1): backedge, NOT the If exit
+	f.End()
+	// HIT (array slot i): key = i+1, value = farr2val
+	fe.cellAddr(A + 3)
+	f.LocalGet(fe.lTop).I32Const(1).I32Add().I64ExtendI32U().I64Store(0)
+	fe.cellAddr(A + 3)
+	f.I32Const(rtTagInt).I32Store(8)
+	fe.cellAddr(A + 4)
+	f.LocalGet(fe.lDd0)
+	f.LocalGet(fe.lTop).I32Const(1).I32Add().I32Const(valSz).I32Mul().I32Sub()
+	f.I64Load(0).I64Store(0)
+	fe.cellAddr(A + 4)
+	f.LocalGet(fe.lDd0).I32Const(arrTagRowOff).I32Add()
+	f.LocalGet(fe.lTop).I32Add().I32Load8U(0).I32Store(8)
+	fe.stageNilFill(A, C, 2)
+	f.Br(4) // Loop(0) SARR(1) N(2) B(3) A(4) — hit exit
+	f.End()
+	f.End() // SARR
+	// ---- hash scan: j = i - asize ----
+	f.LocalGet(fe.lTop).LocalGet(fe.lDd1).I32Sub().LocalSet(fe.lTop)
+	f.Block(wasm.Void) // SHASH: natural exit = exhausted
+	f.Loop(wasm.Void)
+	f.LocalGet(fe.lTop).LocalGet(fe.lT1).I32GeU().BrIf(1)
+	f.LocalGet(fe.lT0).I32Load(tblOffNode)
+	f.LocalGet(fe.lTop).I32Const(nodeSz).I32Mul().I32Add().LocalSet(fe.lSt)
+	f.LocalGet(fe.lSt).I32Load8U(nodeOffTT).I32Const(0x0F).I32And().I32Eqz().If(wasm.Void)
+	f.LocalGet(fe.lTop).I32Const(1).I32Add().LocalSet(fe.lTop)
+	f.Br(1) // If(0) -> Loop(1): backedge, NOT the If exit
+	f.End()
+	// HIT (node j): key = getnodekey (word + tt byte wholesale), value = gval
+	fe.cellAddr(A + 3)
+	f.LocalGet(fe.lSt).I64Load(nodeOffKeyVal).I64Store(0)
+	fe.cellAddr(A + 3)
+	f.LocalGet(fe.lSt).I32Load8U(nodeOffKeyTT).I32Store(8)
+	fe.cellAddr(A + 4)
+	f.LocalGet(fe.lSt).I64Load(0).I64Store(0)
+	fe.cellAddr(A + 4)
+	f.LocalGet(fe.lSt).I32Load8U(nodeOffTT).I32Store(8)
+	fe.stageNilFill(A, C, 2)
+	f.Br(4) // Loop(0) SHASH(1) N(2) B(3) A(4) — hit exit
+	f.End()
+	f.End() // SHASH
+	// exhausted: all C results nil (luaB_next's 1-value nil, adjusted)
+	fe.stageNilFill(A, C, 0)
+	f.Br(2) // N(0) B(1) A(2)
+	f.End() // arm body
+}
+
+// armIpairs lowers ipairsaux inline at a TFORCALL — same A/B wrapper
+// context as armNext, with its own body block: BrIf(0) = decline (fall
+// through to the gmatch probe), Br(3) = the hit (A's end). The callee
+// must be the pinned stock ipairsaux
+// (light C), the state a table (a non-table state may have __index —
+// lua_geti's metamethod arm belongs to C), the control an integer.
+// Stock: j = k+1; in-bounds (checkrange on j ⟺ (u64)k <u asize) and
+// live → (j, t[j]); in-bounds and empty → one nil result (geti's NIL,
+// poscall-adjusted — the loop exits); beyond asize → decline (hash
+// integers and metamethods are C's).
+func (fe *funcEmitter) armIpairs(A, C int) {
+	f := fe.f
+	f.Block(wasm.Void) // arm body: BrIf(0) = decline -> the probe
+	fe.cellAddr(A + 3).I32Load8U(8).I32Const(rtTagLCF).I32Ne().BrIf(0)
+	fe.cellAddr(A + 3).I32Load(0).GlobalGet(fe.b.gIpairF).I32Ne().BrIf(0)
+	fe.cellAddr(A + 4).I32Load(0).LocalSet(fe.lT0)
+	fe.cellAddr(A + 4).I32Load8U(8).I32Const(rtTagTable).I32Ne().BrIf(0)
+	// __index: for an EMPTY in-bounds slot stock lua_geti consults the
+	// metamethod (it may return non-nil and the loop continues) — the
+	// arm's nil-staging would diverge. flags cannot screen this
+	// (invalidateTMcache zeroes them on any insert), so any metatable
+	// declines, conservative
+	f.LocalGet(fe.lT0).I32Load(tblOffMetatable).BrIf(0)
+	fe.cellAddr(A + 5).I32Load8U(8).I32Const(rtTagInt).I32Ne().BrIf(0)
+	fe.cellAddr(A + 5).I64Load(0).LocalSet(fe.lVlo) // k
+	f.LocalGet(fe.lVlo)
+	f.LocalGet(fe.lT0).I32Load(tblOffAsize).I64ExtendI32U()
+	f.I64GeU().BrIf(0)
+	f.LocalGet(fe.lT0).I32Load(tblOffArray).LocalSet(fe.lDd0)
+	f.LocalGet(fe.lVlo).I32WrapI64().LocalSet(fe.lTop) // idx = k (slot of t[k+1]... geti(j), j-1 = k)
+	f.LocalGet(fe.lDd0).I32Const(arrTagRowOff).I32Add()
+	f.LocalGet(fe.lTop).I32Add().I32Load8U(0).I32Const(0x0F).I32And().I32Eqz().If(wasm.Void)
+	// exhausted: t[j] nil — all C results nil
+	fe.stageNilFill(A, C, 0)
+	f.Br(3) // If(0) N(1) B(2) A(3)
+	f.Else()
+	// hit: (j, t[j]) with j = k+1
+	fe.cellAddr(A + 3)
+	f.LocalGet(fe.lVlo).I64Const(1).I64Add().I64Store(0)
+	fe.cellAddr(A + 3)
+	f.I32Const(rtTagInt).I32Store(8)
+	fe.cellAddr(A + 4)
+	f.LocalGet(fe.lDd0)
+	f.LocalGet(fe.lVlo).I32WrapI64().I32Const(1).I32Add().I32Const(valSz).I32Mul().I32Sub()
+	f.I64Load(0).I64Store(0)
+	fe.cellAddr(A + 4)
+	f.LocalGet(fe.lDd0).I32Const(arrTagRowOff).I32Add()
+	f.LocalGet(fe.lTop).I32Add().I32Load8U(0).I32Store(8)
+	fe.stageNilFill(A, C, 2)
+	f.Br(3) // If(0) N(1) B(2) A(3) — hit exit
+	f.End()
+	f.End() // arm body
 }

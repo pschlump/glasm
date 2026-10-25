@@ -704,6 +704,49 @@ static void gmp_pin_body(void) {
   L->top.p--;
 }
 
+/* ---- U14: the pairs/next and ipairs iterator pins ----
+** Both iterators are LIGHT C functions (zero upvalues): a cell holding
+** one carries the C function pointer itself as the value word (raw
+** LUA_VLCF tag — not collectable, no ctb). The pins are captured once
+** per process at state init from the pristine base library: 'next'
+** straight from the global, ipairsaux by running stock ipairs() once
+** (it is static in lbaselib.c and built fresh per call — the f value
+** is its only stable identity). A shadowed or redefined iterator
+** compares unequal to the pin and the wasm arms decline. */
+static lua_CFunction pin_next;
+static lua_CFunction pin_ipairsaux;
+
+static void pair_pin_body(void) {
+  lua_State *L = curL;
+  TValue st, key;
+  Table *gt;
+  if (!ttistable(&G(L)->l_registry))
+    return;
+  luaH_getint(hvalue(&G(L)->l_registry), LUA_RIDX_GLOBALS, &st);
+  if (!ttistable(&st))
+    return;
+  gt = hvalue(&st);
+  setsvalue(L, &key, luaS_new(L, "next"));
+  luaH_getshortstr(gt, tsvalue(&key), &st);
+  if (ttislcf(&st))
+    pin_next = fvalue(&st);
+  setsvalue(L, &key, luaS_new(L, "ipairs"));
+  luaH_getshortstr(gt, tsvalue(&key), &st);
+  if (ttislcf(&st)) {
+    luaD_checkstack(L, 4);
+    setobj2s(L, L->top.p, &st);
+    L->top.p++;
+    lua_createtable(L, 0, 0);
+    lua_call(L, 1, 1);
+    if (ttislcf(s2v(L->top.p - 1)))
+      pin_ipairsaux = fvalue(s2v(L->top.p - 1));
+    L->top.p--;
+  }
+}
+
+rt_addr rt_next_pin_addr(void) { return (rt_addr)(size_t)&pin_next; }
+rt_addr rt_ipaux_pin_addr(void) { return (rt_addr)(size_t)&pin_ipairsaux; }
+
 static void sc_resolve(void) {
   TValue st, key;
   Table *gt;
@@ -776,6 +819,11 @@ static void sc_resolve(void) {
   /* U11e-c: the gmatch_aux pin (by construction — see gmp_pin_body) */
   if (rt_run(gmp_pin_body, 0, -1, -1, -1, NULL) != RT_OK)
     sc_gmatch_aux = NULL; /* OOM-only; the staged raise is the truth */
+  /* U14: the pairs/next + ipairs iterator pins (pair_pin_body) */
+  if (rt_run(pair_pin_body, 0, -1, -1, -1, NULL) != RT_OK) {
+    pin_next = NULL;
+    pin_ipairsaux = NULL;
+  }
 }
 
 /* lstrlib.c's index helpers, verbatim (arg coercion removed: the
