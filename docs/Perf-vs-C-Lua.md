@@ -1,19 +1,23 @@
 # Glasm vs native C Lua 5.5.1 — runtime and memory
 
-First recorded run of `cmd/perfcmp` (tree at `732fc8e`, v1.1.2): the glasm
-engines against **native stock C Lua 5.5.1** on the luabench script set,
-measuring wall time **and** process memory. Raw log of the recorded run:
-`note/perfcmp-run.txt` (gitignored).
+Recorded run of `cmd/perfcmp` (tree at `732fc8e` + the interp finalizer
+fix, commit `18bfcb4`): the glasm engines against **native stock C Lua
+5.5.1** on the luabench script set, measuring wall time **and** process
+memory. Raw log of the recorded run: `note/perfcmp-run2.txt` (gitignored;
+`note/perfcmp-run.txt` is the pre-fix run that found the interp leak,
+below).
 
 Headline (steady state, per run, median):
 
 - The **wazero production engine is 0.7×–6.8× native C** across lanes, and
-  **faster than native C** on the tiny EVAL shape (9.2 µs vs 14 µs — a
+  **faster than native C** on the tiny EVAL shape (9.8 µs vs 14 µs — a
   pooled VM rerun skips parse + state build, which the native CLI pays
   per process by design).
-- The **interpreter is 1.3×–16× native C** — at parity-ish on the
-  string/alloc-churn lanes (`h_concat` 1.3×), worst on tight numeric
-  loops (`h_numloop` 16×).
+- The **interpreter is 1.2×–15.3× native C** — at parity-ish on the
+  string/alloc-churn lanes (`h_concat` 1.2×), worst on tight numeric
+  loops (`h_numloop` 15.3×). Interp steady-state memory is a flat
+  ~0.4 MB live heap: the first perfcmp run found a per-state leak,
+  **fixed the same day** (below).
 - Native C's whole-process footprint is **2.0–2.8 MB** (11.6 MB peak on
   `h_nsieve`, ~2.3 MB of it Lua heap). The Go engines carry a runtime
   floor: interp 8–14 MB cold, wazero ~52 MB steady, wasmtime ~63 MB cold.
@@ -47,7 +51,7 @@ go run ./cmd/perfcmp -only fib # one script
 
 | | |
 |---|---|
-| date | 2026-10-25 06:49 (single session, all engines back-to-back) |
+| date | 2026-10-25 07:13 (single session, all engines back-to-back) |
 | host | Apple M4 Max, arm64, macOS darwin 27.0.0, 36 GB |
 | Go | go1.27.0, GOMAXPROCS=14 |
 | C | Apple clang 21.0.0 (-O2 -DLUA_USE_MACOSX) |
@@ -58,8 +62,8 @@ Caveats that bound these numbers:
 - **Same-session rule.** This machine's perf shifts 2.2–3.3× across days
   (note/u7-perf.md R3 context) — compare only numbers from this one run.
 - **Cold numbers carry a ~3.7 ms harness floor** (`/usr/bin/time -l
-  /usr/bin/true`): fork+exec of `time` itself. Native C's 4.8 ms cold on
-  `h_tiny` is ~1.1 ms above the floor; every engine pays the same floor.
+  /usr/bin/true`): fork+exec of `time` itself. Native C's 5.0 ms cold on
+  `h_tiny` is ~1.3 ms above the floor; every engine pays the same floor.
 - maxRSS is macOS `/usr/bin/time -l` (bytes). It is a **peak** resident
   figure, so Go heap high-water ratchets show up fully (see warm table).
 
@@ -98,8 +102,8 @@ design, not accidents:
    state every run because that is their only honest steady state.
 2. **Pooled wazero guest GC is frozen** (ledger row 61) — per-run guest
    garbage accumulates in the 256 MiB linear memory. Visible on the
-   churny lanes (`h_tablechurn`/`h_nsieve`: 270 MB RSS at 60 iterations);
-   production bounds this with `WithMemoryBudgetBytes`.
+   churny lanes (`h_tablechurn`/`h_nsieve`: 271–308 MB RSS at 60/10
+   iterations); production bounds this with `WithMemoryBudgetBytes`.
 3. **wasmtime per-run cost includes a fresh 256 MiB Store mapping** —
    its ~28 ms warm floor on every script is store setup + cgo, not Lua
    execution. It is the oracle host, not a production posture.
@@ -110,46 +114,46 @@ Cold (one-shot process, median; everyone pays the 3.7 ms harness floor):
 
 | script | clua | interp | wazero | wasmtime |
 |---|---|---|---|---|
-| h_tiny | 4.89ms | 6.71ms | 87.02ms | 42.42ms |
-| h_str | 4.81ms | 6.98ms | 88.91ms | 43.55ms |
-| h_strlong | 5.74ms | 8.74ms | 91.77ms | 45.53ms |
-| h_numloop | 13.76ms | 136.11ms | 128.40ms | 55.09ms |
-| h_tablechurn | 9.40ms | 18.26ms | 111.67ms | 51.67ms |
-| h_concat | 5.79ms | 7.86ms | 90.08ms | 44.73ms |
-| h_fib | 25.64ms | 163.36ms | 224.94ms | 115.71ms |
-| h_nsieve | 11.68ms | 71.04ms | 130.86ms | 54.21ms |
-| h_callret | 7.23ms | 28.62ms | 110.04ms | 53.18ms |
-| h_tco | 6.76ms | 18.41ms | 97.70ms | 46.52ms |
+| h_tiny | 5.01ms | 7.01ms | 87.12ms | 41.07ms |
+| h_str | 4.89ms | 6.89ms | 88.16ms | 44.57ms |
+| h_strlong | 5.49ms | 8.88ms | 92.61ms | 43.64ms |
+| h_numloop | 13.64ms | 136.87ms | 129.06ms | 58.13ms |
+| h_tablechurn | 9.37ms | 18.29ms | 113.35ms | 50.91ms |
+| h_concat | 6.05ms | 8.00ms | 90.27ms | 44.85ms |
+| h_fib | 25.50ms | 163.28ms | 225.08ms | 113.82ms |
+| h_nsieve | 11.60ms | 70.16ms | 131.92ms | 55.00ms |
+| h_callret | 7.09ms | 27.99ms | 110.38ms | 52.09ms |
+| h_tco | 6.46ms | 18.72ms | 97.47ms | 46.66ms |
 
 Warm (per run, steady state, median):
 
 | script | clua | interp | wazero | wasmtime |
 |---|---|---|---|---|
-| h_tiny | 14.0µs | 62.8µs | 9.2µs | 28.02ms |
-| h_str | 35.0µs | 135.8µs | 68.1µs | 30.33ms |
-| h_strlong | 391.0µs | 1.56ms | 731.1µs | 34.18ms |
-| h_numloop | 8.53ms | 136.77ms | 40.04ms | 45.60ms |
-| h_tablechurn | 3.87ms | 10.90ms | 21.30ms | 36.42ms |
-| h_concat | 609.0µs | 812.6µs | 1.46ms | 31.47ms |
-| h_fib | 20.12ms | 155.79ms | 137.03ms | 104.27ms |
-| h_nsieve | 6.14ms | 63.42ms | 40.53ms | 40.04ms |
-| h_callret | 2.42ms | 21.61ms | 22.20ms | 38.66ms |
-| h_tco | 1.70ms | 11.37ms | 9.64ms | 33.97ms |
+| h_tiny | 14.0µs | 39.5µs | 9.8µs | 28.41ms |
+| h_str | 36.0µs | 109.4µs | 69.1µs | 30.65ms |
+| h_strlong | 387.0µs | 1.29ms | 729.2µs | 33.67ms |
+| h_numloop | 8.52ms | 130.49ms | 40.16ms | 44.82ms |
+| h_tablechurn | 3.90ms | 10.68ms | 21.26ms | 36.97ms |
+| h_concat | 620.0µs | 753.3µs | 1.51ms | 30.94ms |
+| h_fib | 20.23ms | 154.02ms | 137.32ms | 100.24ms |
+| h_nsieve | 5.98ms | 61.99ms | 40.16ms | 40.35ms |
+| h_callret | 2.41ms | 20.73ms | 22.26ms | 38.87ms |
+| h_tco | 1.62ms | 11.29ms | 9.49ms | 34.12ms |
 
 Warm wall × native C:
 
 | script | clua | interp | wazero | wasmtime |
 |---|---|---|---|---|
-| h_tiny | 1.0× | 4.5× | 0.7× | 2001.4× |
-| h_str | 1.0× | 3.9× | 1.9× | 866.7× |
-| h_strlong | 1.0× | 4.0× | 1.9× | 87.4× |
-| h_numloop | 1.0× | 16.0× | 4.7× | 5.3× |
-| h_tablechurn | 1.0× | 2.8× | 5.5× | 9.4× |
-| h_concat | 1.0× | 1.3× | 2.4× | 51.7× |
-| h_fib | 1.0× | 7.7× | 6.8× | 5.2× |
-| h_nsieve | 1.0× | 10.3× | 6.6× | 6.5× |
-| h_callret | 1.0× | 8.9× | 9.2× | 16.0× |
-| h_tco | 1.0× | 6.7× | 5.7× | 20.0× |
+| h_tiny | 1.0× | 2.8× | 0.7× | 2029.0× |
+| h_str | 1.0× | 3.0× | 1.9× | 851.4× |
+| h_strlong | 1.0× | 3.3× | 1.9× | 87.0× |
+| h_numloop | 1.0× | 15.3× | 4.7× | 5.3× |
+| h_tablechurn | 1.0× | 2.7× | 5.5× | 9.5× |
+| h_concat | 1.0× | 1.2× | 2.4× | 49.9× |
+| h_fib | 1.0× | 7.6× | 6.8× | 5.0× |
+| h_nsieve | 1.0× | 10.4× | 6.7× | 6.7× |
+| h_callret | 1.0× | 8.6× | 9.2× | 16.1× |
+| h_tco | 1.0× | 7.0× | 5.9× | 21.1× |
 
 ## Results — memory
 
@@ -157,32 +161,32 @@ Cold maxRSS (one-shot process):
 
 | script | clua | interp | wazero | wasmtime |
 |---|---|---|---|---|
-| h_tiny | 2.0MB | 8.5MB | 51.7MB | 62.9MB |
-| h_str | 2.0MB | 8.6MB | 52.0MB | 63.2MB |
-| h_strlong | 2.2MB | 11.7MB | 52.4MB | 63.5MB |
-| h_numloop | 2.0MB | 14.3MB | 51.6MB | 62.7MB |
-| h_tablechurn | 2.5MB | 13.4MB | 57.8MB | 62.9MB |
-| h_concat | 2.4MB | 9.5MB | 51.8MB | 63.2MB |
-| h_fib | 2.0MB | 8.8MB | 52.1MB | 64.0MB |
-| h_nsieve | 6.7MB | 26.7MB | 82.6MB | 70.1MB |
-| h_callret | 2.0MB | 12.7MB | 52.0MB | 62.1MB |
-| h_tco | 2.0MB | 12.3MB | 51.8MB | 63.2MB |
+| h_tiny | 2.0MB | 8.3MB | 51.7MB | 62.6MB |
+| h_str | 2.0MB | 8.5MB | 51.8MB | 63.8MB |
+| h_strlong | 2.2MB | 11.5MB | 52.2MB | 64.6MB |
+| h_numloop | 2.0MB | 14.3MB | 51.8MB | 62.9MB |
+| h_tablechurn | 2.5MB | 13.1MB | 57.8MB | 64.5MB |
+| h_concat | 2.3MB | 9.3MB | 51.9MB | 62.9MB |
+| h_fib | 2.0MB | 8.7MB | 51.9MB | 62.3MB |
+| h_nsieve | 6.7MB | 25.7MB | 82.1MB | 69.3MB |
+| h_callret | 2.0MB | 12.8MB | 52.0MB | 61.8MB |
+| h_tco | 2.0MB | 12.2MB | 51.8MB | 63.6MB |
 
 Warm maxRSS (loop process — see the three posture asymmetries above
 before quoting these):
 
 | script | clua | interp | wazero | wasmtime |
 |---|---|---|---|---|
-| h_tiny | 2.2MB | 54.3MB | 52.3MB | 185.4MB |
-| h_str | 2.4MB | 40.0MB | 52.4MB | 189.7MB |
-| h_strlong | 2.8MB | 19.5MB | 68.3MB | 192.5MB |
-| h_numloop | 2.2MB | 16.8MB | 52.6MB | 130.2MB |
-| h_tablechurn | 2.8MB | 29.4MB | 270.7MB | 228.8MB |
-| h_concat | 2.7MB | 20.1MB | 67.9MB | 203.1MB |
-| h_fib | 2.1MB | 10.3MB | 51.8MB | 99.1MB |
-| h_nsieve | 9.3MB | 33.0MB | 270.7MB | 204.3MB |
-| h_callret | 2.2MB | 15.5MB | 52.2MB | 136.1MB |
-| h_tco | 2.2MB | 15.5MB | 52.0MB | 131.4MB |
+| h_tiny | 2.2MB | 9.4MB | 52.0MB | 190.3MB |
+| h_str | 2.4MB | 9.4MB | 52.1MB | 192.4MB |
+| h_strlong | 2.8MB | 13.4MB | 67.7MB | 201.8MB |
+| h_numloop | 2.2MB | 14.5MB | 51.8MB | 128.0MB |
+| h_tablechurn | 2.8MB | 14.9MB | 270.9MB | 224.1MB |
+| h_concat | 2.7MB | 10.8MB | 85.8MB | 197.9MB |
+| h_fib | 2.1MB | 9.3MB | 52.0MB | 102.5MB |
+| h_nsieve | 11.6MB | 31.8MB | 307.5MB | 203.8MB |
+| h_callret | 2.2MB | 13.9MB | 52.4MB | 130.0MB |
+| h_tco | 2.2MB | 14.1MB | 51.9MB | 131.5MB |
 
 Memory detail (post-loop): clua reports `collectgarbage("count")` at exit
 (Lua heap, KB); Go engines report `runtime.MemStats` after the loop —
@@ -191,36 +195,65 @@ heapsys / live = `HeapSys` / `HeapAlloc` after `runtime.GC()`
 
 | script | clua lua-heap | interp live | wazero heapsys / live | wasmtime live |
 |---|---|---|---|---|
-| h_tiny (300 it) | 27.7KB | 44.1MB | 47.4MB / 12.8MB | 915KB |
-| h_str (200 it) | 33.4KB | 29.7MB | 47.4MB / 12.8MB | 909KB |
-| h_strlong (40 it) | 145.9KB | 6.5MB | 67.4MB / 15.9MB | 910KB |
-| h_numloop (12 it) | 23.8KB | 2.4MB | 43.5MB / 12.8MB | 558KB |
-| h_tablechurn (60 it) | 111.7KB | 9.4MB | 283.4MB / 72.3MB | 910KB |
-| h_concat (60 it) | 163.7KB | 9.4MB | 63.4MB / 19.6MB | 909KB |
-| h_fib (4 it) | 25.3KB | 1.2MB | 47.5MB / 12.8MB | 452KB |
-| h_nsieve (10 it) | 2336.0KB | 2.1MB | 259.4MB / 72.3MB | 533KB |
-| h_callret (12 it) | 25.8KB | 2.4MB | 47.5MB / 12.8MB | 557KB |
-| h_tco (12 it) | 25.7KB | 2.4MB | 47.4MB / 12.8MB | 563KB |
+| h_tiny (300 it) | 27.7KB | 386KB | 47.4MB / 12.8MB | 909KB |
+| h_str (200 it) | 33.4KB | 388KB | 47.4MB / 12.8MB | 909KB |
+| h_strlong (40 it) | 146.0KB | 379KB | 63.4MB / 15.9MB | 910KB |
+| h_numloop (12 it) | 23.8KB | 386KB | 43.4MB / 12.8MB | 558KB |
+| h_tablechurn (60 it) | 111.9KB | 388KB | 279.4MB / 72.3MB | 909KB |
+| h_concat (60 it) | 164.0KB | 380KB | 83.4MB / 19.6MB | 909KB |
+| h_fib (4 it) | 25.3KB | 373KB | 47.5MB / 12.8MB | 452KB |
+| h_nsieve (10 it) | 2336.0KB | 392KB | 299.4MB / 72.3MB | 527KB |
+| h_callret (12 it) | 25.8KB | 379KB | 43.4MB / 12.8MB | 557KB |
+| h_tco (12 it) | 25.7KB | 379KB | 47.4MB / 12.8MB | 557KB |
 
 Attribution notes:
 
 - **clua**: Lua heap at exit is tens of KB except `h_nsieve` (2.3 MB of
   sieve tables); process RSS ≈ binary + runtime + heap, 2.0–2.8 MB.
-- **interp**: warm RSS ratchets with **iteration count**, not script
-  weight — live heap after explicit GC is ~150 KB **retained per
-  fresh-state run** (44 MB at 300 `h_tiny` runs, 2.4 MB at 12). The
-  cold-process figure (8–14 MB) is what a fork-style EVAL host actually
-  pays; the retention is an open interp-side item (nothing in `Close`'s
-  path obviously explains it — worth a heap profile before anyone quotes
-  warm-loop interp RSS as a leak).
+- **interp**: live heap after explicit GC is a flat ~380–390 KB
+  regardless of iteration count (pre-fix it scaled: ~150 KB retained per
+  fresh-state run — see the fix note below). Warm-loop RSS 9–15 MB is
+  the Go runtime + per-script garbage high-water; cold-process RSS
+  (8–14 MB) is what a fork-style EVAL host pays.
 - **wazero**: steady 52 MB = Go runtime + wazero JIT code pages + blob;
   the guest linear memory is Go-heap-backed here, so frozen-GC guest
-  garbage shows up inside `HeapSys` (283 MB on `h_tablechurn` — 52 base +
+  garbage shows up inside `HeapSys` (279 MB on `h_tablechurn` — 52 base +
   ~230 MB accumulated guest garbage at 60 iterations, bounded by the
   256 MiB memory and by `WithMemoryBudgetBytes` in production).
 - **wasmtime**: Go heap is tiny (~1 MB live) — its RSS is cgo-owned
   Store mappings: 256 MiB reservation + guard per Store, reclaimed on
-  finalizer schedule (the M6e behavior), hence 99–229 MB across ≤42 runs.
+  finalizer schedule (the M6e behavior), hence 102–224 MB across ≤42 runs.
+
+## The interp finalizer leak (found by run 1, fixed)
+
+The first perfcmp run (06:49, `note/perfcmp-run.txt`) showed interp warm
+RSS ratcheting with iteration count — ~150 KB retained per fresh-state
+run, 44 MB live at 300 `h_tiny` runs, whole-state-graph pin. Heap-profile
+bisection: `OpenLibs` only; `io` only among the libs; and any script
+leaving a `__gc` object reachable from globals (base-lib-only state, 35 MB
+at 300 runs vs 0 MB without `__gc`).
+
+Mechanism: `syncFinalizer` (gc.go, U5f) registers
+`runtime.SetFinalizer(v, func { g.enqueueFinalizer(v) })` — the closure
+captures the `*Global`, which transitively references every registered
+object through the globals table (`g → _G → io.stdout → obj`). That is
+`runtime.SetFinalizer`'s documented self-reference trap: the finalizer
+can never fire and the object is never collected — and the pending
+closure roots the Global, pinning the entire closed state graph (the io
+standard streams alone were enough to pin every state).
+
+Fix: Global tracks registrations in weak lists (`finRegT`/`finRegU`,
+value.go), and `Close()` unregisters them after `drainFinalizers`
+(`clearRegisteredFinalizers`, gc.go). Weak so mid-life finalizer firing
+(the U5f drain semantics) is untouched; unregistered at close so nothing
+roots the dead graph. Post-fix: flat ~380 KB live across 300 runs, and
+warm wall improved as a side effect (the pinned 44 MB no longer gets
+rescanned between iterations: `h_tiny` 62.8→39.5 µs, `h_str`
+135.8→109.4 µs). Regression test:
+`TestClosedStatesNotPinnedByFinalizers` (finalizer_leak_test.go) — fails
+on the pre-fix tree, passes post-fix. Gates green: root suite -short,
+`TestCLua55Conformance` (official 5.5.1 suite incl. db.lua's finalizer
+battery), `TestU1Gate`.
 
 ## Findings
 
@@ -232,27 +265,26 @@ Attribution notes:
    per operation: `h_callret` 9.2× and `h_fib` 6.8× (the call seam),
    `h_tablechurn` 5.5× (rt table code), `h_numloop` 4.7× (in-wasm arith
    is post-U10/U11e but every miss still folds to `rt_arith`).
-2. **Interpreter:** 1.3×–16× native C. Best on alloc/string churn
-   (`h_concat` 1.3×, `h_tablechurn` 2.8× — it even beats wazero there:
-   10.9 ms vs 21.3 ms), worst on tight arithmetic (`h_numloop` 16×) —
+2. **Interpreter:** 1.2×–15.3× native C. Best on alloc/string churn
+   (`h_concat` 1.2×, `h_tablechurn` 2.7× — it beats wazero there:
+   10.7 ms vs 21.3 ms), worst on tight arithmetic (`h_numloop` 15.3×) —
    the classic dispatch-overhead profile of a register-VM interpreter
    against -O2 C.
-3. **Cold start:** native C adds ~1.1 ms over the 3.7 ms harness floor;
-   interp +3 ms of Go runtime; wazero ~87 ms (Go runtime + wazero
+3. **Cold start:** native C adds ~1.3 ms over the 3.7 ms harness floor;
+   interp +2 ms of Go runtime; wazero ~87 ms (Go runtime + wazero
    runtime init + blob verify/instantiate + compile — the one-shot cost
    the pooled-VM posture exists to amortize); wasmtime ~42 ms.
-4. **Memory:** native C is 2–3 MB total. Interp pays the Go runtime plus
-   per-run retention (~150 KB/run in the warm loop — open item). Wazero
-   pays a flat ~52 MB engine floor plus guest garbage growth bounded by
-   the memory cap. Wasmtime (oracle only) maps a 256 MiB region per
-   Store. For the daemon posture the relevant pair is wazero's flat
-   floor + `WithMemoryBudgetBytes` vs C's ~2 MB — that is the price of
-   the pure-Go/no-cgo constraint (A8), paid once per VM, not per script.
+4. **Memory:** native C is 2–3 MB total. Interp pays the Go runtime
+   (~8–14 MB cold) with a flat ~0.4 MB live heap per closed state after
+   the finalizer fix. Wazero pays a flat ~52 MB engine floor plus guest
+   garbage growth bounded by the memory cap. Wasmtime (oracle only)
+   maps a 256 MiB region per Store. For the daemon posture the relevant
+   pair is wazero's flat floor + `WithMemoryBudgetBytes` vs C's ~2 MB —
+   that is the price of the pure-Go/no-cgo constraint (A8), paid once
+   per VM, not per script.
 
-## Open items surfaced by this run
+## Open items
 
-- interp fresh-state loop retains ~150 KB/run (see above) — heap-profile
-  before labeling.
 - wazero cold ~87 ms is dominated by engine init, not script compile;
   fine for the pooled posture, worth a look if one-shot CLI use matters.
 - The `h_callret`/`h_fib` 9.2×/6.8× gap attribution (per-call seam

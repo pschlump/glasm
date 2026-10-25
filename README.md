@@ -93,8 +93,9 @@ instruction runs** on the machine below. So:
 - **Scripts run a lot** — pool the VM. A pooled VM compiles once and
   re-runs in place; the per-run cost drops back to microseconds and even a
   trivial script round-trips faster than building a fresh interpreter
-  state (24 µs vs 51 µs below). The `host/` package is built around
-  this posture.
+  state (24 µs vs 51 µs below) — **faster, in fact, than the native C
+  `lua` binary itself** (see "vs native C Lua 5.5.1" below). The `host/`
+  package is built around this posture.
 
 ### Measured — production path (`host/` on wazero), 2026-10-21
 
@@ -117,6 +118,47 @@ the by-shape table below, `docs/U9-perf.md`, and `docs/U10-perf.md`.)
 Read the table as: cold = compile + instantiate + run once; pooled =
 already-instantiated VM, run again. The 70 ms column is the "short script
 you run a lot" penalty — pooling removes it.
+
+### vs native C Lua 5.5.1 — `perfcmp`, 2026-10-25
+
+How does any of this compare against the *original* C implementation?
+`cmd/perfcmp` answers that directly: it builds a native stock C Lua 5.5.1
+(`runtime/build-native55.sh` — the vendored 5.5.1 tree plus the stock
+`lua.c` driver, `clang -O2`) and races it against the glasm engines over
+the same scripts, same source bytes, outputs cross-checked every run
+(`docs/Perf-vs-C-Lua.md` for methodology and the full run; all numbers
+from one back-to-back session — this class of comparison does not
+survive cross-day machine drift).
+
+Steady-state per-run medians, warm postures (pooled VM for the wasm
+engine; the C binary re-`loadfile`s per run, which is the best its CLI
+can do — it has no pooling surface):
+
+| script (shape)                    | native C 5.5.1 | glasm interp | glasm wasm (wazero, pooled) | wasm × C |
+|-----------------------------------|----------------|--------------|-----------------------------|----------|
+| h_tiny (startup only)             | 14.0 µs        | 39.5 µs      | **9.8 µs**                  | **0.7×** |
+| h_str (short string ops)          | 36 µs          | 109 µs       | 69 µs                       | 1.9×     |
+| h_strlong (150 KB text processing)| 387 µs         | 1.29 ms      | 729 µs                      | 1.9×     |
+| h_concat (concat-heavy)           | 620 µs         | 753 µs       | 1.51 ms                     | 2.4×     |
+| h_numloop (4 M-iteration numeric) | 8.5 ms         | 130 ms       | 40 ms                       | 4.7×     |
+| h_tablechurn (table alloc churn)  | 3.9 ms         | 10.7 ms      | 21 ms                       | 5.5×     |
+| h_tco (tail-recursive countdown)  | 1.6 ms         | 11.3 ms      | 9.5 ms                      | 5.9×     |
+| h_nsieve (numeric + table stores) | 6.0 ms         | 62 ms        | 40 ms                       | 6.7×     |
+| h_fib(30) (call-heavy recursion)  | 20.2 ms        | 154 ms       | 137 ms                      | 6.8×     |
+
+The headline: **on the high-frequency EVAL shape — a small script run
+many times, which is exactly the daemon's workload — the pooled wasm VM
+is faster than the native C `lua` binary** (9.8 µs vs 14 µs per run),
+because it re-runs an already-compiled, already-instantiated VM while
+the C interpreter re-parses and rebuilds a fresh `lua_State` each time.
+That advantage holds for any script whose cost is dominated by state
+setup rather than compute; as the compute share grows, -O2 C's per-
+instruction advantage takes over (string lanes ~2×, tight numeric loops
+and call-heavy recursion ~5–7×, with the gaps mapped to specific rt
+seams in `docs/Perf-vs-C-Lua.md`). Memory: the C binary runs in ~2–3 MB
+RSS; the pooled Go engine carries a flat ~52 MB floor (Go runtime +
+wazero JIT + runtime blob) plus a bounded guest heap — the price of the
+pure-Go, no-cgo constraint, paid once per VM rather than per script.
 
 ### By shape — compiler vs interpreter
 
