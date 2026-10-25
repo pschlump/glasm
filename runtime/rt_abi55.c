@@ -26,6 +26,7 @@
 #define LUA_CORE /* we link core internals; luaO_arith/luaF_* need it */
 #endif
 #include <stdint.h>
+#include <stddef.h> /* offsetof — the U12 layout pins */
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
@@ -2663,6 +2664,57 @@ int32_t rt_sandbox(int32_t on) {
 static Table **prot_set;
 static int prot_cap; /* prot_n lives with the early tentatives above */
 
+/* g_prot_gen (U12): the protection generation. prot_add bumps it and
+   nothing ever lowers it — the compiled table-write arms poll this word
+   before every in-wasm store (via rt_protgen_addr, cached at module
+   init like the deadline flag's address) and decline to the probe
+   chain, whose per-write rt_prot_isprotected screen is exact. Sticky
+   means an armed-once VM keeps the slow writes forever, including the
+   KEYS/ARGV staging window's remove/re-add of _G — correctness first,
+   and protected hosts are the latency-insensitive ones. */
+int32_t g_prot_gen;
+
+rt_addr rt_protgen_addr(void) { return (rt_addr)(size_t)&g_prot_gen; }
+
+/* rt_layout_num (U12 drift lock): the blob-side truth for the layout
+   offsets the backend bakes in as i32 immediates (luawasm's LayoutPins
+   must agree — a host test pins the pair). The _Static_asserts below
+   hold the C side to the same numbers, so a vendored-tree layout change
+   fails the blob build AND the gate, never silently. */
+int32_t rt_layout_num(int32_t which) {
+  switch (which) {
+  case 0: return (int32_t)offsetof(Table, asize);
+  case 1: return (int32_t)offsetof(Table, array);
+  case 2: return (int32_t)offsetof(Table, node);
+  case 3: return (int32_t)offsetof(Table, metatable);
+  case 4: return (int32_t)offsetof(Table, marked);
+  case 5: return (int32_t)offsetof(Table, lsizenode);
+  case 6: return (int32_t)sizeof(Node);
+  case 7: return (int32_t)offsetof(Node, u.key_tt);
+  case 8: return (int32_t)offsetof(Node, u.next);
+  case 9: return (int32_t)offsetof(Node, u.key_val);
+  case 10: return (int32_t)offsetof(Node, u.tt_);
+  case 11: return (int32_t)offsetof(TString, hash);
+  case 12: return (int32_t)sizeof(TValue);
+  case 13: return (int32_t)sizeof(unsigned); /* getArrTag's row offset */
+  case 14: return (int32_t)sizeof(Value);
+  default: return -1;
+  }
+}
+_Static_assert(offsetof(Table, asize) == 8 && offsetof(Table, array) == 12 &&
+                   offsetof(Table, node) == 16 &&
+                   offsetof(Table, metatable) == 20 &&
+                   offsetof(Table, marked) == 5 &&
+                   offsetof(Table, lsizenode) == 7,
+               "U12 table-arm layout drift (wasm32)");
+_Static_assert(sizeof(Node) == 24 &&
+                   offsetof(Node, u.tt_) == 8 &&
+                   offsetof(Node, u.key_tt) == 9 &&
+                   offsetof(Node, u.next) == 12 &&
+                   offsetof(Node, u.key_val) == 16,
+               "U12 node-arm layout drift (wasm32)");
+_Static_assert(offsetof(TString, hash) == 8, "U12 hash offset drift");
+
 int rt_prot_isprotected(const void *t) {
   int i;
   for (i = 0; i < prot_n; i++)
@@ -2685,6 +2737,7 @@ static int prot_add(lua_State *L, Table *t) {
     prot_cap = ncap;
   }
   prot_set[prot_n++] = t;
+  g_prot_gen++; /* the in-wasm write arms decline from here on (U12) */
   return 1;
 }
 

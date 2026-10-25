@@ -108,6 +108,7 @@ type backend struct {
 	gDeadline        uint32 // mutable global: the deadline flag's address (U6b)
 	gDeadlinePollCtr uint32 // mutable global: the row-100 backstop's back-edge counter (U7a)
 	gDispFrame       uint32 // mutable global: lua_dispatch's EXIT frame (U9c, row 104)
+	gProtGen         uint32 // mutable global: &g_prot_gen (U12 — the arms' protection screen)
 	protos           []protoInfo
 	protoIdx         map[*lua.FunctionProto]int // proto → dispatch index
 	protoFuncs       []*wasm.Function           // dispatch idx → wasm function
@@ -329,6 +330,7 @@ func (b *backend) declareImports() {
 		// missing name would emit call 0)
 		"rt_frame_cursor": m.ImportFunc("rt", "rt_frame_cursor", nil, i32v),
 		"rt_ctrl_addr":    m.ImportFunc("rt", "rt_ctrl_addr", nil, i32v),
+		"rt_protgen_addr": m.ImportFunc("rt", "rt_protgen_addr", nil, i32v),
 		"rt_deadline":     m.ImportFunc("rt", "rt_deadline", nil, i32v),
 		// U9c (row 104): the direct-dispatch helpers — a compiled-callee
 		// OP_CALL/TFORCALL runs lua_dispatch in-module (probe -> push frame
@@ -345,6 +347,7 @@ func (b *backend) declareImports() {
 	b.gDeadline = m.GlobalI32(0, true)
 	b.gDeadlinePollCtr = m.GlobalI32(deadlinePollInterval, true)
 	b.gDispFrame = m.GlobalI32(0, true)
+	b.gProtGen = m.GlobalI32(0, true)
 	m.ImportMemory("rt", "memory", 1, 0)
 }
 
@@ -442,6 +445,11 @@ func (b *backend) emitInit() {
 	// debug init must not leave gDeadline at 0 (a poll of linear-memory
 	// base+0 could read nonzero data and raise spuriously).
 	f.Call(b.imp("rt_ctrl_addr")).GlobalSet(b.gDeadline)
+	// U12: the protection-generation address — the table-write arms poll
+	// this word before every in-wasm store (sticky: once any table has
+	// been protected the arms decline forever, and the probe chain's
+	// per-write rt_prot_isprotected screen takes over)
+	f.Call(b.imp("rt_protgen_addr")).GlobalSet(b.gProtGen)
 	f.I32Const(0).LocalSet(lC)
 
 	// staged by the step parameter (0 = allocs only, 1 = +chunkname,

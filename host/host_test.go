@@ -13,6 +13,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/pschlump/glasm/luawasm"
 )
 
 // noHostGC disables Go GC for the test's duration (ledger row 99): a Go
@@ -63,6 +65,35 @@ func TestBlobPinned(t *testing.T) {
 	}
 	if len(prodBlob) < 100<<10 {
 		t.Fatalf("embedded blob suspiciously small: %d", len(prodBlob))
+	}
+}
+
+// TestTableArmLayoutPins (U12 drift lock): the in-wasm table arms bake
+// the 5.5.1 wasm32 layout offsets in as i32 immediates — this gate
+// makes the blob answer for every one of them via rt_layout_num, so a
+// vendored-tree layout change fails HERE instead of as silent garbage
+// reads (the C side also _Static_asserts the same numbers at build
+// time; this closes the Go side of the pair).
+func TestTableArmLayoutPins(t *testing.T) {
+	e := mustEngine(t)
+	vm, err := e.NewVM()
+	if err != nil {
+		t.Fatalf("NewVM: %v", err)
+	}
+	t.Cleanup(func() { _ = vm.Close() })
+	fn := vm.rtInst.ExportedFunction("rt_layout_num")
+	if fn == nil {
+		t.Fatal("blob exports no rt_layout_num")
+	}
+	for _, p := range luawasm.LayoutPins {
+		got, err := fn.Call(context.Background(), uint64(uint32(p.Which)))
+		if err != nil {
+			t.Fatalf("rt_layout_num(%d): %v", p.Which, err)
+		}
+		if int32(got[0]) != p.Val {
+			t.Errorf("layout %s (which %d): blob says %d, backend bakes %d",
+				p.Name, p.Which, int32(got[0]), p.Val)
+		}
 	}
 }
 

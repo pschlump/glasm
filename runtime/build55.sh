@@ -93,6 +93,7 @@ RT_EXPORTS="$EXPORTS \
   -Wl,--export=rt_newtable -Wl,--export=rt_gettable -Wl,--export=rt_settable \
   -Wl,--export=rt_geti_probe -Wl,--export=rt_seti_probe \
   -Wl,--export=rt_gets_probe -Wl,--export=rt_sets_probe -Wl,--export=rt_len_probe \
+  -Wl,--export=rt_protgen_addr -Wl,--export=rt_layout_num \
   -Wl,--export=rt_stdcall_probe \
   -Wl,--export=rt_concat_probe \
   -Wl,--export=rt_fmod -Wl,--export=rt_pow -Wl,--export=rt_globals_cell \

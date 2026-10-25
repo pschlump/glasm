@@ -301,6 +301,14 @@ void rt_set_memlimit(int32_t bytes);
 int32_t rt_mem_used_bytes(void);
 void *rt_alloc(void *ud, void *ptr, size_t osize, size_t nsize);
 rt_addr rt_ctrl_addr(void);
+/* U12: the protection generation's address — the backend caches it at
+   module init (the gDeadline idiom) and every in-wasm table-write arm
+   polls the word before storing. Sticky-raise: prot_add bumps it,
+   nothing lowers it, and the arms decline to the probe chain from the
+   first bump on. rt_layout_num is the blob-side truth for the layout
+   offsets the arms bake in (the drift lock). */
+rt_addr rt_protgen_addr(void);
+int32_t rt_layout_num(int32_t which);
 void rt_set_deadline(int32_t on);
 int32_t rt_deadline_flag(void);
 int32_t rt_deadline(void);

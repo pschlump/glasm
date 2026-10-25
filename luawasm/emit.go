@@ -623,201 +623,282 @@ func (fe *funcEmitter) emitBlockBody(start, end int) {
 			// via the plain rt_getupval), then the U11a short-string
 			// probe — a per-loop globals read pays no enter. Any miss
 			// (absent slot, long key, metamethod, non-table) re-issues
-			// the cells to the protected path below.
+			// the cells to the protected path below. U12: the walk is
+			// in-wasm; only the globals-cell staging call remains.
 			if fe.isMain {
 				// main runs cl=0: its _ENV upvalue IS the globals table
 				// (row 53) — lower to the registry read
 				fe.scratchAddr(0)
 				fe.f.Call(fe.b.imp("rt_globals_cell"))
-				fe.scratchAddr(0)
-				fe.kcell(C)
-				fe.cellAddr(A)
-				fe.f.Call(fe.b.imp("rt_gets_probe"))
-				fe.f.I32Eqz().If(wasm.Void)
-				fe.cellAddr(A)
-				fe.kcell(C)
-				fe.f.I32Const(fe.line(pc))
-				fe.f.Call(fe.b.imp("rt_getglobal"))
-				fe.checkStatus()
-				fe.f.End()
+				fe.armGets(
+					func() *wasm.Function { return fe.scratchAddr(0) },
+					func() *wasm.Function { return fe.kcell(C) },
+					A,
+					func() {
+						fe.scratchAddr(0)
+						fe.kcell(C)
+						fe.cellAddr(A)
+						fe.f.Call(fe.b.imp("rt_gets_probe"))
+						fe.f.I32Eqz().If(wasm.Void)
+						fe.cellAddr(A)
+						fe.kcell(C)
+						fe.f.I32Const(fe.line(pc))
+						fe.f.Call(fe.b.imp("rt_getglobal"))
+						fe.checkStatus()
+						fe.f.End()
+					})
 			} else {
 				fe.f.LocalGet(1).I32Const(int32(B))
 				fe.scratchAddr(0)
 				fe.f.Call(fe.b.imp("rt_getupval"))
-				fe.scratchAddr(0)
-				fe.kcell(C)
-				fe.cellAddr(A)
-				fe.f.Call(fe.b.imp("rt_gets_probe"))
-				fe.f.I32Eqz().If(wasm.Void)
-				fe.scratchAddr(0)
-				fe.kcell(C)
-				fe.cellAddr(A)
-				fe.f.I32Const(fe.line(pc))
-				// row-71 hints: the object is the upvalue cell B; the
-				// __index-not-callable call error names "metamethod 'index'"
-				fe.f.I32Const(int32(fe.hintUpv(B)))
-				fe.f.I32Const(int32(fe.hintCallSite(pc)))
-				fe.f.Call(fe.b.imp("rt_gettable"))
-				fe.checkStatus()
-				fe.f.End()
+				fe.armGets(
+					func() *wasm.Function { return fe.scratchAddr(0) },
+					func() *wasm.Function { return fe.kcell(C) },
+					A,
+					func() {
+						fe.scratchAddr(0)
+						fe.kcell(C)
+						fe.cellAddr(A)
+						fe.f.Call(fe.b.imp("rt_gets_probe"))
+						fe.f.I32Eqz().If(wasm.Void)
+						fe.scratchAddr(0)
+						fe.kcell(C)
+						fe.cellAddr(A)
+						fe.f.I32Const(fe.line(pc))
+						// row-71 hints: the object is the upvalue cell B; the
+						// __index-not-callable call error names "metamethod 'index'"
+						fe.f.I32Const(int32(fe.hintUpv(B)))
+						fe.f.I32Const(int32(fe.hintCallSite(pc)))
+						fe.f.Call(fe.b.imp("rt_gettable"))
+						fe.checkStatus()
+						fe.f.End()
+					})
 			}
 			fe.bumpTop(A + 1)
 		case lua.OP_SETTABUP:
 			// U11e-b: the same probe posture on the write side; the
 			// sets probe declines protected globals itself (the U6c
-			// guard — the seam hazard), misses re-issue below
+			// guard — the seam hazard), misses re-issue below. U12: the
+			// existing-key overwrite is in-wasm, behind the protection
+			// and barrier screens.
 			if fe.isMain {
 				fe.scratchAddr(0)
 				fe.f.Call(fe.b.imp("rt_globals_cell"))
-				fe.scratchAddr(0)
-				fe.kcell(B)
-				fe.vcCell(C, k)
-				fe.f.Call(fe.b.imp("rt_sets_probe"))
-				fe.f.I32Eqz().If(wasm.Void)
-				fe.kcell(B)
-				fe.vcCell(C, k)
-				fe.f.I32Const(fe.line(pc))
-				fe.f.Call(fe.b.imp("rt_setglobal"))
-				fe.checkStatus()
-				fe.f.End()
+				fe.armSets(
+					func() *wasm.Function { return fe.scratchAddr(0) },
+					func() *wasm.Function { return fe.kcell(B) },
+					func() *wasm.Function { return fe.vcCell(C, k) },
+					func() {
+						fe.scratchAddr(0)
+						fe.kcell(B)
+						fe.vcCell(C, k)
+						fe.f.Call(fe.b.imp("rt_sets_probe"))
+						fe.f.I32Eqz().If(wasm.Void)
+						fe.kcell(B)
+						fe.vcCell(C, k)
+						fe.f.I32Const(fe.line(pc))
+						fe.f.Call(fe.b.imp("rt_setglobal"))
+						fe.checkStatus()
+						fe.f.End()
+					})
 			} else {
 				fe.f.LocalGet(1).I32Const(int32(A))
 				fe.scratchAddr(0)
 				fe.f.Call(fe.b.imp("rt_getupval"))
-				fe.scratchAddr(0)
-				fe.kcell(B)
-				fe.vcCell(C, k)
-				fe.f.Call(fe.b.imp("rt_sets_probe"))
-				fe.f.I32Eqz().If(wasm.Void)
-				fe.scratchAddr(0)
-				fe.kcell(B)
-				fe.vcCell(C, k)
-				fe.f.I32Const(fe.line(pc))
-				fe.f.I32Const(int32(fe.hintUpv(A)))
-				fe.f.I32Const(int32(fe.hintCallSite(pc)))
-				fe.f.Call(fe.b.imp("rt_settable"))
-				fe.checkStatus()
-				fe.f.End()
+				fe.armSets(
+					func() *wasm.Function { return fe.scratchAddr(0) },
+					func() *wasm.Function { return fe.kcell(B) },
+					func() *wasm.Function { return fe.vcCell(C, k) },
+					func() {
+						fe.scratchAddr(0)
+						fe.kcell(B)
+						fe.vcCell(C, k)
+						fe.f.Call(fe.b.imp("rt_sets_probe"))
+						fe.f.I32Eqz().If(wasm.Void)
+						fe.scratchAddr(0)
+						fe.kcell(B)
+						fe.vcCell(C, k)
+						fe.f.I32Const(fe.line(pc))
+						fe.f.I32Const(int32(fe.hintUpv(A)))
+						fe.f.I32Const(int32(fe.hintCallSite(pc)))
+						fe.f.Call(fe.b.imp("rt_settable"))
+						fe.checkStatus()
+						fe.f.End()
+					})
 			}
 		case lua.OP_GETTABLE:
 			// U10/U11: the VM's own luaV_fastgeti and luaV_fastget
 			// arms as unprotected probes (int keys, then short-string
 			// keys) — a hit writes A with no try_table enter; any miss
 			// re-issues the cells to the protected rt_gettable
-			// (metamethods, errors)
-			fe.cellAddr(B)
-			fe.cellAddr(C)
-			fe.cellAddr(A)
-			fe.f.Call(fe.b.imp("rt_geti_probe"))
-			fe.f.I32Eqz().If(wasm.Void)
-			fe.cellAddr(B)
-			fe.cellAddr(C)
-			fe.cellAddr(A)
-			fe.f.Call(fe.b.imp("rt_gets_probe"))
-			fe.f.I32Eqz().If(wasm.Void)
-			fe.cellAddr(B)
-			fe.cellAddr(C)
-			fe.cellAddr(A)
-			fe.f.I32Const(fe.line(pc))
-			fe.f.I32Const(int32(fe.hintSite(pc, B)))
-			fe.f.I32Const(int32(fe.hintCallSite(pc)))
-			fe.f.Call(fe.b.imp("rt_gettable"))
-			fe.checkStatus()
-			fe.f.End()
-			fe.f.End()
+			// (metamethods, errors). U12: the in-wasm arms sit in front
+			// — the hit case runs no crossing at all.
+			fe.armGeti(
+				func() *wasm.Function { return fe.cellAddr(B) },
+				func() *wasm.Function { return fe.cellAddr(C) },
+				-1, A,
+				func() {
+					fe.armGets(
+						func() *wasm.Function { return fe.cellAddr(B) },
+						func() *wasm.Function { return fe.cellAddr(C) },
+						A,
+						func() {
+							fe.cellAddr(B)
+							fe.cellAddr(C)
+							fe.cellAddr(A)
+							fe.f.Call(fe.b.imp("rt_geti_probe"))
+							fe.f.I32Eqz().If(wasm.Void)
+							fe.cellAddr(B)
+							fe.cellAddr(C)
+							fe.cellAddr(A)
+							fe.f.Call(fe.b.imp("rt_gets_probe"))
+							fe.f.I32Eqz().If(wasm.Void)
+							fe.cellAddr(B)
+							fe.cellAddr(C)
+							fe.cellAddr(A)
+							fe.f.I32Const(fe.line(pc))
+							fe.f.I32Const(int32(fe.hintSite(pc, B)))
+							fe.f.I32Const(int32(fe.hintCallSite(pc)))
+							fe.f.Call(fe.b.imp("rt_gettable"))
+							fe.checkStatus()
+							fe.f.End()
+							fe.f.End()
+						})
+				})
 			fe.bumpTop(A + 1)
 		case lua.OP_GETI:
 			fe.mkIntScratch(1, int64(C))
-			fe.cellAddr(B)
-			fe.scratchAddr(1)
-			fe.cellAddr(A)
-			fe.f.Call(fe.b.imp("rt_geti_probe"))
-			fe.f.I32Eqz().If(wasm.Void)
-			fe.cellAddr(B)
-			fe.scratchAddr(1)
-			fe.cellAddr(A)
-			fe.f.I32Const(fe.line(pc))
-			fe.f.I32Const(int32(fe.hintSite(pc, B)))
-			fe.f.I32Const(int32(fe.hintCallSite(pc)))
-			fe.f.Call(fe.b.imp("rt_gettable"))
-			fe.checkStatus()
-			fe.f.End()
+			// U12: the constant key embeds — no scratch-cell reads at all
+			// on the hit path
+			fe.armGeti(
+				func() *wasm.Function { return fe.cellAddr(B) },
+				nil, int64(C), A,
+				func() {
+					fe.cellAddr(B)
+					fe.scratchAddr(1)
+					fe.cellAddr(A)
+					fe.f.Call(fe.b.imp("rt_geti_probe"))
+					fe.f.I32Eqz().If(wasm.Void)
+					fe.cellAddr(B)
+					fe.scratchAddr(1)
+					fe.cellAddr(A)
+					fe.f.I32Const(fe.line(pc))
+					fe.f.I32Const(int32(fe.hintSite(pc, B)))
+					fe.f.I32Const(int32(fe.hintCallSite(pc)))
+					fe.f.Call(fe.b.imp("rt_gettable"))
+					fe.checkStatus()
+					fe.f.End()
+				})
 			fe.bumpTop(A + 1)
 		case lua.OP_GETFIELD:
 			// U11: const short-string key — the luaV_fastget arm; miss
-			// (absent field, non-table, metamethod) -> protected path
-			fe.cellAddr(B)
-			fe.kcell(C)
-			fe.cellAddr(A)
-			fe.f.Call(fe.b.imp("rt_gets_probe"))
-			fe.f.I32Eqz().If(wasm.Void)
-			fe.cellAddr(B)
-			fe.kcell(C)
-			fe.cellAddr(A)
-			fe.f.I32Const(fe.line(pc))
-			fe.f.I32Const(int32(fe.hintSite(pc, B)))
-			fe.f.I32Const(int32(fe.hintCallSite(pc)))
-			fe.f.Call(fe.b.imp("rt_gettable"))
-			fe.checkStatus()
-			fe.f.End()
+			// (absent field, non-table, metamethod) -> protected path.
+			// U12: the chain walk itself is in-wasm.
+			fe.armGets(
+				func() *wasm.Function { return fe.cellAddr(B) },
+				func() *wasm.Function { return fe.kcell(C) },
+				A,
+				func() {
+					fe.cellAddr(B)
+					fe.kcell(C)
+					fe.cellAddr(A)
+					fe.f.Call(fe.b.imp("rt_gets_probe"))
+					fe.f.I32Eqz().If(wasm.Void)
+					fe.cellAddr(B)
+					fe.kcell(C)
+					fe.cellAddr(A)
+					fe.f.I32Const(fe.line(pc))
+					fe.f.I32Const(int32(fe.hintSite(pc, B)))
+					fe.f.I32Const(int32(fe.hintCallSite(pc)))
+					fe.f.Call(fe.b.imp("rt_gettable"))
+					fe.checkStatus()
+					fe.f.End()
+				})
 			fe.bumpTop(A + 1)
 		case lua.OP_SETTABLE:
 			// U10/U11: rt_seti_probe then rt_sets_probe (int keys,
 			// then short-string keys — luaV_fastseti/fastset); the
-			// protected rt_settable on a miss
-			fe.cellAddr(A)
-			fe.cellAddr(B)
-			fe.vcCell(C, k)
-			fe.f.Call(fe.b.imp("rt_seti_probe"))
-			fe.f.I32Eqz().If(wasm.Void)
-			fe.cellAddr(A)
-			fe.cellAddr(B)
-			fe.vcCell(C, k)
-			fe.f.Call(fe.b.imp("rt_sets_probe"))
-			fe.f.I32Eqz().If(wasm.Void)
-			fe.cellAddr(A)
-			fe.cellAddr(B)
-			fe.vcCell(C, k)
-			fe.f.I32Const(fe.line(pc))
-			fe.f.I32Const(int32(fe.hintSite(pc, A)))
-			fe.f.I32Const(int32(fe.hintCallSite(pc)))
-			fe.f.Call(fe.b.imp("rt_settable"))
-			fe.checkStatus()
-			fe.f.End()
-			fe.f.End()
+			// protected rt_settable on a miss. U12: the in-wasm arms
+			// in front (protection/barrier screened before any store)
+			fe.armSeti(
+				func() *wasm.Function { return fe.cellAddr(A) },
+				func() *wasm.Function { return fe.cellAddr(B) },
+				-1,
+				func() *wasm.Function { return fe.vcCell(C, k) },
+				func() {
+					fe.armSets(
+						func() *wasm.Function { return fe.cellAddr(A) },
+						func() *wasm.Function { return fe.cellAddr(B) },
+						func() *wasm.Function { return fe.vcCell(C, k) },
+						func() {
+							fe.cellAddr(A)
+							fe.cellAddr(B)
+							fe.vcCell(C, k)
+							fe.f.Call(fe.b.imp("rt_seti_probe"))
+							fe.f.I32Eqz().If(wasm.Void)
+							fe.cellAddr(A)
+							fe.cellAddr(B)
+							fe.vcCell(C, k)
+							fe.f.Call(fe.b.imp("rt_sets_probe"))
+							fe.f.I32Eqz().If(wasm.Void)
+							fe.cellAddr(A)
+							fe.cellAddr(B)
+							fe.vcCell(C, k)
+							fe.f.I32Const(fe.line(pc))
+							fe.f.I32Const(int32(fe.hintSite(pc, A)))
+							fe.f.I32Const(int32(fe.hintCallSite(pc)))
+							fe.f.Call(fe.b.imp("rt_settable"))
+							fe.checkStatus()
+							fe.f.End()
+							fe.f.End()
+						})
+				})
 		case lua.OP_SETI:
 			fe.mkIntScratch(1, int64(B))
-			fe.cellAddr(A)
-			fe.scratchAddr(1)
-			fe.vcCell(C, k)
-			fe.f.Call(fe.b.imp("rt_seti_probe"))
-			fe.f.I32Eqz().If(wasm.Void)
-			fe.cellAddr(A)
-			fe.scratchAddr(1)
-			fe.vcCell(C, k)
-			fe.f.I32Const(fe.line(pc))
-			fe.f.I32Const(int32(fe.hintSite(pc, A)))
-			fe.f.I32Const(int32(fe.hintCallSite(pc)))
-			fe.f.Call(fe.b.imp("rt_settable"))
-			fe.checkStatus()
-			fe.f.End()
+			fe.armSeti(
+				func() *wasm.Function { return fe.cellAddr(A) },
+				nil, int64(B),
+				func() *wasm.Function { return fe.vcCell(C, k) },
+				func() {
+					fe.cellAddr(A)
+					fe.scratchAddr(1)
+					fe.vcCell(C, k)
+					fe.f.Call(fe.b.imp("rt_seti_probe"))
+					fe.f.I32Eqz().If(wasm.Void)
+					fe.cellAddr(A)
+					fe.scratchAddr(1)
+					fe.vcCell(C, k)
+					fe.f.I32Const(fe.line(pc))
+					fe.f.I32Const(int32(fe.hintSite(pc, A)))
+					fe.f.I32Const(int32(fe.hintCallSite(pc)))
+					fe.f.Call(fe.b.imp("rt_settable"))
+					fe.checkStatus()
+					fe.f.End()
+				})
 		case lua.OP_SETFIELD:
 			// U11: const short-string key — the luaV_fastset arm; miss
-			// (absent key needing a rehash, NEWINDEX) -> protected path
-			fe.cellAddr(A)
-			fe.kcell(B)
-			fe.vcCell(C, k)
-			fe.f.Call(fe.b.imp("rt_sets_probe"))
-			fe.f.I32Eqz().If(wasm.Void)
-			fe.cellAddr(A)
-			fe.kcell(B)
-			fe.vcCell(C, k)
-			fe.f.I32Const(fe.line(pc))
-			fe.f.I32Const(int32(fe.hintSite(pc, A)))
-			fe.f.I32Const(int32(fe.hintCallSite(pc)))
-			fe.f.Call(fe.b.imp("rt_settable"))
-			fe.checkStatus()
-			fe.f.End()
+			// (absent key needing a rehash, NEWINDEX) -> protected
+			// path. U12: the existing-key overwrite is in-wasm.
+			fe.armSets(
+				func() *wasm.Function { return fe.cellAddr(A) },
+				func() *wasm.Function { return fe.kcell(B) },
+				func() *wasm.Function { return fe.vcCell(C, k) },
+				func() {
+					fe.cellAddr(A)
+					fe.kcell(B)
+					fe.vcCell(C, k)
+					fe.f.Call(fe.b.imp("rt_sets_probe"))
+					fe.f.I32Eqz().If(wasm.Void)
+					fe.cellAddr(A)
+					fe.kcell(B)
+					fe.vcCell(C, k)
+					fe.f.I32Const(fe.line(pc))
+					fe.f.I32Const(int32(fe.hintSite(pc, A)))
+					fe.f.I32Const(int32(fe.hintCallSite(pc)))
+					fe.f.Call(fe.b.imp("rt_settable"))
+					fe.checkStatus()
+					fe.f.End()
+				})
 		case lua.OP_NEWTABLE:
 			narr := lua.OpGetArgvC(inst)
 			if k != 0 {
