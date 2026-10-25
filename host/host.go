@@ -18,6 +18,8 @@ import (
 	"github.com/pschlump/glasm"
 	"github.com/pschlump/glasm/luawasm"
 	"github.com/pschlump/glasm/parse"
+	"github.com/pschlump/pluto/lru_ts"
+	"github.com/tetratelabs/wazero"
 )
 
 // HostFunc is a Lua-visible function implemented in Go (the redis.call
@@ -35,6 +37,7 @@ type options struct {
 	maxMem            int64                      // per-VM allocation budget bytes (0 = unlimited; the blob's 256 MiB linear-memory max is the hard backstop either way)
 	eventSink         func(vm *VM, args []Value) // EVT_PRINT observer (already wire-decoded)
 	globalsProtection bool                       // Redis-classic globals lockdown per VM (rt_protect_globals)
+	vmCacheSize       int                        // warm-VM pool capacity (0 = the v1 fresh-VM-per-run posture)
 }
 
 // WithRuntimeBlob replaces the embedded production blob (a staged/test
@@ -70,6 +73,20 @@ func WithGlobalsProtection(on bool) Option {
 	return func(o *options) { o.globalsProtection = on }
 }
 
+// WithVMCacheSize enables a bounded pool of warm VM images, keyed by
+// script source (the deferred pooled posture, guide R3): Engine.Run
+// reuses a pooled image bound to the same source instead of building a
+// fresh VM per run — the NewVM cost (wazero blob compile + Lua state
+// build) is amortized to zero for repeat scripts. Images recycle
+// (close, not reuse) once their Lua allocation crosses the recycle
+// watermark (frozen-GC heaps grow monotonically — UsedBytes is the
+// recycling signal), and engine-level failures close them; guest-level
+// script errors keep the image pooled (the stack unwinds to base).
+// n <= 0 (the default) keeps the fresh-VM-per-run v1 posture.
+func WithVMCacheSize(n int) Option {
+	return func(o *options) { o.vmCacheSize = n }
+}
+
 // Engine is the shared, process-wide scripting engine.
 type Engine struct {
 	opts options
@@ -80,6 +97,26 @@ type Engine struct {
 	hostVals []registeredVal
 	vms      int // live VMs (RegisterGlobal freezes once the first exists)
 	closed   bool
+
+	// wcache shares one wazero engine across every VM runtime: the blob
+	// JIT-compiles once per Engine instead of once per VM (~75 ms → ~2 ms,
+	// note/wazero-performance-note-001.md). Engine sharing does NOT share
+	// module namespaces — import resolution goes through each runtime's
+	// own store, so the per-VM isolation model is untouched.
+	wcache wazero.CompilationCache
+	// leaseOnce/leaseRT pin the compiled blob in the shared engine's
+	// in-memory cache: compiled modules are refcounted and evicted when
+	// the last instance closes (engine.go DeleteCompiledModule), so
+	// without a permanent lease the sequential fresh-VM shape would
+	// recompile the blob on every run. The lease runtime is never closed
+	// while VMs exist (its lifetime belongs to the process — see Close).
+	leaseOnce sync.Once
+	leaseErr  error
+	leaseRT   wazero.Runtime
+
+	// pool is the warm-VM cache (WithVMCacheSize); nil when disabled.
+	pool    *lru_ts.Lru[string, *VM]
+	poolCap int
 }
 
 type registeredFn struct {
@@ -168,7 +205,12 @@ func NewEngine(opts ...Option) (*Engine, error) {
 	if err := verifyBlob(o.blob); err != nil {
 		return nil, err
 	}
-	return &Engine{opts: o, cache: map[string]*Script{}}, nil
+	e := &Engine{opts: o, cache: map[string]*Script{}, wcache: wazero.NewCompilationCache()}
+	if o.vmCacheSize > 0 {
+		e.pool = lru_ts.NewLru[string, *VM](o.vmCacheSize)
+		e.poolCap = o.vmCacheSize
+	}
+	return e, nil
 }
 
 // RegisterGlobal installs <table>.<name> as a Lua function backed by fn
@@ -256,21 +298,124 @@ func (e *Engine) Compile(source []byte, name string) (*Script, error) {
 }
 
 // Run compiles nothing: it executes s against a fresh VM (the v1 default
-// deployment — maximum parallelism, zero shared mutable guest state).
+// deployment — maximum parallelism, zero shared mutable guest state), or
+// against a pooled warm image when WithVMCacheSize is set (repeat scripts
+// skip NewVM entirely; each image still serves one run at a time).
 func (e *Engine) Run(ctx context.Context, s *Script, opt RunOptions) (Result, error) {
+	if s == nil {
+		return Result{}, errors.New("host: nil script")
+	}
+	key := s.SHA1 + "\x00" + s.name
+	if e.pool != nil {
+		// Atomic take (Get alone re-marks recency but LEAVES the entry —
+		// two concurrent Runs would hold one image, and the recycle path
+		// could close it under a live run).
+		e.pool.Lock()
+		var pooled *VM
+		if v, ok := e.pool.NlGet(key); ok {
+			pooled = v
+			e.pool.NlDelete(key)
+		}
+		e.pool.Unlock()
+		if pooled != nil {
+			res, err := pooled.Run(ctx, s, opt)
+			e.recycle(ctx, pooled, key, err)
+			return res, err
+		}
+	}
 	vm, err := e.NewVM()
 	if err != nil {
 		return Result{}, err
 	}
-	defer vm.Close()
-	return vm.Run(ctx, s, opt)
+	res, err := vm.Run(ctx, s, opt)
+	if e.pool == nil || !poolable(err) {
+		_ = vm.Close()
+		return res, err
+	}
+	e.recycle(ctx, vm, key, err)
+	return res, err
+}
+
+// poolable reports whether err leaves the image reusable: guest-level
+// errors unwind the Lua stack to base (per-run hygiene clears the staged
+// error and the deadline flag), while engine-level failures — traps are
+// always backend bugs, design §6.4 — leave unknown machine state.
+func poolable(err error) bool {
+	var se *ScriptError
+	return err == nil || errors.As(err, &se)
+}
+
+// recycle returns vm to the pool, or closes it when its Lua allocation
+// crossed the recycle watermark (frozen-GC growth per run; the pool must
+// not drift to the memory budget) or when it arrived at a full pool as
+// the entry that loses the LRU race.
+func (e *Engine) recycle(ctx context.Context, vm *VM, key string, runErr error) {
+	if !poolable(runErr) || vm.UsedBytes(ctx) > e.recycleLimit() {
+		_ = vm.Close()
+		return
+	}
+	// Compound op under the pool lock (pluto convention): a key already
+	// in the pool refreshes its own slot (an entry taken from the pool
+	// and a fresh one must be treated alike); a NEW key at capacity pops
+	// the LRU victim. Close victims OUTSIDE the lock — Close is too long
+	// to run under it, and Put alone would silently drop the victim (a
+	// leaked image).
+	e.pool.Lock()
+	var victim *VM
+	if _, mine := e.pool.NlPeek(key); !mine && e.pool.NlLen() >= e.pool.NlCapacity() {
+		if _, v, ok := e.pool.NlPopOldest(); ok {
+			victim = v
+		}
+	}
+	e.pool.NlPut(key, vm)
+	e.pool.Unlock()
+	if victim != nil && victim != vm {
+		_ = victim.Close()
+	}
+}
+
+// recycleLimit is the UsedBytes watermark at which pooled images are
+// closed instead of reused: three quarters of the budget when one is
+// set, else 64 MiB (the blob's 256 MiB linear-memory max backstops
+// either way).
+func (e *Engine) recycleLimit() int64 {
+	if e.opts.maxMem > 0 {
+		return e.opts.maxMem * 3 / 4
+	}
+	return 64 << 20
 }
 
 // Close marks the engine closed; live VMs keep working (they own their
-// runtimes) but no new ones may be made.
+// runtimes) but no new ones may be made. Pooled VMs are engine-owned
+// and are drained here. The shared wazero engine (the compile cache's)
+// outlives every VM runtime, so it is only released when no VM was ever
+// created; otherwise its blob machine code lives until process exit —
+// bounded (one blob's code per Engine).
 func (e *Engine) Close() error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	if e.closed {
+		return nil
+	}
 	e.closed = true
+	if e.pool != nil {
+		e.pool.Lock()
+		victims := make([]*VM, 0, e.pool.NlLen())
+		for {
+			_, v, ok := e.pool.NlPopOldest()
+			if !ok {
+				break
+			}
+			victims = append(victims, v)
+		}
+		e.pool.Unlock()
+		for _, v := range victims {
+			_ = v.Close()
+		}
+	}
+	if e.vms == 0 && e.leaseRT != nil {
+		_ = e.leaseRT.Close(context.Background())
+		return e.wcache.Close(context.Background())
+	}
 	return nil
 }

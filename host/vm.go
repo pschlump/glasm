@@ -153,11 +153,31 @@ type VM struct {
 	flagMu sync.Mutex
 }
 
+// ensureLease compiles the runtime blob once per Engine against the shared
+// compile cache and keeps the lease runtime alive (Engine.leaseRT) — the
+// permanent refcount that stops the shared engine from evicting the blob's
+// compiled code when no VM instance holds it. Called at the top of NewVM so
+// the one-time ~75 ms JIT lands in the first VM, exactly where it used to
+// land per-VM.
+func (e *Engine) ensureLease(ctx context.Context) error {
+	e.leaseOnce.Do(func() {
+		rc := wazero.NewRuntimeConfig().
+			WithCoreFeatures(api.CoreFeaturesV2 | experimental.CoreFeaturesExceptionHandling).
+			WithCompilationCache(e.wcache)
+		e.leaseRT = wazero.NewRuntimeWithConfig(ctx, rc)
+		if _, err := e.leaseRT.CompileModule(ctx, e.opts.blob); err != nil {
+			e.leaseErr = fmt.Errorf("host: blob lease compile: %w", err)
+		}
+	})
+	return e.leaseErr
+}
+
 // NewVM builds a fresh image: runtime + host module + rt instance + Lua
 // state, sandboxed, with the engine's host functions registered. µs–ms
 // (instantiation plus the C state build); the M0-era measurement put
 // wazero instantiation at ~7.4 µs for a tiny module — this one also
-// opens the Lua stdlib.
+// opens the Lua stdlib. All VMs of an engine share one wazero compile
+// engine (e.wcache), so only the first NewVM pays the blob JIT.
 func (e *Engine) NewVM() (*VM, error) {
 	e.mu.Lock()
 	if e.closed {
@@ -169,8 +189,12 @@ func (e *Engine) NewVM() (*VM, error) {
 	e.mu.Unlock()
 
 	ctx := context.Background()
+	if err := e.ensureLease(ctx); err != nil {
+		return nil, err
+	}
 	rc := wazero.NewRuntimeConfig().
-		WithCoreFeatures(api.CoreFeaturesV2 | experimental.CoreFeaturesExceptionHandling)
+		WithCoreFeatures(api.CoreFeaturesV2 | experimental.CoreFeaturesExceptionHandling).
+		WithCompilationCache(e.wcache)
 	r := wazero.NewRuntimeWithConfig(ctx, rc)
 	vm.rt = r
 

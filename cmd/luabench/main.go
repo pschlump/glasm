@@ -200,10 +200,22 @@ func emitBench(stem, posture string, st stats) {
 		stem, posture, runtime.GOMAXPROCS(0), st.n, st.mean.Nanoseconds())
 }
 
+// regBenchCall registers the bench.call host function (h_hostfn lane).
+func regBenchCall(e *host.Engine, needsB bool) {
+	if !needsB {
+		return
+	}
+	must(e.RegisterGlobal("bench", "call", func(vm *host.VM, args []host.Value) ([]host.Value, error) {
+		if len(args) != 1 {
+			return nil, fmt.Errorf("bench.call wants 1 argument, got %d", len(args))
+		}
+		return []host.Value{host.Int(benchFn(args[0].String()))}, nil
+	}))
+}
+
 func main() {
 	flag.Parse()
 	ctx := context.Background()
-
 	fmt.Printf("# luabench — %s | host/ prod blob + wazero-prod engine | GOMAXPROCS=%d | %s\n",
 		runtime.Version(), runtime.GOMAXPROCS(0), time.Now().Format("2006-01-02 15:04"))
 	if *cpuprof != "" {
@@ -220,14 +232,7 @@ func main() {
 
 		e, err := host.NewEngine()
 		must(err)
-		if sc.needsB {
-			must(e.RegisterGlobal("bench", "call", func(vm *host.VM, args []host.Value) ([]host.Value, error) {
-				if len(args) != 1 {
-					return nil, fmt.Errorf("bench.call wants 1 argument, got %d", len(args))
-				}
-				return []host.Value{host.Int(benchFn(args[0].String()))}, nil
-			}))
-		}
+		regBenchCall(e, sc.needsB)
 		s, err := e.Compile(src, sc.name)
 		must(err)
 
@@ -265,6 +270,25 @@ func main() {
 		fmt.Printf("%-26s %5d  %s  %s  %s\n", "wasm warm: pooled VM rerun", st.n, fmtDur(st.min), fmtDur(st.med), fmtDur(st.mean))
 		emitBench(stem, "warm", st)
 		vm.Close()
+
+		// engine VM-cache (WithVMCacheSize): e.Run reruns against a pooled
+		// warm image. One priming run pays the first VM (blob compile +
+		// state build); the measured iterations are pool hits — the
+		// daemon's steady-state EVAL shape.
+		ep, err := host.NewEngine(host.WithVMCacheSize(8))
+		must(err)
+		regBenchCall(ep, sc.needsB)
+		sp, err := ep.Compile(src, sc.name)
+		must(err)
+		_, err = ep.Run(ctx, sp, host.RunOptions{})
+		must(err)
+		st = measure("vmcache", stem, func() {
+			_, err := ep.Run(ctx, sp, host.RunOptions{})
+			must(err)
+		}, 400)
+		fmt.Printf("%-26s %5d  %s  %s  %s\n", "wasm pooled: engine VM-cache", st.n, fmtDur(st.min), fmtDur(st.med), fmtDur(st.mean))
+		emitBench(stem, "vmcache", st)
+		ep.Close()
 
 		// wazero-prod differential engine: prod blob, fresh runtime per
 		// run, no host machinery. Return-only scripts log nothing; the

@@ -270,6 +270,14 @@ func NewEngine(opts ...Option) (*Engine, error)
 //          WithGlobalsProtection(bool)  (Redis-classic lockdown; enable after
 //                                        all Register* calls — VM creation order
 //                                        is sandbox → host staging → protection)
+//          WithVMCacheSize(int)         (bounded pool of warm VM images keyed
+//                                        by script: repeat e.Run skips NewVM
+//                                        entirely — h_tiny 3.9 ms → 9 µs; n<=0,
+//                                        the default, keeps fresh-VM-per-run.
+//                                        Images recycle past the UsedBytes
+//                                        watermark (3/4 of the budget, else
+//                                        64 MiB); guest errors keep the image,
+//                                        engine-level failures close it)
 
 func (e *Engine) Compile(source []byte, name string) (*Script, error)
 // parse.Parse → lua.Compile → luawasm.Compile, SHA1-keyed cache; exactly
