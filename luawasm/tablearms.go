@@ -7,9 +7,9 @@ package luawasm
 // every condition the matching probe would check is checked in-wasm
 // first. An arm is a strict REFINEMENT of its probe's hit set: anything
 // the arm declines (non-table, long key, empty slot, metamethod,
-// protection, barrier, hash-part insert) falls through to the exact
-// probe->protected chain that ran before, so semantics are unchanged by
-// construction and the differential gates stay the oracle.
+// protection, barrier, occupied/colliding insert) falls through to the
+// exact probe->protected chain that ran before, so semantics are
+// unchanged by construction and the differential gates stay the oracle.
 //
 // Layout pins (lobject.h/ltable.h, wasm32):
 //
@@ -29,6 +29,7 @@ import "github.com/pschlump/glasm/wasm"
 
 const (
 	tblOffMarked    = 5  // Table.marked (CommonHeader: lgc.h)
+	tblOffFlags     = 6  // Table.flags: TM-absence cache bits 0..5 + BITDUMMY 6
 	tblOffLsizenode = 7  // Table.lsizenode
 	tblOffAsize     = 8  // Table.asize (unsigned int)
 	tblOffArray     = 12 // Table.array (Value*)
@@ -219,12 +220,22 @@ func (fe *funcEmitter) armGets(tblCell, keyCell func() *wasm.Function, dst int, 
 	f.End()
 }
 
-// armSets lowers a short-string-key table write restricted to
-// psetshortstr's existing-key arm (setobj: value + tag byte, the key
-// untouched — the barrier is the caller's luaV_finishfastset, screened
-// up front like armSeti's). Absent keys decline: the insert path needs
-// space checks, ABSTKEY/VEMPTY discrimination, and rehash — the probe
-// and protected path already own it.
+// armSets lowers a short-string-key table write in two arms, both
+// stock-verbatim: (1) psetshortstr's existing-key arm — setobj: value +
+// tag byte, the key untouched; (2) at chain end (key absent),
+// insertkey's main-position-free branch: isempty(gval(mp)) -> setnodekey
+// (the kcell's value word + tag byte, wholesale) + setobj + the caller's
+// invalidateTMcache (flags &= ~0x3F, keeping BITDUMMY). Everything else —
+// colliding main position (getfreepos/occupant-move), full tables
+// (rehash), float/int normalization, external strings — declines: the
+// probe and protected path already own it. Screens before any store:
+// protection generation, BITDUMMY (inserting into the shared dummy node
+// would write a static), nil values (luaH_newkey's !ttisnil), fasttm
+// __newindex absence (finishset consults it BEFORE inserting), and the
+// barrier: the key is collectable by construction, so any black table
+// declines (luaC_barrierback both for the key and the value). mp->next is
+// left untouched, matching insertkey: a deleted mid-chain head keeps its
+// chain and is reused in place.
 func (fe *funcEmitter) armSets(tblCell, keyCell, valCell func() *wasm.Function, fallback func()) {
 	f := fe.f
 	f.Block(wasm.Void) // A
@@ -240,8 +251,10 @@ func (fe *funcEmitter) armSets(tblCell, keyCell, valCell func() *wasm.Function, 
 	f.LocalGet(fe.lT0).I32Load8U(tblOffLsizenode)
 	f.I32Shl().I32Const(1).I32Sub()
 	f.I32And().I32Const(nodeSz).I32Mul().I32Add().LocalSet(fe.lDd0)
+	f.LocalGet(fe.lDd0).LocalSet(fe.lDd1) // mp, saved across the walk
+	f.Block(wasm.Void)                    // C: the walk — its end falls into the insert region
 	f.Loop(wasm.Void)
-	// existing key with a live value? (empty value = a nil'd slot — decline)
+	// existing key with a live value? (empty value = a nil'd slot)
 	f.LocalGet(fe.lDd0).I32Load8U(nodeOffKeyTT).I32Const(rtTagShrstr).I32Eq()
 	f.LocalGet(fe.lDd0).I32Load(nodeOffKeyVal).LocalGet(fe.lT1).I32Eq()
 	f.I32And()
@@ -249,16 +262,16 @@ func (fe *funcEmitter) armSets(tblCell, keyCell, valCell func() *wasm.Function, 
 	f.I32And().If(wasm.Void)
 	// the barrier screen (same as armSeti's)
 	valCell().I32Load8U(8).I32Const(0x40).I32And().If(wasm.Void)
-	f.LocalGet(fe.lT0).I32Load8U(tblOffMarked).I32Const(0x20).I32And().BrIf(2)
+	f.LocalGet(fe.lT0).I32Load8U(tblOffMarked).I32Const(0x20).I32And().BrIf(3)
 	f.End()
-	// hit: setobj — value word, then the tag byte into tt_
+	// overwrite hit: setobj — value word, then the tag byte into tt_
 	f.LocalGet(fe.lDd0)
 	valCell().I64Load(0).I64Store(0)
 	f.LocalGet(fe.lDd0)
 	valCell().I32Load8U(8).I32Store8(nodeOffTT)
-	f.Br(3)
+	f.Br(4)
 	f.End()
-	f.LocalGet(fe.lDd0).I32Load(nodeOffNext).I32Eqz().BrIf(1)
+	f.LocalGet(fe.lDd0).I32Load(nodeOffNext).I32Eqz().BrIf(1) // -> insert region (C's end)
 	f.LocalGet(fe.lDd0)
 	f.LocalGet(fe.lDd0)
 	f.LocalGet(fe.lDd0).I32Load(nodeOffNext).I32Const(nodeSz).I32Mul().I32Add()
@@ -266,6 +279,37 @@ func (fe *funcEmitter) armSets(tblCell, keyCell, valCell func() *wasm.Function, 
 	f.Br(0)
 	f.End()
 	f.End()
-	fallback()
+	// ---- insert: the key is absent ----
+
+	// dummy node? (flags BITDUMMY 0x40 — insertkey's || isdummy(t))
+	f.LocalGet(fe.lT0).I32Load8U(tblOffFlags).I32Const(0x40).I32And().BrIf(0)
+	// nil never inserts (luaH_newkey's !ttisnil(value))
+	valCell().I32Load8U(8).I32Const(0x0F).I32And().I32Eqz().BrIf(0)
+	// fasttm __newindex absent? (a metatable without the bit cached away declines)
+	f.LocalGet(fe.lT0).I32Load(tblOffMetatable).If(wasm.Void)
+	f.LocalGet(fe.lT0).I32Load(tblOffMetatable).I32Load8U(tblOffFlags)
+	f.I32Const(2).I32And().I32Eqz().BrIf(1)
 	f.End()
+	// barrier: the key is collectable by construction — black tables decline
+	f.LocalGet(fe.lT0).I32Load8U(tblOffMarked).I32Const(0x20).I32And().BrIf(0)
+	// main position OCCUPIED? (!isempty(gval(mp)): any live variant has a
+	// nonzero novariant tag — VNIL/VEMPTY/VABSTKEY are all variant 0)
+	f.LocalGet(fe.lDd1).I32Load8U(nodeOffTT).I32Const(0x0F).I32And().BrIf(0)
+	// setnodekey: kcell value word + tag byte, wholesale
+	f.LocalGet(fe.lDd1)
+	keyCell().I64Load(0).I64Store(nodeOffKeyVal)
+	f.LocalGet(fe.lDd1)
+	keyCell().I32Load8U(8).I32Store8(nodeOffKeyTT)
+	// setobj2t: value word + tag byte
+	f.LocalGet(fe.lDd1)
+	valCell().I64Load(0).I64Store(0)
+	f.LocalGet(fe.lDd1)
+	valCell().I32Load8U(8).I32Store8(nodeOffTT)
+	// invalidateTMcache: clear the TM bits, keep BITDUMMY (flags &= 0xC0)
+	f.LocalGet(fe.lT0)
+	f.LocalGet(fe.lT0).I32Load8U(tblOffFlags).I32Const(0xC0).I32And().I32Store8(tblOffFlags)
+	f.Br(1)
+	f.End() // B
+	fallback()
+	f.End() // A
 }
