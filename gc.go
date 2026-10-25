@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"runtime"
+	"weak"
 )
 
 // Weak tables (U5f; row 79's durable fix, pulled in from U7+ because the
@@ -261,6 +262,7 @@ func (ls *LState) syncFinalizer(obj, mt LValue) {
 	switch v := obj.(type) {
 	case *LTable:
 		if has {
+			g.trackFinalizableTable(v)
 			runtime.SetFinalizer(v, func(t *LTable) { g.enqueueFinalizer(t) })
 		} else {
 			runtime.SetFinalizer(v, nil)
@@ -270,11 +272,52 @@ func (ls *LState) syncFinalizer(obj, mt LValue) {
 			return // stock finalizes tables and full userdata only
 		}
 		if has {
+			g.trackFinalizableUserData(v)
 			runtime.SetFinalizer(v, func(u *LUserData) { g.enqueueFinalizer(u) })
 		} else {
 			runtime.SetFinalizer(v, nil)
 		}
 	}
+}
+
+// trackFinalizableTable/UserData record a registration for Close's
+// clearRegisteredFinalizers sweep (value.go's finReg comment: the weak
+// lists must not pin the objects — that would defeat mid-life firing).
+func (g *Global) trackFinalizableTable(v *LTable) {
+	g.finMu.Lock()
+	g.finRegT = append(g.finRegT, weak.Make(v))
+	g.finMu.Unlock()
+}
+
+func (g *Global) trackFinalizableUserData(v *LUserData) {
+	g.finMu.Lock()
+	g.finRegU = append(g.finRegU, weak.Make(v))
+	g.finMu.Unlock()
+}
+
+// clearRegisteredFinalizers unregisters every finalizer this state
+// registered — Close's last GC-facing step, after drainFinalizers. The
+// entries that still hold live objects (the io standard streams;
+// anything a script left under a global) are exactly the ones whose
+// pending finalizer would otherwise pin the closed state's whole graph
+// via the closure's captured Global. Objects already collected (or
+// already finalized) skip — weak.Value reports nil, and SetFinalizer on
+// a dead-pending object is the runtime's race to win; a straggler
+// enqueue lands on the orphaned finQ and dies with the state's cycle.
+func (g *Global) clearRegisteredFinalizers() {
+	g.finMu.Lock()
+	for _, p := range g.finRegT {
+		if v := p.Value(); v != nil {
+			runtime.SetFinalizer(v, nil)
+		}
+	}
+	for _, p := range g.finRegU {
+		if v := p.Value(); v != nil {
+			runtime.SetFinalizer(v, nil)
+		}
+	}
+	g.finRegT, g.finRegU = nil, nil
+	g.finMu.Unlock()
 }
 
 // enqueueFinalizer is the SetFinalizer callback body — the ONLY code that

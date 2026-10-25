@@ -2553,6 +2553,12 @@ func (ls *LState) Close() {
 	}
 	th.closeUpvalues(0)
 	th.closeTBCProtected(0, LNil)
+	// The finalizer registrations must go before the graph drops: each
+	// pending runtime.SetFinalizer closure captures the Global, which
+	// transitively references its object — the self-reference trap that
+	// pinned every closed state (~150KB/run; docs/Perf-vs-C-Lua.md's
+	// open item, io's standard streams alone were enough).
+	ls.G.clearRegisteredFinalizers()
 	for _, file := range ls.G.tempFiles {
 		// ignore errors in these operations
 		file.Close()

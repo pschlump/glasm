@@ -7,6 +7,7 @@ import (
 	"strconv"
 	"sync"
 	"sync/atomic"
+	"weak"
 )
 
 type LValueType int
@@ -256,6 +257,18 @@ type Global struct {
 	// sites do not re-enter (stock's GCSTPGC around GCTM) — their
 	// objects stay queued for the next drain.
 	finDepth int
+	// finRegT/finRegU weakly track every object this state registered a
+	// runtime.SetFinalizer on, so Close can unregister them (gc.go's
+	// clearRegisteredFinalizers). The finalizer closure captures this
+	// Global, which transitively references every registered object
+	// through the globals table — runtime.SetFinalizer's documented
+	// self-reference trap — so even one pending finalizer (the io
+	// standard streams alone) pins its object and, with it, the whole
+	// closed state graph forever. Weak, because a strong list would pin
+	// the registered objects themselves and defeat mid-life finalizer
+	// firing (the U5f drain semantics).
+	finRegT []weak.Pointer[LTable]
+	finRegU []weak.Pointer[LUserData]
 
 	builtinMts map[int]LValue
 	tempFiles  []*os.File
