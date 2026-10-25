@@ -623,6 +623,7 @@ int32_t rt_len_probe(rt_addr srccell, rt_addr dstcell) {
 ** errors): the caller falls through to the protected call. */
 
 static TValue sc_byte, sc_find, sc_format;
+static TValue sc_min, sc_max, sc_concat; /* the U11e-c h_strlong residual */
 static TString *sc_tostring_key; /* "__tostring": 5.5.1 has no TM slot
                                     (luaL_tolstring rawgets the real mt) */
 static int sc_resolved = 0;
@@ -712,6 +713,9 @@ static void sc_resolve(void) {
   setnilvalue(&sc_byte);
   setnilvalue(&sc_find);
   setnilvalue(&sc_format);
+  setnilvalue(&sc_min);
+  setnilvalue(&sc_max);
+  setnilvalue(&sc_concat);
   /* raw walk: registry[LUA_RIDX_GLOBALS] -> "string" -> "byte"/"find" —
      no metamethods, no C stack, no ordering hazard against globals
      protection. The short names are interned, so luaS_new finds them
@@ -739,6 +743,35 @@ static void sc_resolve(void) {
   luaH_getshortstr(gt, tsvalue(&key), &sc_format);
   if (!ttislcf(&sc_format))
     setnilvalue(&sc_format);
+  /* the math.min/max and table.concat pins (the U11e-c h_strlong
+     residual): two more library tables, same light-C shape. gt was
+     reassigned to the string table above, so globals is re-fetched. */
+  luaH_getint(hvalue(&G(curL)->l_registry), LUA_RIDX_GLOBALS, &st);
+  if (ttistable(&st)) {
+    setsvalue(curL, &key, luaS_new(curL, "math"));
+    luaH_getshortstr(hvalue(&st), tsvalue(&key), &st);
+    if (ttistable(&st)) {
+      setsvalue(curL, &key, luaS_new(curL, "min"));
+      luaH_getshortstr(hvalue(&st), tsvalue(&key), &sc_min);
+      if (!ttislcf(&sc_min))
+        setnilvalue(&sc_min);
+      setsvalue(curL, &key, luaS_new(curL, "max"));
+      luaH_getshortstr(hvalue(&st), tsvalue(&key), &sc_max);
+      if (!ttislcf(&sc_max))
+        setnilvalue(&sc_max);
+    }
+  }
+  luaH_getint(hvalue(&G(curL)->l_registry), LUA_RIDX_GLOBALS, &st);
+  if (ttistable(&st)) {
+    setsvalue(curL, &key, luaS_new(curL, "table"));
+    luaH_getshortstr(hvalue(&st), tsvalue(&key), &st);
+    if (ttistable(&st)) {
+      setsvalue(curL, &key, luaS_new(curL, "concat"));
+      luaH_getshortstr(hvalue(&st), tsvalue(&key), &sc_concat);
+      if (!ttislcf(&sc_concat))
+        setnilvalue(&sc_concat);
+    }
+  }
   /* U11e-c: the gmatch_aux pin (by construction — see gmp_pin_body) */
   if (rt_run(gmp_pin_body, 0, -1, -1, -1, NULL) != RT_OK)
     sc_gmatch_aux = NULL; /* OOM-only; the staged raise is the truth */
@@ -819,6 +852,8 @@ static int32_t sc_stage(TValue *dst, int w, const TValue *res, int nres) {
 }
 
 static int sc_format_arm(TValue *args, int n, TValue *dst, int w);
+static int sc_minmax_arm(TValue *args, int n, TValue *dst, int w, int ismax);
+static int sc_tconcat_arm(TValue *args, int n, TValue *dst, int w);
 
 int32_t rt_stdcall_probe(rt_addr funcaddr, rt_addr argcells, int32_t nargs,
                          int32_t want) {
@@ -908,6 +943,18 @@ int32_t rt_stdcall_probe(rt_addr funcaddr, rt_addr argcells, int32_t nargs,
     /* str_format's fold (U11d): stages its single result via sc_stage,
        or returns 1 = MISS for every raising/exotic shape */
     return sc_format_arm(args, n, dst, w);
+  }
+  if (luaV_rawequalobj(fn, &sc_min)) {
+    /* math_min's fold (U11e-c residual): the winner is an arg cell */
+    return sc_minmax_arm(args, n, dst, w, 0);
+  }
+  if (luaV_rawequalobj(fn, &sc_max)) {
+    /* math_max's fold (U11e-c residual) */
+    return sc_minmax_arm(args, n, dst, w, 1);
+  }
+  if (luaV_rawequalobj(fn, &sc_concat)) {
+    /* tconcat's fold (U11e-c residual): concat-probe shaped (U11c) */
+    return sc_tconcat_arm(args, n, dst, w);
   }
   return 1; /* not a probe-known function */
 }
@@ -1920,6 +1967,155 @@ static int sc_format_arm(TValue *args, int n, TValue *dst, int w) {
   }
   if (total <= LUAI_MAXSHORTLEN)
     ts = luaS_newlstr(curL, sbuff, total);
+  setsvalue(curL, &resv, ts);
+  return sc_stage(dst, w, &resv, 1);
+}
+
+/* ---- the U11e-c h_strlong residual pins: math.min/max, table.concat
+** ----
+**
+** h_strlong's remaining protected enters were math.min (the block
+** bound) and table.concat (the block fold). math_min/max are the
+** ideal probe shapes: pure reads of pre-screened NUMBER cells (the
+** pairs go through luaV_lessthan's LTnum arm — no metamethod, no
+** allocation, nothing that can raise) and the result IS the winning
+** argument cell (stock's lua_pushvalue), so the arm cannot diverge.
+** tconcat is concat-probe shaped (U11c): fields read raw via
+** luaH_fastgeti — a PRESENT slot is exactly lua_geti's fast path
+** (a present key never consults __index), numbers fold through
+** luaO_tostringbuff like every string lane, and the one result
+** allocation sits behind the shared two-sided pre-flight. Every
+** raise shape (min's n==0 argcheck, the table/string/integer
+** argument checks, absent fields = __index territory, "invalid
+** value ... in table for 'concat'", length overflow, OOM) declines
+** to the protected call, which raises the stock texts. */
+
+static int sc_minmax_arm(TValue *args, int n, TValue *dst, int w, int ismax) {
+  int imin = 0, i;
+  TValue resv;
+  if (n < 1)
+    return 1; /* "value expected": the protected path raises */
+  for (i = 0; i < n; i++)
+    if (!ttisnumber(&args[i]))
+      return 1; /* string ordering / __lt / type error: protected path */
+  for (i = 1; i < n; i++) {
+    /* stock's lua_compare(L, i, imin, LUA_OPLT) (min) and
+       (L, imin, i) (max), verbatim */
+    if (ismax ? luaV_lessthan(curL, &args[imin], &args[i])
+              : luaV_lessthan(curL, &args[i], &args[imin]))
+      imin = i;
+  }
+  resv = args[imin]; /* lua_pushvalue: the winner verbatim */
+  return sc_stage(dst, w, &resv, 1);
+}
+
+/* one tconcat field: luaH_fastgeti's PRESENT slot is exactly lua_geti's
+   fast path; strings pass through, numbers fold via luaO_tostringbuff
+   (lua_tolstring's own bytes). NULL = the decline/raise shapes. */
+static const char *sc_tfield(Table *t, lua_Integer j, size_t *len,
+                             char *nbuf) {
+  TValue field;
+  lu_byte tag;
+  luaH_fastgeti(t, j, &field, tag);
+  if (tagisempty(tag))
+    return NULL; /* absent: __index metamethod territory */
+  if (ttisstring(&field)) {
+    *len = tsslen(tsvalue(&field));
+    return getstr(tsvalue(&field));
+  }
+  if (ttisnumber(&field)) {
+    *len = luaO_tostringbuff(&field, nbuf);
+    return nbuf;
+  }
+  return NULL; /* "invalid value ... in table for 'concat'" */
+}
+
+static int sc_tconcat_arm(TValue *args, int n, TValue *dst, int w) {
+  char nbuf[LUA_N2SBUFFSZ];   /* number fields' tostringbuff bytes */
+  char sepbuf[LUA_N2SBUFFSZ]; /* a number separator's coercion bytes */
+  char sbuff[LUAI_MAXSHORTLEN];
+  Table *t;
+  lua_Integer i, last;
+  const char *sep = "";
+  size_t lsep = 0, fl, total = 0;
+  TValue resv;
+  TString *ts;
+  char *p;
+
+  if (n < 1 || !ttistable(&args[0]))
+    return 1; /* checktab's "table expected": the protected path */
+  t = hvalue(&args[0]);
+  if (fasttm(curL, t->metatable, TM_LEN) == NULL) /* no __len */
+    last = l_castU2S(luaH_getn(curL, t)); /* luaL_len's plain border */
+  else
+    return 1; /* the __len metamethod: the protected path */
+  if (n >= 2 && !ttisnil(&args[1])) { /* luaL_optlstring's "" default */
+    if (ttisstring(&args[1])) {
+      sep = getstr(tsvalue(&args[1]));
+      lsep = tsslen(tsvalue(&args[1]));
+    } else if (ttisnumber(&args[1])) { /* stock's number coercion */
+      lsep = luaO_tostringbuff(&args[1], sepbuf);
+      sep = sepbuf;
+    } else
+      return 1; /* "string expected": the protected path */
+  }
+  i = 1; /* luaL_optinteger(L, 3, 1) */
+  if (n >= 3 && !ttisnil(&args[2])) {
+    if (!ttisinteger(&args[2]))
+      return 1; /* coercion shapes: the protected path */
+    i = ivalue(&args[2]);
+  }
+  if (n >= 4 && !ttisnil(&args[3])) { /* luaL_optinteger(L, 4, last) */
+    if (!ttisinteger(&args[3]))
+      return 1;
+    last = ivalue(&args[3]);
+  }
+  { /* pass 1: screen every field, sum the exact total — stock's loop
+       (fields i..last-1 with separators, the last field alone; the
+       final field lands whenever i <= last, because stock's own loop
+       variable IS i and exits at last) */
+    lua_Integer j;
+    const char *fp;
+    for (j = i; j < last; j++) {
+      fp = sc_tfield(t, j, &fl, nbuf);
+      if (fp == NULL)
+        return 1;
+      total += fl + lsep;
+    }
+    if (i <= last) {
+      fp = sc_tfield(t, last, &fl, nbuf);
+      if (fp == NULL)
+        return 1;
+      total += fl;
+    }
+  }
+  if (total >= MAX_SIZE - sizeof(TString))
+    return 1; /* "string length overflow": the protected path raises */
+  if (!rt_probe_mem_ok(total, 1))
+    return 1; /* the shared two-sided pre-flight (U11c's law) */
+  { /* pass 2: emit (no code ran between the passes; GC is frozen) */
+    lua_Integer j;
+    const char *fp;
+    if (total > LUAI_MAXSHORTLEN) {
+      ts = luaS_createlngstrobj(curL, total);
+      p = getlngstr(ts);
+    } else
+      p = sbuff;
+    for (j = i; j < last; j++) {
+      fp = sc_tfield(t, j, &fl, nbuf);
+      memcpy(p, fp, fl);
+      p += fl;
+      memcpy(p, sep, lsep);
+      p += lsep;
+    }
+    if (i <= last) {
+      fp = sc_tfield(t, last, &fl, nbuf);
+      memcpy(p, fp, fl);
+      p += fl;
+    }
+    if (total <= LUAI_MAXSHORTLEN)
+      ts = luaS_newlstr(curL, sbuff, total);
+  }
   setsvalue(curL, &resv, ts);
   return sc_stage(dst, w, &resv, 1);
 }

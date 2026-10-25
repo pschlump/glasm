@@ -1,4 +1,4 @@
-# U11 — the string lanes (2026-10-20, U11c + U11d; U11e/U11e-b 2026-10-21)
+# U11 — the string lanes (2026-10-20, U11c + U11d; U11e/U11e-b 2026-10-21; U11e-c/U11f 2026-10-25)
 
 U10 retired the numeric/call/table try_table-enter tax; the residual gap
 was strings: h_strlong ran ~10× interp warm, h_concat ~2×, and the
@@ -350,9 +350,67 @@ callees.
   105, same day): `strGmatchIter` now compiles the pattern on its
   first call — stock's lazy construction, raise at the iteration site
   (`_u1/gm01.lua` pins it byte-exact against the oracle).
-- h_strlong's 105 residual enters: the un-probed stdlib callees
-  (`math.min`, `table.concat` …) — the same pin-by-name shape as
-  `rt_stdcall_probe`'s targets, extendable callee by callee.
+- ~~h_strlong's 105 residual enters: the un-probed stdlib callees
+  (`math.min`, `table.concat` …)~~ **DONE** (2026-10-25, below): the
+  `math.min`/`math.max`/`table.concat` stdcall arms.
 - h_concat's allocating fold at 1.7× interp.
 - wazero upstream: the per-enter stack clone is an engine cost the
   probes route around, not fix.
+
+## U11f — the residual stdcall pins: math.min/max, table.concat
+(2026-10-25)
+
+The U11e-c open item, executed callee by callee as planned: three new
+arms on `rt_stdcall_probe`, pinned by value at `sc_resolve` (once per
+process, raw registry walk into `math`/`table`, light-C shape only —
+the pooled-VM redefinition law unchanged: a swapped global stops
+matching, a saved original restored still does).
+
+- **`math.min`/`math.max`** (`sc_minmax_arm`): the ideal probe shape —
+  stock is `lua_compare(..., LUA_OPLT)` over the arguments plus
+  `lua_pushvalue` of the winner, so the arm pre-screens every cell
+  `ttisnumber` (the LTnum pairs cannot raise) and stages the winning
+  ARGUMENT CELL verbatim. No allocation, no metamethod, cannot
+  diverge. Declines: n==0 ("value expected") and any non-number
+  ordering (strings / `__lt` / type errors → the protected path's
+  stock texts).
+- **`table.concat`** (`sc_tconcat_arm`), concat-probe shaped (U11c):
+  fields read raw via `luaH_fastgeti` — a PRESENT slot is exactly
+  `lua_geti`'s fast path (a present key never consults `__index`, so
+  no metatable screening for hits; absent fields decline to the
+  metamethod territory), `__len` tables decline, numbers fold through
+  `luaO_tostringbuff`, a number separator coerces through the same,
+  and the one result allocation sits behind the shared two-sided
+  `rt_probe_mem_ok`. Two subtleties found while porting: stock's
+  `i` IS the loop variable (the final field lands whenever initial
+  `i <= last`, not `i == last` — the naive translation drops the last
+  field), and the separator's coercion buffer must be separate from
+  the field buffer or pass 2 overwrites it.
+
+Coverage: the native ABI battery (plain/ASan/UBSan) pins hits
+(int/float winner subtypes, NaN incumbency, nil-padding, multret,
+i/j bounds, number coercions, the 219-byte lngstr path, the
+`__index`-present raw-read law), declines (n==0, strings, boolean
+sep, string i, non-table, boolean field, hole, `__len`), and the
+pin-is-the-original swap test; `host/TestMemoryBudgetTconcat` pins
+the OOM decline against the budget cap. Gates green end-to-end
+(matrix/error/glua/clua55/U1/U2/U2f/U5/U6/U9, host plain+race).
+Blob re-pinned both sides (host/blob.go + testdiff/m6c_test.go);
+prod blob 292,351 B, `46f7e3e2…43ac1749`.
+
+Measured (same-day A/B, quiet machine, pooled wazero-prod warm):
+
+| shape | old | new |
+|---|---|---|
+| micro: 300 × {math.min, math.max, table.concat(t100, ",")} | 1.08 ms median (min 0.96) | **0.43 ms median (min 0.40)** — 2.5× |
+| h_strlong warm | 735.6 µs median | 714.8–729.9 µs — no movement beyond noise |
+
+The honest reading: the arms eliminate every protected enter for
+these callees (the micro's 900 enters/run), but h_strlong calls them
+only 10× per run (5 blocks × min+concat) — ~4% of its warm cost,
+under the noise floor. The U11e-c-era "105 residual = the un-probed
+callees" attribution was loose: 105 enters against 10 calls means
+most of that residual was misc, not `math.min`/`table.concat`. For
+scripts that actually hammer these callees (JOIN/SORT-shaped EVAL),
+the win is the micro's 2.5×; for h_strlong the remaining cost is
+elsewhere (the concat fold and the call seam).

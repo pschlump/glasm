@@ -786,6 +786,290 @@ int main(void) {
       L->top.p--;
     }
 
+    /* ---- the U11e-c residual arms: math.min/max, table.concat ---- */
+    {
+      TValue fmin, fmax, fconcat, blk[8];
+      int32_t r;
+      lua_getglobal(L, "math");
+      lua_getfield(L, -1, "min");
+      fmin = *s2v(L->top.p - 1);
+      lua_getfield(L, -2, "max"); /* -2 = the math table */
+      fmax = *s2v(L->top.p - 1);
+      L->top.p -= 3;
+      lua_getglobal(L, "table");
+      lua_getfield(L, -1, "concat");
+      fconcat = *s2v(L->top.p - 1);
+      L->top.p -= 2;
+
+      /* min(3, 1, 2) -> 1 */
+      blk[0] = fmin;
+      rt_mkinteger(cell_of(&blk[1]), 3);
+      rt_mkinteger(cell_of(&blk[2]), 1);
+      rt_mkinteger(cell_of(&blk[3]), 2);
+      r = rt_stdcall_probe(cell_of(&blk[0]), cell_of(&blk[1]), 3, 1);
+      CHECK(r == 0 && ttisinteger(&blk[0]) && ivalue(&blk[0]) == 1);
+      /* min(2, 1.5) -> 1.5: the winning ARG cell verbatim, float subtype */
+      blk[0] = fmin;
+      rt_mkinteger(cell_of(&blk[1]), 2);
+      rt_mknumber(cell_of(&blk[2]), 1.5);
+      r = rt_stdcall_probe(cell_of(&blk[0]), cell_of(&blk[1]), 2, 1);
+      CHECK(r == 0 && ttisfloat(&blk[0]) && fltvalue(&blk[0]) == 1.5);
+      /* min(1, nan) -> 1; min(nan, 1) -> nan (stock's loop keeps the
+         incumbent when the compare is false — NaN compares false both
+         ways) */
+      blk[0] = fmin;
+      rt_mkinteger(cell_of(&blk[1]), 1);
+      rt_mknumber(cell_of(&blk[2]), 0.0 / 0.0);
+      r = rt_stdcall_probe(cell_of(&blk[0]), cell_of(&blk[1]), 2, 1);
+      CHECK(r == 0 && ttisinteger(&blk[0]) && ivalue(&blk[0]) == 1);
+      blk[0] = fmin;
+      rt_mknumber(cell_of(&blk[1]), 0.0 / 0.0);
+      rt_mkinteger(cell_of(&blk[2]), 1);
+      r = rt_stdcall_probe(cell_of(&blk[0]), cell_of(&blk[1]), 2, 1);
+      CHECK(r == 0 && ttisfloat(&blk[0]) && isnan(fltvalue(&blk[0])));
+      /* min(5, 9) want=2 nil-pads; multret -(1+1) */
+      blk[0] = fmin;
+      rt_mkinteger(cell_of(&blk[1]), 5);
+      rt_mkinteger(cell_of(&blk[2]), 9);
+      r = rt_stdcall_probe(cell_of(&blk[0]), cell_of(&blk[1]), 2, 2);
+      CHECK(r == 0 && ivalue(&blk[0]) == 5 && ttisnil(&blk[1]));
+      blk[0] = fmin;
+      rt_mkinteger(cell_of(&blk[1]), 5);
+      rt_mkinteger(cell_of(&blk[2]), 9);
+      r = rt_stdcall_probe(cell_of(&blk[0]), cell_of(&blk[1]), 2, -1);
+      CHECK(r == -2 && ivalue(&blk[0]) == 5);
+      /* max(3, 1, 2) -> 3; max(2, 2.5) -> 2.5 */
+      blk[0] = fmax;
+      rt_mkinteger(cell_of(&blk[1]), 3);
+      rt_mkinteger(cell_of(&blk[2]), 1);
+      rt_mkinteger(cell_of(&blk[3]), 2);
+      r = rt_stdcall_probe(cell_of(&blk[0]), cell_of(&blk[1]), 3, 1);
+      CHECK(r == 0 && ivalue(&blk[0]) == 3);
+      blk[0] = fmax;
+      rt_mkinteger(cell_of(&blk[1]), 2);
+      rt_mknumber(cell_of(&blk[2]), 2.5);
+      r = rt_stdcall_probe(cell_of(&blk[0]), cell_of(&blk[1]), 2, 1);
+      CHECK(r == 0 && ttisfloat(&blk[0]) && fltvalue(&blk[0]) == 2.5);
+      /* min's raise shape and the non-number orderings decline */
+      blk[0] = fmin;
+      rt_mkinteger(cell_of(&blk[1]), 1);
+      CHECK(rt_stdcall_probe(cell_of(&blk[0]), cell_of(&blk[1]), 0, 1) == 1);
+      blk[0] = fmin;
+      rt_intern(cell_of(&blk[1]), (rt_addr)(uintptr_t)"a", 1);
+      rt_mkinteger(cell_of(&blk[2]), 1);
+      CHECK(rt_stdcall_probe(cell_of(&blk[0]), cell_of(&blk[1]), 2, 1) == 1);
+      /* the pin is the ORIGINAL: after math.min = 1 the saved value
+         still hits and the replacement misses (the pooled-VM law) */
+      blk[0] = fmin;
+      rt_mkinteger(cell_of(&blk[1]), 2);
+      rt_mkinteger(cell_of(&blk[2]), 1);
+      lua_getglobal(L, "math");
+      lua_pushinteger(L, 1);
+      lua_setfield(L, -2, "min");
+      L->top.p--;
+      r = rt_stdcall_probe(cell_of(&blk[0]), cell_of(&blk[1]), 2, 1);
+      CHECK(r == 0 && ivalue(&blk[0]) == 1);
+      lua_getglobal(L, "math");
+      lua_getfield(L, -1, "min");
+      blk[7] = *s2v(L->top.p - 1);
+      L->top.p -= 2;
+      CHECK(rt_stdcall_probe(cell_of(&blk[7]), cell_of(&blk[1]), 2, 1) == 1);
+      /* restore the stock function before anything else looks */
+      lua_getglobal(L, "math");
+      setobj2s(L, L->top.p, &fmin);
+      L->top.p++;
+      lua_setfield(L, -2, "min");
+      L->top.p--;
+
+      /* tconcat: {"a","b","c"} with "," -> "a,b,c" (the h_strlong
+         shape's block fold). blk[5]/blk[6] are settable scratch. */
+      rt_set_memlimit(rt_mem_used_bytes() + (8 << 20)); /* as U11c below */
+      blk[0] = fconcat;
+      CHECK(rt_newtable(cell_of(&blk[1]), 3, 0) == RT_OK);
+      {
+        static const char *sv[3] = {"a", "b", "c"};
+        int k;
+        for (k = 1; k <= 3; k++) {
+          rt_intern(cell_of(&blk[5]), (rt_addr)(uintptr_t)sv[k - 1], 1);
+          rt_mkinteger(cell_of(&blk[6]), k);
+          CHECK(rt_settable(cell_of(&blk[1]), cell_of(&blk[6]),
+                            cell_of(&blk[5]), 30, -1, -1) == RT_OK);
+        }
+      }
+      rt_intern(cell_of(&blk[2]), (rt_addr)(uintptr_t)",", 1);
+      r = rt_stdcall_probe(cell_of(&blk[0]), cell_of(&blk[1]), 2, 1);
+      CHECK(r == 0 && ttisshrstring(&blk[0]) &&
+            tsslen(tsvalue(&blk[0])) == 5 &&
+            memcmp(getstr(tsvalue(&blk[0])), "a,b,c", 5) == 0);
+      /* no separator: "abc"; explicit nil separator = absent (each hit
+         stages over the callee cell — re-stage first, as U11b's chain) */
+      blk[0] = fconcat;
+      r = rt_stdcall_probe(cell_of(&blk[0]), cell_of(&blk[1]), 1, 1);
+      CHECK(r == 0 && tsslen(tsvalue(&blk[0])) == 3 &&
+            memcmp(getstr(tsvalue(&blk[0])), "abc", 3) == 0);
+      blk[0] = fconcat;
+      setnilvalue(&blk[2]);
+      r = rt_stdcall_probe(cell_of(&blk[0]), cell_of(&blk[1]), 2, 1);
+      CHECK(r == 0 && tsslen(tsvalue(&blk[0])) == 3);
+      /* i/j bounds: (2,def) -> "b,c"; (1,2) -> "a,b"; (2,2) -> "b";
+         (5,2) -> "" (the empty interval) */
+      blk[0] = fconcat;
+      rt_intern(cell_of(&blk[2]), (rt_addr)(uintptr_t)",", 1);
+      rt_mkinteger(cell_of(&blk[3]), 2);
+      r = rt_stdcall_probe(cell_of(&blk[0]), cell_of(&blk[1]), 3, 1);
+      CHECK(r == 0 && tsslen(tsvalue(&blk[0])) == 3 &&
+            memcmp(getstr(tsvalue(&blk[0])), "b,c", 3) == 0);
+      blk[0] = fconcat;
+      setnilvalue(&blk[3]);
+      rt_mkinteger(cell_of(&blk[4]), 2);
+      r = rt_stdcall_probe(cell_of(&blk[0]), cell_of(&blk[1]), 4, 1);
+      CHECK(r == 0 && tsslen(tsvalue(&blk[0])) == 3 &&
+            memcmp(getstr(tsvalue(&blk[0])), "a,b", 3) == 0);
+      blk[0] = fconcat;
+      rt_mkinteger(cell_of(&blk[3]), 2);
+      r = rt_stdcall_probe(cell_of(&blk[0]), cell_of(&blk[1]), 4, 1);
+      CHECK(r == 0 && tsslen(tsvalue(&blk[0])) == 1 &&
+            memcmp(getstr(tsvalue(&blk[0])), "b", 1) == 0);
+      blk[0] = fconcat;
+      rt_mkinteger(cell_of(&blk[3]), 5);
+      r = rt_stdcall_probe(cell_of(&blk[0]), cell_of(&blk[1]), 4, 1);
+      CHECK(r == 0 && ttisstring(&blk[0]) && tsslen(tsvalue(&blk[0])) == 0);
+      /* number fields + a number separator (stock's coercions):
+         {1, 2.5} sep 0 -> "102.5" */
+      blk[0] = fconcat;
+      CHECK(rt_newtable(cell_of(&blk[1]), 2, 0) == RT_OK);
+      rt_mkinteger(cell_of(&blk[5]), 1);
+      rt_mkinteger(cell_of(&blk[6]), 1);
+      CHECK(rt_settable(cell_of(&blk[1]), cell_of(&blk[6]),
+                        cell_of(&blk[5]), 30, -1, -1) == RT_OK);
+      rt_mknumber(cell_of(&blk[5]), 2.5);
+      rt_mkinteger(cell_of(&blk[6]), 2);
+      CHECK(rt_settable(cell_of(&blk[1]), cell_of(&blk[6]),
+                        cell_of(&blk[5]), 30, -1, -1) == RT_OK);
+      rt_mkinteger(cell_of(&blk[2]), 0);
+      r = rt_stdcall_probe(cell_of(&blk[0]), cell_of(&blk[1]), 2, 1);
+      CHECK(r == 0 && tsslen(tsvalue(&blk[0])) == 5 &&
+            memcmp(getstr(tsvalue(&blk[0])), "102.5", 5) == 0);
+      /* a long result takes the lngstr path: 20 x "abcdefghij" sep ","
+         -> 219 bytes */
+      blk[0] = fconcat;
+      CHECK(rt_newtable(cell_of(&blk[1]), 20, 0) == RT_OK);
+      {
+        int k;
+        for (k = 1; k <= 20; k++) {
+          rt_intern(cell_of(&blk[5]), (rt_addr)(uintptr_t)"abcdefghij", 10);
+          rt_mkinteger(cell_of(&blk[6]), k);
+          CHECK(rt_settable(cell_of(&blk[1]), cell_of(&blk[6]),
+                            cell_of(&blk[5]), 30, -1, -1) == RT_OK);
+        }
+      }
+      rt_intern(cell_of(&blk[2]), (rt_addr)(uintptr_t)",", 1);
+      r = rt_stdcall_probe(cell_of(&blk[0]), cell_of(&blk[1]), 2, 1);
+      CHECK(r == 0);
+      {
+        char expect[256];
+        int k;
+        for (k = 0; k < 20; k++) {
+          memcpy(expect + k * 11, "abcdefghij,", 11);
+        }
+        expect[218] = 'j'; /* the last field has no separator */
+        CHECK(ttislngstring(&blk[0]));
+        CHECK(tsslen(tsvalue(&blk[0])) == 219);
+        CHECK(memcmp(getstr(tsvalue(&blk[0])), expect, 219) == 0);
+      }
+      /* multret: -(1+1) */
+      blk[0] = fconcat;
+      r = rt_stdcall_probe(cell_of(&blk[0]), cell_of(&blk[1]), 2, -1);
+      CHECK(r == -2 && ttisstring(&blk[0]));
+      /* the decline shapes: boolean sep, string i, non-table, a boolean
+         field, a hole (absent field = __index territory) */
+      blk[0] = fconcat;
+      CHECK(rt_newtable(cell_of(&blk[1]), 1, 0) == RT_OK);
+      rt_intern(cell_of(&blk[5]), (rt_addr)(uintptr_t)"a", 1);
+      rt_mkinteger(cell_of(&blk[6]), 1);
+      CHECK(rt_settable(cell_of(&blk[1]), cell_of(&blk[6]),
+                        cell_of(&blk[5]), 30, -1, -1) == RT_OK);
+      rt_mkbool(cell_of(&blk[2]), 1);
+      CHECK(rt_stdcall_probe(cell_of(&blk[0]), cell_of(&blk[1]), 2, 1) == 1);
+      setnilvalue(&blk[2]);
+      rt_intern(cell_of(&blk[3]), (rt_addr)(uintptr_t)"1", 1);
+      CHECK(rt_stdcall_probe(cell_of(&blk[0]), cell_of(&blk[1]), 3, 1) == 1);
+      setnilvalue(&blk[3]);
+      rt_mkinteger(cell_of(&blk[1]), 7);
+      CHECK(rt_stdcall_probe(cell_of(&blk[0]), cell_of(&blk[1]), 1, 1) == 1);
+      CHECK(rt_newtable(cell_of(&blk[1]), 1, 0) == RT_OK);
+      rt_mkbool(cell_of(&blk[5]), 1);
+      CHECK(rt_settable(cell_of(&blk[1]), cell_of(&blk[6]),
+                        cell_of(&blk[5]), 30, -1, -1) == RT_OK);
+      CHECK(rt_stdcall_probe(cell_of(&blk[0]), cell_of(&blk[1]), 1, 1) == 1);
+      CHECK(rt_newtable(cell_of(&blk[1]), 2, 0) == RT_OK);
+      rt_intern(cell_of(&blk[5]), (rt_addr)(uintptr_t)"a", 1);
+      CHECK(rt_settable(cell_of(&blk[1]), cell_of(&blk[6]),
+                        cell_of(&blk[5]), 30, -1, -1) == RT_OK);
+      rt_mkinteger(cell_of(&blk[4]), 2);
+      CHECK(rt_stdcall_probe(cell_of(&blk[0]), cell_of(&blk[1]), 4, 1) == 1);
+      /* a __len table declines (luaL_len's metamethod) */
+      {
+        TValue lt, mt, fn;
+        CHECK(rt_newtable(cell_of(&lt), 0, 0) == RT_OK);
+        CHECK(rt_newtable(cell_of(&mt), 0, 1) == RT_OK);
+        {
+          const char *src = "return function(_) return 99 end";
+          CHECK(luaL_loadbuffer(L, src, strlen(src), "=lenmt2") == 0);
+          CHECK(lua_pcall(L, 0, 1, 0) == 0);
+          fn = *s2v(L->top.p - 1);
+          L->top.p--;
+        }
+        rt_intern(cell_of(&blk[5]), (rt_addr)(uintptr_t)"__len", 5);
+        CHECK(rt_settable(cell_of(&mt), cell_of(&blk[5]), cell_of(&fn), 30,
+                          -1, -1) == RT_OK);
+        luaD_checkstack(L, 2);
+        setobj2s(L, L->top.p, &lt);
+        L->top.p++;
+        setobj2s(L, L->top.p, &mt);
+        L->top.p++;
+        lua_setmetatable(L, -2);
+        L->top.p--;
+        CHECK(rt_stdcall_probe(cell_of(&blk[0]), cell_of(&lt), 1, 1) == 1);
+      }
+      /* an __index metatable does NOT shadow PRESENT fields (stock
+         lua_geti's fast path reads them raw) — the probe still hits */
+      {
+        TValue lt, mt, fn, resv;
+        CHECK(rt_newtable(cell_of(&lt), 1, 0) == RT_OK);
+        rt_intern(cell_of(&blk[5]), (rt_addr)(uintptr_t)"raw", 3);
+        rt_mkinteger(cell_of(&blk[6]), 1);
+        CHECK(rt_settable(cell_of(&lt), cell_of(&blk[6]),
+                          cell_of(&blk[5]), 30, -1, -1) == RT_OK);
+        CHECK(rt_newtable(cell_of(&mt), 0, 1) == RT_OK);
+        {
+          const char *src = "return function(_, _) return 'meta' end";
+          CHECK(luaL_loadbuffer(L, src, strlen(src), "=idxmt") == 0);
+          CHECK(lua_pcall(L, 0, 1, 0) == 0);
+          fn = *s2v(L->top.p - 1);
+          L->top.p--;
+        }
+        rt_intern(cell_of(&blk[5]), (rt_addr)(uintptr_t)"__index", 8);
+        CHECK(rt_settable(cell_of(&mt), cell_of(&blk[5]), cell_of(&fn), 30,
+                          -1, -1) == RT_OK);
+        luaD_checkstack(L, 2);
+        setobj2s(L, L->top.p, &lt);
+        L->top.p++;
+        setobj2s(L, L->top.p, &mt);
+        L->top.p++;
+        lua_setmetatable(L, -2);
+        L->top.p--;
+        /* callee/args contiguous: the probe derives dst as argcells-16 */
+        blk[0] = fconcat;
+        blk[1] = lt;
+        r = rt_stdcall_probe(cell_of(&blk[0]), cell_of(&blk[1]), 1, 1);
+        CHECK(r == 0 && ttisstring(&blk[0]) && /* blk[0] = dst: raw hit */
+              tsslen(tsvalue(&blk[0])) == 3 &&
+              memcmp(getstr(tsvalue(&blk[0])), "raw", 3) == 0);
+      }
+      rt_set_memlimit(0); /* restore unlimited, as U11c's block does */
+    }
+
     /* ---- U11c: the concat fold probe ---- */
     {
       TValue blk[4];

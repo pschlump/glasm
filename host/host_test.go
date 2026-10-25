@@ -561,6 +561,28 @@ end`, RunOptions{Deadline: 60 * time.Second})
 	}
 }
 
+// TestMemoryBudgetTconcat pins the table.concat stdcall arm against the
+// budget cap: a fold whose result would cross the limit must decline
+// (the two-sided pre-flight runs before any allocation or staging), so
+// the OOM surfaces from the protected tconcat — same text as the
+// concat spin, never a trap out of the probe.
+func TestMemoryBudgetTconcat(t *testing.T) {
+	noHostGC(t)
+	e := mustEngine(t, WithMemoryBudgetBytes(4<<20))
+	_, err := runScript(t, e, `
+local t = {}
+for i = 1, 200 do t[i] = string.rep("x", 100) end
+while true do t[#t + 1] = table.concat(t) end`,
+		RunOptions{Deadline: 60 * time.Second})
+	se, ok := err.(*ScriptError)
+	if !ok {
+		t.Fatalf("want ScriptError, got %T %v", err, err)
+	}
+	if !strings.Contains(se.Error(), "not enough memory") {
+		t.Fatalf("oom text: %q", se.Error())
+	}
+}
+
 // --- determinism ---------------------------------------------------------------
 
 func TestDeterminism(t *testing.T) {
