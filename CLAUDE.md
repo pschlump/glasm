@@ -37,7 +37,8 @@ go test ./testdiff/ -run TestWasmFullMatrix -v   # run a single differential gat
 # GLUA_WASM_CACHE_DIR=<dir> sweeps every wazero-family column over the on-disk
 # compile cache (honored in WazeroEngine.Run, RTWASM-style) — the full 13-gate
 # sweep ran green under it (0 diffs, note/gates-diskcache.log), and the wazero
-# columns stop re-JIT-ing the blob per case (matrix 66s).
+# columns stop re-JIT-ing the blob per case (matrix 66s vs 287s in-memory
+# control, 4.3×).
 
 # CLI differential runner (exit 1 on any diff). wasm = wasmtime oracle
 # host; wazero = the pure-Go production engine (same blob — ledger row 32);
