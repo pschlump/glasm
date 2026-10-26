@@ -5,7 +5,7 @@ go 1.27.0
 require (
 	github.com/bytecodealliance/wasmtime-go/v48 v48.0.0
 	github.com/ergochat/readline v0.1.3
-	github.com/pschlump/pluto v0.1.9
+	github.com/pschlump/pluto v0.1.10
 	github.com/tetratelabs/wazero v1.12.0
 )
 
