@@ -283,18 +283,32 @@ func NewEngine(opts ...Option) (*Engine, error)
 //                                        cache serves the blob JIT to a fresh
 //                                        process in ~6 ms instead of ~90 ms,
 //                                        and compiled script artifacts persist
-//                                        via pluto lru_disk_ts (dir/scripts,
-//                                        256 entries, keyed by SHA-1 + name +
-//                                        glasm version) — SCRIPT LOAD identity
+//                                        via the pluto two-tier lru_disk_ts
+//                                        (dir/scripts, 256 disk entries,
+//                                        keyed by SHA-1 + name + glasm
+//                                        version) — SCRIPT LOAD identity
 //                                        across daemon restarts. Default "" =
 //                                        in-memory. The daemon must own the dir
 //                                        (0o700: a poisoned machine-code entry
 //                                        is native code execution)
+//          WithCompileMemCache(int)     (bounds the script cache's in-memory
+//                                        tier, n ENTRIES — budget n × artifact
+//                                        size, single-digit KiB each. With a
+//                                        cache dir: the n most recent
+//                                        artifacts stay decoded in RAM (hit =
+//                                        free; demoted hit = one file read,
+//                                        never the frontend); default 256 =
+//                                        the disk capacity, 0 = pure disk.
+//                                        Without a dir: n > 0 bounds the
+//                                        otherwise unbounded in-memory script
+//                                        map; n <= 0 = the v1 default)
 
 func (e *Engine) Compile(source []byte, name string) (*Script, error)
-// parse.Parse → lua.Compile → luawasm.Compile, SHA1-keyed cache; exactly
-// one *Script pointer per (source, name) — the one-script law and
-// consumer-side per-script pools rely on pointer identity.
+// parse.Parse → lua.Compile → luawasm.Compile, keyed by (SHA-1, name).
+// One *Script pointer per source while it stays cache-resident; an
+// evicted source compiles/decodes to a fresh pointer — script identity
+// is (SHA1, name), which is also what the one-script law compares
+// (same identity ⇒ byte-identical module).
 
 type Script struct {
     SHA1 string    // hex SHA-1 of the source — the SCRIPT LOAD / EVALSHA identity
@@ -331,6 +345,9 @@ func (e *Engine) Run(ctx context.Context, s *Script, opt RunOptions) (Result, er
 // As-built v1 laws (differ from the original sketch):
 // • ONE SCRIPT PER VM IMAGE: proto indices are per-script (0-based) into
 //   a per-image registry, so a second script would collide (ErrScriptBound).
+//   "Same script" is (SHA1, name) identity, not pointer: a bounded cache
+//   tier may evict and re-mint a source's *Script, and same identity ⇒
+//   byte-identical module, so the fresh pointer runs on the bound image.
 //   Re-running the SAME script on a VM is the Redis-classic shared-globals
 //   mode. Engine.Run (fresh VM) sidesteps the law entirely.
 // • ONE WAZERO RUNTIME PER VM (not shared): module names resolve inside

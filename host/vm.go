@@ -417,12 +417,18 @@ func (vm *VM) Run(ctx context.Context, s *Script, opt RunOptions) (res Result, e
 	vm.curCtx = ctx
 	defer func() { vm.curCtx = nil }()
 
-	// one-script law: bind at first Run
+	// one-script law: bind at first Run. The comparison is identity —
+	// (SHA-1, name), not pointer: a bounded cache tier may evict and
+	// re-mint a source's *Script, and same identity ⇒ byte-identical
+	// module (compile determinism), so the re-minted pointer runs on the
+	// already-bound image. Only a genuinely different script is refused
+	// (proto indices are per-script, 0-based, into a per-image registry
+	// — a second script would collide).
 	if vm.script == nil {
 		if err := vm.bindScript(ctx, s); err != nil {
 			return Result{}, err
 		}
-	} else if vm.script != s {
+	} else if vm.script.identity() != s.identity() {
 		return Result{}, ErrScriptBound
 	}
 

@@ -7,6 +7,7 @@ package host
 import (
 	"context"
 	"crypto/sha1"
+	"encoding/binary"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -41,6 +42,7 @@ type options struct {
 	globalsProtection bool                       // Redis-classic globals lockdown per VM (rt_protect_globals)
 	vmCacheSize       int                        // warm-VM pool capacity (0 = the v1 fresh-VM-per-run posture)
 	compileCacheDir   string                     // on-disk compile cache root ("" = in-memory, the default)
+	scriptMemCache    int                        // script-cache memory-tier entries (<0 = unset → per-posture default)
 }
 
 // WithRuntimeBlob replaces the embedded production blob (a staged/test
@@ -99,10 +101,10 @@ func WithVMCacheSize(n int) Option {
 //     entry keys on the blob bytes + wazero version + CPU features, so
 //     upgrades and blob changes just become new entries.
 //   - compiled script artifacts (the Script.Wasm bytes) persist via a
-//     bounded pluto lru_disk_ts cache (path/scripts, 256 entries) —
-//     SCRIPT LOAD identity across daemon restarts, keyed by source
-//     SHA-1 + name + the glasm version (bump PackageVersion when the
-//     lowering changes, or old artifacts keep being served).
+//     bounded two-tier pluto lru_disk_ts cache (path/scripts, 256 disk
+//     entries) — SCRIPT LOAD identity across daemon restarts, keyed by
+//     source SHA-1 + name + the glasm version (bump PackageVersion when
+//     the lowering changes, or old artifacts keep being served).
 //
 // The daemon must own the directory (0o700; not world-writable — a
 // poisoned machine-code entry is native code execution; wazero's
@@ -111,12 +113,31 @@ func WithCompileCacheDir(path string) Option {
 	return func(o *options) { o.compileCacheDir = path }
 }
 
+// WithCompileMemCache bounds the script cache's in-memory tier to n
+// entries (entries, not bytes — budget n × artifact size; artifacts are
+// typically single-digit KiB):
+//
+//   - with WithCompileCacheDir set, the script cache is two-tier (pluto
+//     lru_disk_ts): the n most recently used artifacts stay decoded in
+//     RAM — a resident hit costs nothing, a demoted hit is one file
+//     read and decode, and the frontend never runs again for either.
+//     The default (any negative n) is 256, the disk capacity: every
+//     entry resident, the posture the old unbounded front map gave,
+//     now bounded. n = 0 is pure disk — zero retained artifacts, every
+//     hit re-reads its file (the minimum-RAM daemon posture).
+//   - without a cache dir, n > 0 bounds the in-memory script cache: the
+//     v1 default map is unbounded, so a daemon compiling unbounded
+//     distinct scripts retains every artifact for the process lifetime.
+//     n <= 0 keeps the unbounded map.
+func WithCompileMemCache(n int) Option {
+	return func(o *options) { o.scriptMemCache = n }
+}
+
 // Engine is the shared, process-wide scripting engine.
 type Engine struct {
 	opts options
 
 	mu       sync.Mutex
-	cache    map[string]*Script
 	hostFns  []registeredFn
 	hostVals []registeredVal
 	vms      int // live VMs (RegisterGlobal freezes once the first exists)
@@ -130,9 +151,16 @@ type Engine struct {
 	// default; WithCompileCacheDir swaps in the on-disk variant (compiled
 	// machine code persisted across processes).
 	wcache wazero.CompilationCache
-	// scriptDisk persists compiled script artifacts when the compile
-	// cache is on-disk (nil in the in-memory posture).
-	scriptDisk *lru_disk_ts.LruDisk[[]byte]
+	// the script cache, in exactly one of three postures (NewEngine):
+	//   cache       unbounded map — the v1 default (no dir, no mem bound)
+	//   scriptLru   bounded in-memory LRU (WithCompileMemCache, no dir)
+	//   scriptDisk  two-tier pluto lru_disk_ts (WithCompileCacheDir): the
+	//               memory tier holds the n most recent *Script POINTERS
+	//               (WithCompileMemCache — resident identity), the disk
+	//               tier every live entry across restarts
+	cache      map[string]*Script
+	scriptLru  *lru_ts.Lru[string, *Script]
+	scriptDisk *lru_disk_ts.LruDisk[*Script]
 	// leaseOnce/leaseRT pin the compiled blob in the shared engine's
 	// in-memory cache: compiled modules are refcounted and evicted when
 	// the last instance closes (engine.go DeleteCompiledModule), so
@@ -227,21 +255,31 @@ func luaValueLit(v Value) string {
 
 // NewEngine verifies the runtime blob and returns a ready engine.
 func NewEngine(opts ...Option) (*Engine, error) {
-	o := options{blob: prodBlob}
+	o := options{blob: prodBlob, scriptMemCache: -1}
 	for _, f := range opts {
 		f(&o)
 	}
 	if err := verifyBlob(o.blob); err != nil {
 		return nil, err
 	}
-	e := &Engine{opts: o, cache: map[string]*Script{}}
+	e := &Engine{opts: o}
 	if o.compileCacheDir != "" {
 		wc, err := wazero.NewCompilationCacheWithDir(o.compileCacheDir)
 		if err != nil {
 			return nil, fmt.Errorf("host: compile cache dir %s: %w", o.compileCacheDir, err)
 		}
 		e.wcache = wc
-		sd, err := lru_disk_ts.NewLruDisk[[]byte](256, filepath.Join(o.compileCacheDir, "scripts"), encBytes, decBytes)
+		// the memory tier's default is the disk capacity — every entry
+		// resident; 0 disables the tier entirely (pure disk)
+		mem := defaultScriptMemCache
+		if o.scriptMemCache >= 0 {
+			mem = o.scriptMemCache
+		}
+		var dopts []lru_disk_ts.Option
+		if mem > 0 {
+			dopts = append(dopts, lru_disk_ts.WithMemCapacity(mem))
+		}
+		sd, err := lru_disk_ts.NewLruDisk[*Script](scriptDiskCap, filepath.Join(o.compileCacheDir, "scripts"), encScript, decScript, dopts...)
 		if err != nil {
 			wc.Close(context.Background())
 			return nil, fmt.Errorf("host: script cache dir: %w", err)
@@ -249,6 +287,11 @@ func NewEngine(opts ...Option) (*Engine, error) {
 		e.scriptDisk = sd
 	} else {
 		e.wcache = wazero.NewCompilationCache()
+		if o.scriptMemCache > 0 {
+			e.scriptLru = lru_ts.NewLru[string, *Script](o.scriptMemCache)
+		} else {
+			e.cache = map[string]*Script{}
+		}
 	}
 	if o.vmCacheSize > 0 {
 		e.pool = lru_ts.NewLru[string, *VM](o.vmCacheSize)
@@ -257,10 +300,43 @@ func NewEngine(opts ...Option) (*Engine, error) {
 	return e, nil
 }
 
-// encBytes/decBytes are the identity codecs for the []byte
-// script-artifact disk cache.
-func encBytes(b []byte) []byte          { return b }
-func decBytes(b []byte) ([]byte, error) { return b, nil }
+// scriptDiskCap is the disk tier's entry bound (path/scripts), and
+// defaultScriptMemCache is the memory tier's default when the knob is
+// unset: the disk capacity — every entry resident, the posture the old
+// unbounded front map gave, now bounded.
+const (
+	scriptDiskCap         = 256
+	defaultScriptMemCache = scriptDiskCap
+)
+
+// encScript/decScript carry *Script through the two-tier disk cache.
+// The payload is self-identifying — chunk name + SHA-1 + Wasm — so a
+// decode is a COMPLETE Script: Compile must never fill fields on a
+// value the cache hands out (Get promotes the decoded pointer into the
+// memory tier under its own lock; a post-Get write would race every
+// later reader of the same pointer). A legacy raw-Wasm payload decodes
+// as garbage lengths and fails — the cache treats that as a miss and
+// self-heals (delete; the recompile's Put overwrites).
+func encScript(s *Script) []byte {
+	b := make([]byte, 8, 8+len(s.name)+len(s.SHA1)+len(s.Wasm))
+	binary.LittleEndian.PutUint32(b[:4], uint32(len(s.name)))
+	binary.LittleEndian.PutUint32(b[4:], uint32(len(s.SHA1)))
+	b = append(b, s.name...)
+	b = append(b, s.SHA1...)
+	return append(b, s.Wasm...)
+}
+
+func decScript(b []byte) (*Script, error) {
+	if len(b) < 8 {
+		return nil, errors.New("host: script artifact: short payload")
+	}
+	nl := int(binary.LittleEndian.Uint32(b[:4]))
+	sl := int(binary.LittleEndian.Uint32(b[4:8]))
+	if nl < 0 || sl < 0 || 8+nl+sl > len(b) {
+		return nil, errors.New("host: script artifact: bad payload lengths")
+	}
+	return &Script{name: string(b[8 : 8+nl]), SHA1: string(b[8+nl : 8+nl+sl]), Wasm: b[8+nl+sl:]}, nil
+}
 
 // versionSalt namespaces the disk artifact key by the glasm version —
 // bump PackageVersion when the lowering changes (or stale artifacts
@@ -304,9 +380,23 @@ type Script struct {
 // position prefixes use it).
 func (s *Script) Name() string { return s.name }
 
+// identity is the script's cache/pool key and the one-script law's
+// comparison: (SHA-1, chunk name). Same identity ⇒ byte-identical Wasm
+// (compile determinism), so a VM bound to one pointer of the identity
+// runs any other — a bounded cache tier evicts and re-mints pointers.
+func (s *Script) identity() string { return s.SHA1 + "\x00" + s.name }
+
 // Compile parses and lowers source to a wasm module, caching by
 // (SHA-1, name). Compile errors (syntax, v1-unsupported constructs such
 // as coroutines) return the frontend's message verbatim.
+//
+// Identity law: a cache-resident source is served as ONE *Script
+// pointer (the tiers hold pointers, so a hit is the resident pointer).
+// A source evicted from every tier compiles — or, on disk, decodes —
+// to a FRESH pointer; consumers key scripts by (SHA-1, name), which is
+// also the one-script law's identity (VM.Run): same identity ⇒
+// byte-identical module, so any pointer of the identity runs on any
+// image the identity already bound.
 func (e *Engine) Compile(source []byte, name string) (*Script, error) {
 	if name == "" {
 		name = "=script"
@@ -314,29 +404,29 @@ func (e *Engine) Compile(source []byte, name string) (*Script, error) {
 	sum := sha1.Sum(source)
 	sha := hex.EncodeToString(sum[:])
 	key := sha + "\x00" + name
-	e.mu.Lock()
-	if s, ok := e.cache[key]; ok {
-		e.mu.Unlock()
-		return s, nil
-	}
-	e.mu.Unlock()
-
-	// on-disk artifact layer (WithCompileCacheDir): a hit skips the
-	// frontend entirely; the disk key carries the glasm version so a
-	// lowering change can't keep serving stale artifacts
+	// the disk key carries the glasm version so a lowering change can't
+	// keep serving stale artifacts
 	diskKey := key + "\x00" + versionSalt()
+
 	if e.scriptDisk != nil {
-		if bin, ok := e.scriptDisk.Get(diskKey); ok {
-			s := &Script{SHA1: sha, Wasm: bin, name: name}
-			e.mu.Lock()
-			if prev, ok := e.cache[key]; ok {
-				e.mu.Unlock()
-				return prev, nil
-			}
-			e.cache[key] = s
+		// a hit skips the frontend entirely — resident hit or one file
+		// read + decode. A payload that disagrees with the key (SHA-1,
+		// name both ride the payload) is corrupt: fall through and the
+		// Put below overwrites it.
+		if s, ok := e.scriptDisk.Get(diskKey); ok && s.SHA1 == sha && s.name == name {
+			return s, nil
+		}
+	} else if e.scriptLru != nil {
+		if s, ok := e.scriptLru.Get(key); ok {
+			return s, nil
+		}
+	} else {
+		e.mu.Lock()
+		if s, ok := e.cache[key]; ok {
 			e.mu.Unlock()
 			return s, nil
 		}
+		e.mu.Unlock()
 	}
 
 	// the same three-stage chain as testdiff.CompileSource, minus the
@@ -354,23 +444,26 @@ func (e *Engine) Compile(source []byte, name string) (*Script, error) {
 	if err != nil {
 		return nil, err
 	}
+	s := &Script{SHA1: sha, Wasm: bin, name: name}
 	if e.scriptDisk != nil {
 		// a failed cache write must not fail Compile — the artifact is
 		// correct either way, just not persisted
-		_ = e.scriptDisk.Put(diskKey, bin)
-	}
-	s := &Script{SHA1: sha, Wasm: bin, name: name}
-	e.mu.Lock()
-	// A concurrent Compile of the same source may have won the race:
-	// pointer identity per (SHA-1, name) is the invariant the VM
-	// one-script law (ErrScriptBound) and consumer-side per-script pools
-	// rely on — never hand out two pointers for one source.
-	if prev, ok := e.cache[key]; ok {
+		_ = e.scriptDisk.Put(diskKey, s)
+	} else if e.scriptLru != nil {
+		e.scriptLru.Put(key, s)
+	} else {
+		e.mu.Lock()
+		// A concurrent Compile of the same source may have won the race:
+		// pointer identity per (SHA-1, name) is the invariant the VM
+		// one-script law (ErrScriptBound) and consumer-side per-script
+		// pools rely on — never hand out two pointers for one source.
+		if prev, ok := e.cache[key]; ok {
+			e.mu.Unlock()
+			return prev, nil
+		}
+		e.cache[key] = s
 		e.mu.Unlock()
-		return prev, nil
 	}
-	e.cache[key] = s
-	e.mu.Unlock()
 	return s, nil
 }
 
@@ -382,7 +475,7 @@ func (e *Engine) Run(ctx context.Context, s *Script, opt RunOptions) (Result, er
 	if s == nil {
 		return Result{}, errors.New("host: nil script")
 	}
-	key := s.SHA1 + "\x00" + s.name
+	key := s.identity()
 	if e.pool != nil {
 		// Atomic take (Get alone re-marks recency but LEAVES the entry —
 		// two concurrent Runs would hold one image, and the recycle path
