@@ -63,11 +63,6 @@ func NewRunEngine(name string, precompiled []byte) Engine {
 	if strings.EqualFold(os.Getenv("GLUA_WASM_ENGINE"), "wazero") {
 		e := NewWazeroEngine(name)
 		e.Precompiled = precompiled
-		// GLUA_WASM_CACHE_DIR: the on-disk compile-cache posture for the
-		// standalone runners (glua's -cachedir is the same surface as a
-		// flag) — a fresh process mmaps the blob machine code instead of
-		// re-JIT-ing it.
-		e.CacheDir = os.Getenv("GLUA_WASM_CACHE_DIR")
 		return e
 	}
 	e := NewWasmEngine(name)
@@ -108,7 +103,10 @@ type WazeroEngine struct {
 	// CacheDir: persist the blob's compiled machine code under this dir
 	// (the WithCompileCacheDir posture — perfcmp's wazero-disk leg): a
 	// fresh process mmaps it in ~6 ms instead of paying the ~75 ms JIT.
-	// "" (the default) compiles in-memory per engine.
+	// "" (the default) compiles in-memory per engine, unless
+	// GLUA_WASM_CACHE_DIR is set — honored in Run like RTWASM, so the
+	// gate corpora run the disk posture with one env var; the field wins
+	// when both are given.
 	CacheDir string
 }
 
@@ -168,11 +166,17 @@ func (e *WazeroEngine) Run(c Case) (log []string) {
 		WithCoreFeatures(api.CoreFeaturesV2 | experimental.CoreFeaturesExceptionHandling)
 	// CacheDir: the engine's machine code persists under the dir, so the
 	// next process (or the next engine over the same dir) loads it
-	// instead of re-JIT-ing the 659-function blob.
+	// instead of re-JIT-ing the 659-function blob. The env is the same
+	// posture opt-in for every engine instance — the corpus gates set it
+	// to sweep the disk posture over the corpora.
 	var wcache wazero.CompilationCache
-	if e.CacheDir != "" {
+	cacheDir := e.CacheDir
+	if cacheDir == "" {
+		cacheDir = os.Getenv("GLUA_WASM_CACHE_DIR")
+	}
+	if cacheDir != "" {
 		var err error
-		wcache, err = wazero.NewCompilationCacheWithDir(e.CacheDir)
+		wcache, err = wazero.NewCompilationCacheWithDir(cacheDir)
 		if err != nil {
 			return []string{"ENGINE-ERROR\tcompile cache: " + err.Error()}
 		}
