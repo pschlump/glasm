@@ -9,6 +9,13 @@
 //	interp   the glasm interpreter, fresh LState per run
 //	wazero   the wasm backend on wazero over host/ — the production
 //	         posture: cold = e.Run (fresh VM), warm = pooled VM rerun
+//	wazero-disk
+//	         the wazero leg with WithCompileCacheDir — the
+//	         daemon-restart posture. The children share one compile-cache
+//	         dir; each script is populated once (untimed) before its cold
+//	         reps, so every timed cold process is the warm-hit shape:
+//	         blob machine code mmap'd from disk, script artifact from the
+//	         lru_disk_ts layer. -cachedir reuses a dir across runs.
 //	wasmtime the wasm backend on wasmtime (the differential oracle host;
 //	         shared Engine, fresh Store per run)
 //
@@ -92,6 +99,7 @@ var (
 	luaBin     = flag.String("lua", "note/native-lua55/lua", "native C Lua 5.5.1 binary (runtime/build-native55.sh)")
 	scriptsDir = flag.String("scripts", "cmd/luabench/scripts", "bench script dir (repo-root relative)")
 	warmDrv    = flag.String("warmdriver", "cmd/perfcmp/warm55.lua", "native warm rerun driver")
+	cacheDir   = flag.String("cachedir", "", "wazero-disk leg: WithCompileCacheDir path (default: a fresh temp dir for this invocation)")
 )
 
 func must(err error) {
@@ -149,9 +157,10 @@ func resultString(res host.Result) string {
 
 // childWazero: the production host package. pooled=false → e.Run (fresh
 // VM per run, the cold posture); pooled=true → one pooled VM bound to
-// the script (the warm posture).
-func childWazero(src []byte, name string, warmup, runs int, pooled bool) {
-	e, err := host.NewEngine()
+// the script (the warm posture). opts carry engine options — the
+// wazero-disk leg passes WithCompileCacheDir.
+func childWazero(src []byte, name string, warmup, runs int, pooled bool, opts ...host.Option) {
+	e, err := host.NewEngine(opts...)
 	must(err)
 	s, err := e.Compile(src, name)
 	must(err)
@@ -239,6 +248,13 @@ func childMain() {
 		childInterp(src, warmup, runs)
 	case "wazero":
 		childWazero(src, *nameFlag, warmup, runs, *posture == "warm")
+	case "wazero-disk":
+		// an empty dir silently degrades to the in-memory posture — fail
+		// loudly instead of measuring the wrong shape
+		if *cacheDir == "" {
+			must(fmt.Errorf("wazero-disk child requires -cachedir"))
+		}
+		childWazero(src, *nameFlag, warmup, runs, *posture == "warm", host.WithCompileCacheDir(*cacheDir))
 	case "wasmtime":
 		childWasmtime(src, *nameFlag, warmup, runs)
 	default:
@@ -267,7 +283,7 @@ type row struct {
 	legs []leg
 }
 
-var engineOrder = []string{"clua", "interp", "wazero", "wasmtime"}
+var engineOrder = []string{"clua", "interp", "wazero", "wazero-disk", "wasmtime"}
 
 var rssRe = regexp.MustCompile(`(\d+)\s+maximum resident set size`)
 
@@ -358,13 +374,25 @@ func fmtRSS(b int64) string {
 	}
 }
 
-// runLegs measures every engine on one prelude'd script file.
-func runLegs(sc scriptDef, tmp, self string) []leg {
+// runLegs measures every engine on one prelude'd script file. cacheDir
+// is the wazero-disk leg's shared compile-cache dir.
+func runLegs(sc scriptDef, tmp, self, cacheDir string) []leg {
 	byName := map[string]*leg{}
 	legs := make([]leg, len(engineOrder))
 	for i, e := range engineOrder {
 		legs[i].engine = e
 		byName[e] = &legs[i]
+	}
+
+	// childArgv builds a child invocation; the wazero-disk child needs
+	// its cache dir on the command line.
+	childArgv := func(eng, posture string, runs int) []string {
+		argv := []string{self,
+			"-child=" + eng, "-posture=" + posture, "-src=" + tmp, "-name=" + sc.name, "-runs=" + strconv.Itoa(runs)}
+		if eng == "wazero-disk" {
+			argv = append(argv, "-cachedir="+cacheDir)
+		}
+		return argv
 	}
 
 	// clua cold: fresh native process per rep (its only CLI posture).
@@ -402,13 +430,20 @@ func runLegs(sc scriptDef, tmp, self string) []leg {
 
 	// Go engines: cold = fresh child process per rep (exactly one run);
 	// warm = one child, in-process loop.
-	for _, eng := range []string{"interp", "wazero", "wasmtime"} {
+	for _, eng := range []string{"interp", "wazero", "wazero-disk", "wasmtime"} {
+		if eng == "wazero-disk" {
+			// Populate the shared dir once, untimed, so every timed cold
+			// rep is the warm-hit shape — the daemon-restart scenario:
+			// blob machine code + this script's artifact already on disk
+			// from a previous process. Without this, rep 1 pays the
+			// ~90 ms populate and the median measures a mix.
+			runTimed(childArgv(eng, "cold", 1))
+		}
 		var walls []time.Duration
 		var rsses []int64
 		var lastRet, lastGomem string
 		for r := 0; r < sc.coldReps; r++ {
-			w, rss, out := runTimed([]string{self,
-				"-child=" + eng, "-posture=cold", "-src=" + tmp, "-name=" + sc.name, "-runs=1"})
+			w, rss, out := runTimed(childArgv(eng, "cold", 1))
 			walls = append(walls, w)
 			rsses = append(rsses, rss)
 			_, lastRet, lastGomem = parseChildOut(out)
@@ -419,8 +454,7 @@ func runLegs(sc scriptDef, tmp, self string) []leg {
 		if eng == "wasmtime" && warmN > wasmtimeWarmCap {
 			warmN = wasmtimeWarmCap
 		}
-		_, rss, out := runTimed([]string{self,
-			"-child=" + eng, "-posture=warm", "-src=" + tmp, "-name=" + sc.name, "-runs=" + strconv.Itoa(warmN)})
+		_, rss, out := runTimed(childArgv(eng, "warm", warmN))
 		med, ret, gomem := parseChildOut(out)
 		byName[eng].warm = cell{wall: med, rss: rss, ret: ret, gomem: gomem}
 	}
@@ -446,7 +480,7 @@ func emitMarkdown(rows []row) {
 	}
 	table := func(title string, val func(r row, l *leg) string) {
 		fmt.Printf("\n## %s\n\n", title)
-		fmt.Printf("| script | clua | interp | wazero | wasmtime |\n|---|---|---|---|---|\n")
+		fmt.Printf("| script | clua | interp | wazero | wazero-disk | wasmtime |\n|---|---|---|---|---|---|\n")
 		for _, r := range rows {
 			fmt.Printf("| %s |", strings.TrimSuffix(r.name, ".lua"))
 			for _, e := range engineOrder {
@@ -488,6 +522,16 @@ func main() {
 	must(err)
 	defer os.RemoveAll(tmpdir)
 
+	// the wazero-disk leg's shared compile-cache dir: a fresh one per
+	// invocation unless -cachedir pins one (reusing a dir across runs is
+	// the steady-state daemon shape — the populate runs then hit too)
+	diskDir := *cacheDir
+	if diskDir == "" {
+		diskDir, err = os.MkdirTemp("", "perfcmp-diskcache")
+		must(err)
+		defer os.RemoveAll(diskDir)
+	}
+
 	var rows []row
 	for _, sc := range scripts {
 		stem := strings.TrimSuffix(sc.name, ".lua")
@@ -499,14 +543,14 @@ func main() {
 		tmp := filepath.Join(tmpdir, sc.name)
 		must(os.WriteFile(tmp, append([]byte(prelude), src...), 0o644))
 
-		legs := runLegs(sc, tmp, self)
+		legs := runLegs(sc, tmp, self, diskDir)
 		rows = append(rows, row{name: sc.name, legs: legs})
 
 		fmt.Printf("\n=== %s (%d bytes + prelude)\n", sc.name, len(src))
-		fmt.Printf("  %-8s %8s %9s   %8s %9s\n", "engine", "cold", "maxRSS", "warm", "maxRSS")
+		fmt.Printf("  %-12s %8s %9s   %8s %9s\n", "engine", "cold", "maxRSS", "warm", "maxRSS")
 		rets := map[string]string{}
 		for _, lg := range legs {
-			fmt.Printf("  %-8s %8s %9s   %8s %9s",
+			fmt.Printf("  %-12s %8s %9s   %8s %9s",
 				lg.engine, fmtDur(lg.cold.wall), fmtRSS(lg.cold.rss), fmtDur(lg.warm.wall), fmtRSS(lg.warm.rss))
 			if lg.warm.heap != "" {
 				fmt.Printf("  lua-heap %sKB", lg.warm.heap)
@@ -519,7 +563,7 @@ func main() {
 			rets[lg.engine] = lg.warm.ret
 		}
 		ref := normRet(rets["clua"])
-		for _, e := range []string{"interp", "wazero", "wasmtime"} {
+		for _, e := range []string{"interp", "wazero", "wazero-disk", "wasmtime"} {
 			if normRet(rets[e]) != ref {
 				fmt.Printf("  RET MISMATCH %s: %q vs clua %q\n", e, rets[e], rets["clua"])
 			}

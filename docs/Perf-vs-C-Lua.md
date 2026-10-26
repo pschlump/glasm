@@ -291,3 +291,47 @@ battery), `TestU1Gate`.
    residue after U9 direct dispatch) matches U9c's residue analysis;
    `h_nsieve`/`h_tablechurn` remain the rt-table-codegen lanes from
    note/u7-perf.md.
+
+## Update — the wazero-disk leg (run 3, `note/perfcmp-run3-diskcache.txt`)
+
+`cmd/perfcmp` gained a **wazero-disk** engine: the production `wazero`
+leg with `host.WithCompileCacheDir` — the daemon-restart posture. The
+children share one compile-cache dir; each script is populated once
+(untimed) before its cold reps, so every timed cold process is the
+warm-hit shape: blob machine code mmap'd from disk, script artifact from
+the `lru_disk_ts` layer. Same session as run 2's rows (2026-10-25,
+glasm v1.3.0 tree at `dbd98d2`).
+
+Cold wall (one-shot process, median):
+
+| script | clua | interp | wazero | **wazero-disk** | wasmtime |
+|---|---|---|---|---|---|
+| h_tiny | 4.58ms | 6.91ms | 90.91ms | **15.82ms** | 43.64ms |
+| h_str | 4.68ms | 6.73ms | 92.88ms | **15.70ms** | 46.59ms |
+| h_strlong | 5.70ms | 8.93ms | 97.27ms | **16.86ms** | 48.98ms |
+| h_numloop | 13.71ms | 135.35ms | 134.13ms | **57.18ms** | 58.82ms |
+| h_tablechurn | 9.44ms | 18.33ms | 103.46ms | **25.84ms** | 50.61ms |
+| h_concat | 5.75ms | 7.97ms | 94.48ms | **17.48ms** | 46.37ms |
+| h_fib | 25.37ms | 162.08ms | 228.18ms | **152.05ms** | 115.58ms |
+| h_nsieve | 11.33ms | 69.28ms | 134.91ms | **58.59ms** | 51.09ms |
+| h_callret | 7.26ms | 28.30ms | 114.25ms | **37.70ms** | 50.86ms |
+| h_tco | 6.57ms | 18.43ms | 100.19ms | **25.13ms** | 47.28ms |
+
+Cold maxRSS: **wazero-disk saves ~18 MB on every lane** (35.2 MB vs
+53.0 MB on `h_tiny`) — the mmap'd machine code is not heap, where the
+JIT-built engine keeps it in memory. The warm rows are unchanged vs the
+plain wazero leg (9.5 µs `h_tiny`; no disk tax on the steady state).
+
+Reading:
+
+- The ~75 ms one-shot JIT penalty is gone: light lanes drop to
+  **15.7–17.5 ms**, i.e. process floor (~7 ms, see interp cold 6.7 ms)
+  + ~6 ms cache load + script run — within **3–4× of native C** cold,
+  and **below wasmtime** (43.6 ms) on every non-compute lane.
+- Compute lanes now measure wazero execution, not startup:
+  `h_numloop` 57 ms ≈ wasmtime's 59 ms; `h_fib` 152 ms is the U9c
+  per-call residue (interp 162 ms), unchanged by the cache.
+- The open item "wazero cold ~87 ms is dominated by engine init" is
+  closed by the on-disk option for processes that can carry a cache dir
+  (the daemon always can; the CLI can default to one under the user's
+  cache home). The in-memory default remains correct for hermetic use.
