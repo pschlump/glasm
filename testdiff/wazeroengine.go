@@ -63,6 +63,11 @@ func NewRunEngine(name string, precompiled []byte) Engine {
 	if strings.EqualFold(os.Getenv("GLUA_WASM_ENGINE"), "wazero") {
 		e := NewWazeroEngine(name)
 		e.Precompiled = precompiled
+		// GLUA_WASM_CACHE_DIR: the on-disk compile-cache posture for the
+		// standalone runners (glua's -cachedir is the same surface as a
+		// flag) — a fresh process mmaps the blob machine code instead of
+		// re-JIT-ing it.
+		e.CacheDir = os.Getenv("GLUA_WASM_CACHE_DIR")
 		return e
 	}
 	e := NewWasmEngine(name)
@@ -100,6 +105,11 @@ type WazeroEngine struct {
 	// Deadline: host timeout — the watchdog writes the rt control-block
 	// flag and the guest's back-edge polls raise the error (M6d D4).
 	Deadline time.Duration
+	// CacheDir: persist the blob's compiled machine code under this dir
+	// (the WithCompileCacheDir posture — perfcmp's wazero-disk leg): a
+	// fresh process mmaps it in ~6 ms instead of paying the ~75 ms JIT.
+	// "" (the default) compiles in-memory per engine.
+	CacheDir string
 }
 
 // NewWazeroEngine returns a wazero-hosted wasm-backend engine.
@@ -156,6 +166,22 @@ func (e *WazeroEngine) Run(c Case) (log []string) {
 	ctx := context.Background()
 	rc := wazero.NewRuntimeConfig().
 		WithCoreFeatures(api.CoreFeaturesV2 | experimental.CoreFeaturesExceptionHandling)
+	// CacheDir: the engine's machine code persists under the dir, so the
+	// next process (or the next engine over the same dir) loads it
+	// instead of re-JIT-ing the 659-function blob.
+	var wcache wazero.CompilationCache
+	if e.CacheDir != "" {
+		var err error
+		wcache, err = wazero.NewCompilationCacheWithDir(e.CacheDir)
+		if err != nil {
+			return []string{"ENGINE-ERROR\tcompile cache: " + err.Error()}
+		}
+		rc = rc.WithCompilationCache(wcache)
+		// registered BEFORE r.Close's defer, so it runs AFTER it (defers
+		// are LIFO): the runtime and its instances must be closed before
+		// the cache frees the machine code they still point at
+		defer wcache.Close(ctx)
+	}
 	r := wazero.NewRuntimeWithConfig(ctx, rc)
 	defer r.Close(ctx)
 

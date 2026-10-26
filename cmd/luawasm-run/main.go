@@ -1,7 +1,10 @@
 // Command luawasm-run executes a module saved by cmd/luawasmc against
 // the C-Lua rt_* runtime (embedded lua55_rt.wasm, ABI v4) on wasmtime —
 // or on the pure-Go wazero production engine when GLUA_WASM_ENGINE=wazero
-// (ledger row 32: one blob, two hosts).
+// (ledger row 32: one blob, two hosts). GLUA_WASM_CACHE_DIR=dir switches
+// the wazero engine to the on-disk compile cache (the WithCompileCacheDir
+// posture: a fresh process mmaps the blob's machine code in ~6 ms instead
+// of re-JIT-ing it; glua's -cachedir is the same surface as a flag).
 //
 //	luawasm-run [-v] artifact.wasm [args...]
 //

@@ -65,6 +65,9 @@ go run ./cmd/luawasmc [-o out.wasm] script.lua
 go run ./cmd/luawasm-run [-v] artifact.wasm [args...]   # GLUA_WASM_ENGINE=wazero selects the production engine
 cmd/glua/glua -w out.wasm script.lua   # compile (or -e 'stat')
 cmd/glua/glua -W artifact.wasm         # run precompiled (also auto-detected by \x00asm magic)
+cmd/glua/glua -cd dir -W artifact.wasm # wazero engine (-W, GLUA_WASM_ENGINE=wazero): on-disk compile cache —
+                                       # blob JIT ~90ms becomes a ~6ms mmap after the first run
+                                       # (GLUA_WASM_CACHE_DIR=dir is the env form; luawasm-run takes the env)
 
 # C runtime (needs wasi-sdk; default WASI_SDK=$HOME/wasi-sdk-dl/wasi-sdk-34.0-arm64-macos)
 runtime/build55.sh          # rebuild lua55_sjlj.wasm (5.5.1 oracle, U0) + lua55_rt.wasm (ABI v4, U2d) + lua55_prod.wasm (zero-wasi prod flavor, U6d — copies into testdiff/ and host/)

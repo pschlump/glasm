@@ -20,6 +20,7 @@ func mainAux() int {
 	var opt_e, opt_l, opt_p, opt_w string
 	var opt_i, opt_v, opt_dt, opt_dc, opt_W bool
 	var opt_m int
+	var opt_cd string
 	// Every option takes its single-letter and a full-word spelling (-v,
 	// -version); both names bind the same variable, and Go's flag package
 	// already accepts -name and --name alike.
@@ -43,6 +44,8 @@ func mainAux() int {
 	flag.BoolVar(&opt_dc, "dumpcode", false, "")
 	flag.BoolVar(&opt_W, "W", false, "")
 	flag.BoolVar(&opt_W, "runwasm", false, "")
+	flag.StringVar(&opt_cd, "cd", "", "")
+	flag.StringVar(&opt_cd, "cachedir", "", "")
 	flag.Usage = func() {
 		fmt.Println(`Usage: glua [options] [script [args]].
 Available options are:
@@ -55,6 +58,9 @@ Available options are:
   -p file,  -cpuprofile file   write cpu profiles to the file
   -w file,  -wasm file         compile 'script' (or -e stat) to a wasm module, write to 'file' and exit
   -W,       -runwasm           run 'script' as a precompiled wasm module (cmd/luawasmc or -w output)
+  -cd dir,  -cachedir dir      wazero engine only (-W, GLUA_WASM_ENGINE=wazero): on-disk compile
+                               cache under 'dir' — the blob JIT (~90ms) becomes a ~6ms mmap after
+                               the first run (the daemon-restart posture; perfcmp's wazero-disk leg)
   -v,       -version           show version information (git tag/commit, build date)`)
 	}
 	flag.Parse()
@@ -135,7 +141,7 @@ Available options are:
 				return 1
 			}
 			if opt_W || (len(bin) >= 4 && string(bin[:4]) == "\x00asm") {
-				return runWasm(bin, script, flag.Args()[1:])
+				return runWasm(bin, script, flag.Args()[1:], opt_cd)
 			}
 			// not a wasm module after all — run it as Lua source below
 		}
@@ -197,13 +203,23 @@ Available options are:
 // PRINT/STDOUT events go to stdout, errors to stderr. The engine is
 // wasmtime (the oracle) or, when GLUA_WASM_ENGINE=wazero, the pure-Go
 // production engine (ledger row 32) — the _cli-tests WAZERO=1 leg.
-func runWasm(bin []byte, path string, args []string) int {
+// cacheDir (-cachedir / GLUA_WASM_CACHE_DIR) is the wazero engine's
+// on-disk compile-cache posture; the wasmtime oracle host has no
+// equivalent, so there it draws a note instead of silently ignoring.
+func runWasm(bin []byte, path string, args []string, cacheDir string) int {
 	dir, err := os.Getwd()
 	if err != nil {
 		fmt.Println(err.Error())
 		return 1
 	}
 	e := testdiff.NewRunEngine("run", bin)
+	if cacheDir != "" {
+		if we, ok := e.(*testdiff.WazeroEngine); ok {
+			we.CacheDir = cacheDir
+		} else {
+			fmt.Fprintln(os.Stderr, "glua: -cachedir applies to the wazero engine (GLUA_WASM_ENGINE=wazero) — ignored")
+		}
+	}
 	log := e.Run(testdiff.Case{
 		Name:   path, // arg[0] / chunkname: the path as typed, like the source path
 		Dir:    dir,
