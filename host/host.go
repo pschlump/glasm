@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -18,6 +19,7 @@ import (
 	"github.com/pschlump/glasm"
 	"github.com/pschlump/glasm/luawasm"
 	"github.com/pschlump/glasm/parse"
+	"github.com/pschlump/pluto/lru_disk_ts"
 	"github.com/pschlump/pluto/lru_ts"
 	"github.com/tetratelabs/wazero"
 )
@@ -38,6 +40,7 @@ type options struct {
 	eventSink         func(vm *VM, args []Value) // EVT_PRINT observer (already wire-decoded)
 	globalsProtection bool                       // Redis-classic globals lockdown per VM (rt_protect_globals)
 	vmCacheSize       int                        // warm-VM pool capacity (0 = the v1 fresh-VM-per-run posture)
+	compileCacheDir   string                     // on-disk compile cache root ("" = in-memory, the default)
 }
 
 // WithRuntimeBlob replaces the embedded production blob (a staged/test
@@ -87,6 +90,27 @@ func WithVMCacheSize(n int) Option {
 	return func(o *options) { o.vmCacheSize = n }
 }
 
+// WithCompileCacheDir switches the engine's compile caches from
+// in-memory (the default) to on-disk under path:
+//
+//   - the wazero compilation cache persists the blob's compiled machine
+//     code — a fresh process loads it in ~3 ms instead of paying the
+//     one-time ~75-90 ms JIT (note/wazero-performance-note-001.md); the
+//     entry keys on the blob bytes + wazero version + CPU features, so
+//     upgrades and blob changes just become new entries.
+//   - compiled script artifacts (the Script.Wasm bytes) persist via a
+//     bounded pluto lru_disk_ts cache (path/scripts, 256 entries) —
+//     SCRIPT LOAD identity across daemon restarts, keyed by source
+//     SHA-1 + name + the glasm version (bump PackageVersion when the
+//     lowering changes, or old artifacts keep being served).
+//
+// The daemon must own the directory (0o700; not world-writable — a
+// poisoned machine-code entry is native code execution; wazero's
+// contract puts that safeguard on the embedder).
+func WithCompileCacheDir(path string) Option {
+	return func(o *options) { o.compileCacheDir = path }
+}
+
 // Engine is the shared, process-wide scripting engine.
 type Engine struct {
 	opts options
@@ -102,8 +126,13 @@ type Engine struct {
 	// JIT-compiles once per Engine instead of once per VM (~75 ms → ~2 ms,
 	// note/wazero-performance-note-001.md). Engine sharing does NOT share
 	// module namespaces — import resolution goes through each runtime's
-	// own store, so the per-VM isolation model is untouched.
+	// own store, so the per-VM isolation model is untouched. In-memory by
+	// default; WithCompileCacheDir swaps in the on-disk variant (compiled
+	// machine code persisted across processes).
 	wcache wazero.CompilationCache
+	// scriptDisk persists compiled script artifacts when the compile
+	// cache is on-disk (nil in the in-memory posture).
+	scriptDisk *lru_disk_ts.LruDisk[[]byte]
 	// leaseOnce/leaseRT pin the compiled blob in the shared engine's
 	// in-memory cache: compiled modules are refcounted and evicted when
 	// the last instance closes (engine.go DeleteCompiledModule), so
@@ -205,13 +234,38 @@ func NewEngine(opts ...Option) (*Engine, error) {
 	if err := verifyBlob(o.blob); err != nil {
 		return nil, err
 	}
-	e := &Engine{opts: o, cache: map[string]*Script{}, wcache: wazero.NewCompilationCache()}
+	e := &Engine{opts: o, cache: map[string]*Script{}}
+	if o.compileCacheDir != "" {
+		wc, err := wazero.NewCompilationCacheWithDir(o.compileCacheDir)
+		if err != nil {
+			return nil, fmt.Errorf("host: compile cache dir %s: %w", o.compileCacheDir, err)
+		}
+		e.wcache = wc
+		sd, err := lru_disk_ts.NewLruDisk[[]byte](256, filepath.Join(o.compileCacheDir, "scripts"), encBytes, decBytes)
+		if err != nil {
+			wc.Close(context.Background())
+			return nil, fmt.Errorf("host: script cache dir: %w", err)
+		}
+		e.scriptDisk = sd
+	} else {
+		e.wcache = wazero.NewCompilationCache()
+	}
 	if o.vmCacheSize > 0 {
 		e.pool = lru_ts.NewLru[string, *VM](o.vmCacheSize)
 		e.poolCap = o.vmCacheSize
 	}
 	return e, nil
 }
+
+// encBytes/decBytes are the identity codecs for the []byte
+// script-artifact disk cache.
+func encBytes(b []byte) []byte          { return b }
+func decBytes(b []byte) ([]byte, error) { return b, nil }
+
+// versionSalt namespaces the disk artifact key by the glasm version —
+// bump PackageVersion when the lowering changes (or stale artifacts
+// keep being served).
+func versionSalt() string { return lua.PackageVersion }
 
 // RegisterGlobal installs <table>.<name> as a Lua function backed by fn
 // (e.g. RegisterGlobal("redis", "call", ...)). Must be called before the
@@ -267,6 +321,24 @@ func (e *Engine) Compile(source []byte, name string) (*Script, error) {
 	}
 	e.mu.Unlock()
 
+	// on-disk artifact layer (WithCompileCacheDir): a hit skips the
+	// frontend entirely; the disk key carries the glasm version so a
+	// lowering change can't keep serving stale artifacts
+	diskKey := key + "\x00" + versionSalt()
+	if e.scriptDisk != nil {
+		if bin, ok := e.scriptDisk.Get(diskKey); ok {
+			s := &Script{SHA1: sha, Wasm: bin, name: name}
+			e.mu.Lock()
+			if prev, ok := e.cache[key]; ok {
+				e.mu.Unlock()
+				return prev, nil
+			}
+			e.cache[key] = s
+			e.mu.Unlock()
+			return s, nil
+		}
+	}
+
 	// the same three-stage chain as testdiff.CompileSource, minus the
 	// testdiff import (that package hosts the wasmtime oracle engines —
 	// cgo must never reach a daemon through this package)
@@ -281,6 +353,11 @@ func (e *Engine) Compile(source []byte, name string) (*Script, error) {
 	bin, err := luawasm.Compile(proto, name)
 	if err != nil {
 		return nil, err
+	}
+	if e.scriptDisk != nil {
+		// a failed cache write must not fail Compile — the artifact is
+		// correct either way, just not persisted
+		_ = e.scriptDisk.Put(diskKey, bin)
 	}
 	s := &Script{SHA1: sha, Wasm: bin, name: name}
 	e.mu.Lock()

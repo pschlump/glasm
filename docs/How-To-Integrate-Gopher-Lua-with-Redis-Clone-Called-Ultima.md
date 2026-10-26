@@ -278,6 +278,18 @@ func NewEngine(opts ...Option) (*Engine, error)
 //                                        watermark (3/4 of the budget, else
 //                                        64 MiB); guest errors keep the image,
 //                                        engine-level failures close it)
+//          WithCompileCacheDir(string)  (on-disk compile caches under the dir,
+//                                        cross-PROCESS: wazero's machine-code
+//                                        cache serves the blob JIT to a fresh
+//                                        process in ~6 ms instead of ~90 ms,
+//                                        and compiled script artifacts persist
+//                                        via pluto lru_disk_ts (dir/scripts,
+//                                        256 entries, keyed by SHA-1 + name +
+//                                        glasm version) — SCRIPT LOAD identity
+//                                        across daemon restarts. Default "" =
+//                                        in-memory. The daemon must own the dir
+//                                        (0o700: a poisoned machine-code entry
+//                                        is native code execution)
 
 func (e *Engine) Compile(source []byte, name string) (*Script, error)
 // parse.Parse → lua.Compile → luawasm.Compile, SHA1-keyed cache; exactly
