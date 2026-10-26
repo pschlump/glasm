@@ -34,6 +34,10 @@ go test ./testdiff/ -run TestWasmFullMatrix -v   # run a single differential gat
 #             TestU9Gate/TestU9WasmGate (_u9: direct-dispatch call path, row 104)
 # The four heavy corpus gates run the U6f exit-gate engine set × {interp, clua55, wasm,
 # wazero, wazero-prod} as three passes (row 98).
+# GLUA_WASM_CACHE_DIR=<dir> sweeps every wazero-family column over the on-disk
+# compile cache (honored in WazeroEngine.Run, RTWASM-style) — the full 13-gate
+# sweep ran green under it (0 diffs, note/gates-diskcache.log), and the wazero
+# columns stop re-JIT-ing the blob per case (matrix 66s).
 
 # CLI differential runner (exit 1 on any diff). wasm = wasmtime oracle
 # host; wazero = the pure-Go production engine (same blob — ledger row 32);
