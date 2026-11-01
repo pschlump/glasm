@@ -12,4 +12,4 @@ var PackageVersion = "1.3.3"
 
 // PackageCopyRight must stay a var: it is computed from PackageVersion at
 // package init, after the linker has applied any -X override.
-var PackageCopyRight = PackageName + " " + PackageVersion + " (fork of GopherLua) Copyright (C) 2015 -2017 " + PackageAuthors
+var PackageCopyRight = PackageName + " " + PackageVersion + " (fork of GopherLua) Copyright (C) 2015 -2017 " + PackageAuthors + " Copyright (C) 2026 Philip Schlump"

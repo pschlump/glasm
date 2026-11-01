@@ -56,6 +56,10 @@ go run ./cmd/luabench [-only substr] [-benchstat] [-cpuprofile dir]  # interp TO
 # Glasm vs native C Lua 5.5.1 — runtime + memory (docs/Perf-vs-C-Lua.md)
 runtime/build-native55.sh   # native stock C lua from the vendored tree + tarball lua.c → note/native-lua55/lua
 go run ./cmd/perfcmp        # {clua, interp, wazero, wazero-disk, wasmtime} × {cold, warm}: wall + maxRSS + heap detail (wazero-disk = WithCompileCacheDir daemon-restart posture, dir populated untimed per script)
+
+# Glasm vs native C Lua — embedded usage, Redis-EVAL shape (docs/Embedded-EVAL-Perf.md)
+runtime/build-embedbench55.sh  # native C embedding-API harness (runtime/embedbench55.c, no tarball; mach_absolute_time clock) → note/native-lua55/embedbench
+go run ./cmd/embedcmp          # C-API {clua-reuse (one state, chunk kept), clua-fresh} vs host/ {glasm-cold (restart), glasm-fresh, glasm-pool} — short scripts × thousands of staged KEYS/ARGV runs; two-tier cache (WithCompileCacheDir+WithCompileMemCache) on ALL glasm legs: wall + maxRSS + live-heap/USED detail
 nohup bin/soak-7nights.sh > note/fuzz-counting.log 2>&1 &  # multi-night counting soak; window pinned in note/fuzz-window-end, note/fuzz-stop ends it
 bin/check-fuzz-status.sh        # = make fuzz-status; nightly totals in note/fuzz/soak.json
 go run ./cmd/luafuzz -replay -seed S -from N   # replay soak case N for triage

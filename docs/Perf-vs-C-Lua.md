@@ -7,6 +7,11 @@ memory. Raw log of the recorded run: `note/perfcmp-run2.txt` (gitignored;
 `note/perfcmp-run.txt` is the pre-fix run that found the interp leak,
 below).
 
+See also `docs/Embedded-EVAL-Perf.md` — the sibling suite whose native
+leg embeds C Lua through its **C API** (one state, chunk kept, staged
+pcalls — how Redis actually uses Lua) instead of the CLI used here; the
+two suites' numbers are never comparable.
+
 Headline (steady state, per run, median):
 
 - The **wazero production engine is 0.7×–6.8× native C** across lanes, and

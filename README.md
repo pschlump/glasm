@@ -160,6 +160,23 @@ RSS; the pooled Go engine carries a flat ~52 MB floor (Go runtime +
 wazero JIT + runtime blob) plus a bounded guest heap — the price of the
 pure-Go, no-cgo constraint, paid once per VM rather than per script.
 
+### vs native C Lua — embedded usage, `embedcmp`, 2026-11-01
+
+The table above handicaps the C side: the `lua` CLI re-parses and
+rebuilds a state every run. `cmd/embedcmp` removes the handicap — its
+native leg (`runtime/embedbench55.c`) embeds C Lua 5.5.1 through the
+**C API** the way Redis does: one `lua_State`, chunk loaded once and
+kept, fresh KEYS/ARGV staged per call. Against *that* shape, over short
+EVAL-style scripts run thousands of times, with the glasm side in its
+best daemon posture (VM pool + the two-tier compile cache), native C
+wins every script: **13–62× per run** (0.3–14 µs vs 20.7–189.7 µs) —
+the ratio compresses to 3× as scripts do real work, because the ~20 µs
+is a fixed wasm-boundary dispatch + staging cost, not per-instruction
+slowness. Restart: ~12 ms / ~35 MB vs ~3.7 ms / ~2 MB (the two-tier
+cache does its job — script recompile from disk is 13–18 µs, same order
+as C's parse; the cost is wasm instantiation). Full methodology and
+tables: `docs/Embedded-EVAL-Perf.md`.
+
 ### By shape — compiler vs interpreter
 
 Process-time medians (3 runs) over the luabench scripts, re-measured
