@@ -26,6 +26,19 @@ Glasm builds on that foundation with:
   surface over the wazero wasm engine: untrusted scripts with memory
   budgets, deadlines, sandboxed globals, and Go host functions.
 
+> **The native engine now lives elsewhere.** On 2026-11-01 glasm's
+> root-package interpreter — the register VM inherited from gopher-lua
+> and upgraded to 5.5.1 — was carved out (at `0affa95`, this commit)
+> into [pschlump/gopher-lua](https://github.com/pschlump/gopher-lua):
+> the standalone pure-Go Lua 5.5.1 VM, byte-exact with stock C Lua,
+> now powering Ultima's EVAL/SCRIPT through its own `host/` package
+> and its own measured performance program (vs C Lua 5.5.1: pooled
+> EVAL scripts at 2.2–15.8× C, ~4× C RSS — see its README). Glasm
+> remains the Lua→wasm compiler project and the frozen source of that
+> carve — no backflow. To **embed a pure-Go Lua interpreter** in a
+> daemon, use gopher-lua; to **compile Lua to WebAssembly**, you are
+> in the right place.
+
 Glasm has the same goal as Lua: **Be a scripting language with extensible
 semantics.** It provides Go APIs that allow you to easily embed a scripting
 language in your Go host programs.
@@ -188,11 +201,11 @@ U11e-c (the gmatch iterator probe) —
 `bench/2026-10-21-u11ec.txt` (the U11/U11c runs:
 `bench/2026-10-20-u11*.txt`):
 
-| shape                                | wasm on wasmtime | wasm on wazero | vs interpreter                        |
-|--------------------------------------|------------------|----------------|---------------------------------------|
-| fib(30) (call-heavy recursion)¹      | **0.11 s**       | 0.23 s         | interp 0.16 s: **1.5× faster** on wasmtime, 1.4× slower on wazero |
-| h_nsieve (numeric loop + table stores) | **0.05 s**     | 0.13 s         | interp 0.06 s: parity on wasmtime, ~2× slower on wazero |
-| ~150 KB text processing              | 0.04 s           | 0.10 s         | interp < 0.01 s: 4× / 10× slower — instantiation-dominated at this script size |
+| shape                                  | wasm on wasmtime | wasm on wazero | vs interpreter                                                                 |
+|----------------------------------------|------------------|----------------|--------------------------------------------------------------------------------|
+| fib(30) (call-heavy recursion)¹        | **0.11 s**       | 0.23 s         | interp 0.16 s: **1.5× faster** on wasmtime, 1.4× slower on wazero              |
+| h_nsieve (numeric loop + table stores) | **0.05 s**       | 0.13 s         | interp 0.06 s: parity on wasmtime, ~2× slower on wazero                        |
+| ~150 KB text processing                | 0.04 s           | 0.10 s         | interp < 0.01 s: 4× / 10× slower — instantiation-dominated at this script size |
 
 ¹ The call-path history: U9c's direct in-module dispatch (ledger row
 104) took wasmtime fib from 14.2 s to interp parity, and U10 removed
